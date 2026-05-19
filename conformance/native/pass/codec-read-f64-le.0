@@ -1,0 +1,9 @@
+pub fun main(world: World) -> Void raises {
+    let mut buf: [8]u8 = [0, 0, 0, 0, 0, 0, 248, 63]
+    let span: Span<u8> = buf
+    let read: f64 = std.codec.readF64Le(span, 0)
+    let expected: f64 = 1.5
+    if read == expected {
+        check world.out.write("codec read f64 le ok\n")
+    }
+}

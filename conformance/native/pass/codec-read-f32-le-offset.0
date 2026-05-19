@@ -1,0 +1,13 @@
+pub fun main(world: World) -> Void raises {
+    let mut buf: [12]u8 = [0, 0, 128, 63, 0, 0, 0, 64, 0, 0, 64, 64]
+    let span: Span<u8> = buf
+    let a: f32 = std.codec.readF32Le(span, 0)
+    let b: f32 = std.codec.readF32Le(span, 4)
+    let c: f32 = std.codec.readF32Le(span, 8)
+    let okA: Bool = a == 1.0
+    let okB: Bool = b == 2.0
+    let okC: Bool = c == 3.0
+    if okA && okB && okC {
+        check world.out.write("codec read f32 le offset ok\n")
+    }
+}

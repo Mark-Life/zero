@@ -308,6 +308,9 @@ for (const fixture of [
   "conformance/native/pass/typed-span-i32.0",
   "conformance/native/pass/math-rmsnorm-span.0",
   "conformance/native/pass/math-softmax-span.0",
+  "conformance/native/pass/codec-read-f32-le.0",
+  "conformance/native/pass/codec-read-f64-le.0",
+  "conformance/native/pass/codec-read-f32-le-offset.0",
   "conformance/native/pass/wrapping-saturating-arithmetic.0",
   "conformance/native/pass/maybe-error-flow.0",
   "conformance/native/pass/match-scalar-guards.0",
@@ -1789,6 +1792,9 @@ for (const runtimeFixture of [
   ["conformance/native/pass/typed-span-i32.0", "typed-span-i32", { stdout: "typed span i32 ok\n" }],
   ["conformance/native/pass/math-rmsnorm-span.0", "math-rmsnorm-span", { stdout: "math rmsnorm span ok\n", libm: true }],
   ["conformance/native/pass/math-softmax-span.0", "math-softmax-span", { stdout: "math softmax span ok\n", libm: true }],
+  ["conformance/native/pass/codec-read-f32-le.0", "codec-read-f32-le", { stdout: "codec read f32 le ok\n" }],
+  ["conformance/native/pass/codec-read-f64-le.0", "codec-read-f64-le", { stdout: "codec read f64 le ok\n" }],
+  ["conformance/native/pass/codec-read-f32-le-offset.0", "codec-read-f32-le-offset", { stdout: "codec read f32 le offset ok\n" }],
   ["conformance/native/pass/checked-bounds-get.0", "checked-bounds-get", { stdout: "checked bounds get ok\n" }],
   ["conformance/native/pass/check-maybe-fallibility.0", "check-maybe-fallibility", { stdout: "check maybe fallibility ok\n" }],
   ["conformance/native/pass/fallibility-error-sets.0", "fallibility-error-sets", { stdout: "fallibility error sets ok\n" }],
@@ -1848,6 +1854,7 @@ await assertBoundsTrap("conformance/native/fail/bounds-open-slice-start.0", "bou
 await assertBoundsTrap("conformance/native/fail/index-string.0", "index-string");
 await assertBoundsTrap("conformance/native/fail/slice-string.0", "slice-string");
 await assertBoundsTrap("conformance/native/fail/indexed-mutation-oob.0", "indexed-mutation-oob");
+await assertBoundsTrap("conformance/native/fail/codec-read-f32-le-bounds.0", "codec-read-f32-le-bounds");
 
 const failed = await execFileAsync(zero, ["check", "conformance/check/fail/unknown-name.0"]).catch((error) => error);
 assert.notEqual(failed.code, 0);

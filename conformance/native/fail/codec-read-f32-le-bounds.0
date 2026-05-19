@@ -1,0 +1,8 @@
+pub fun main(world: World) -> Void raises {
+    let buf: [4]u8 = [0, 0, 128, 63]
+    let span: Span<u8> = buf
+    let read: f32 = std.codec.readF32Le(span, 1)
+    if read == 0.0 {
+        check world.out.write("unreachable\n")
+    }
+}

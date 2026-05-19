@@ -2292,6 +2292,44 @@ static bool elf_emit_value(ZBuf *code, const IrFunction *fun, const IrValue *val
       elf_append_u8(code, 0x00);
       return true;
     }
+    case IR_VALUE_BYTE_VIEW_READ_FLOAT_LE: {
+      if (!value->left) return elf_diag(diag, "direct ELF64 readF*Le requires a byte view", value->line, value->column, "missing byte view");
+      if (!value->index) return elf_diag(diag, "direct ELF64 readF*Le requires an offset", value->line, value->column, "missing offset");
+      bool is64 = elf_type_is_f64(value->type);
+      unsigned char scalar_size = is64 ? 8 : 4;
+      if (!elf_emit_value(code, fun, value->index, ctx, diag)) return false;
+      elf_append_u8(code, 0x50);
+      if (!elf_emit_byte_view_len(code, fun, value->left, ctx, diag)) return false;
+      elf_append_u8(code, 0x48);
+      elf_append_u8(code, 0x89);
+      elf_append_u8(code, 0xc1);
+      elf_append_u8(code, 0x58);
+      elf_append_u8(code, 0x48);
+      elf_append_u8(code, 0x89);
+      elf_append_u8(code, 0xc2);
+      elf_append_u8(code, 0x48);
+      elf_append_u8(code, 0x83);
+      elf_append_u8(code, 0xc2);
+      elf_append_u8(code, scalar_size);
+      elf_append_u8(code, 0x48);
+      elf_append_u8(code, 0x39);
+      elf_append_u8(code, 0xd1);
+      size_t ok_patch = elf_emit_jcc32_placeholder(code, 0x83);
+      elf_append_u8(code, 0x0f);
+      elf_append_u8(code, 0x0b);
+      elf_patch_rel32(code, ok_patch, code->len);
+      elf_append_u8(code, 0x50);
+      if (!elf_emit_byte_view_ptr(code, fun, value->left, ctx, diag)) return false;
+      elf_append_u8(code, 0x59);
+      elf_append_u8(code, 0x48);
+      elf_append_u8(code, 0x01);
+      elf_append_u8(code, 0xc8);
+      elf_append_u8(code, is64 ? 0xf2 : 0xf3);
+      elf_append_u8(code, 0x0f);
+      elf_append_u8(code, 0x10);
+      elf_append_u8(code, 0x00);
+      return true;
+    }
     default:
       return elf_diag(diag, "direct ELF64 value kind is unsupported", value->line, value->column, "unsupported value");
   }

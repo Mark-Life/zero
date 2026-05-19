@@ -947,6 +947,8 @@ static const char *std_call_return_type(const Expr *callee) {
   else if (strcmp(name.data, "std.codec.readU8") == 0) result = "u8";
   else if (strcmp(name.data, "std.codec.readU16") == 0) result = "u16";
   else if (strcmp(name.data, "std.codec.readU32") == 0) result = "u32";
+  else if (strcmp(name.data, "std.codec.readF32Le") == 0) result = "f32";
+  else if (strcmp(name.data, "std.codec.readF64Le") == 0) result = "f64";
   else if (strcmp(name.data, "std.codec.writeU16") == 0) result = "u32";
   else if (strcmp(name.data, "std.codec.writeU32") == 0) result = "u32";
   else if (strcmp(name.data, "std.codec.base64EncodedLen") == 0) result = "usize";
@@ -1102,6 +1104,8 @@ static int std_call_arg_count(const char *name) {
   if (strcmp(name, "std.codec.readU8") == 0) return 1;
   if (strcmp(name, "std.codec.readU16") == 0) return 1;
   if (strcmp(name, "std.codec.readU32") == 0) return 1;
+  if (strcmp(name, "std.codec.readF32Le") == 0) return 2;
+  if (strcmp(name, "std.codec.readF64Le") == 0) return 2;
   if (strcmp(name, "std.codec.writeU16") == 0) return 1;
   if (strcmp(name, "std.codec.writeU32") == 0) return 1;
   if (strcmp(name, "std.codec.base64EncodedLen") == 0) return 1;
@@ -1256,6 +1260,8 @@ static const char *std_call_arg_type(const char *name, size_t index) {
   if (strcmp(name, "std.codec.readU8") == 0) return "String";
   if (strcmp(name, "std.codec.readU16") == 0) return "String";
   if (strcmp(name, "std.codec.readU32") == 0) return "String";
+  if (strcmp(name, "std.codec.readF32Le") == 0) return index == 0 ? "Span<u8>" : "usize";
+  if (strcmp(name, "std.codec.readF64Le") == 0) return index == 0 ? "Span<u8>" : "usize";
   if (strcmp(name, "std.codec.writeU16") == 0) return "u32";
   if (strcmp(name, "std.codec.writeU32") == 0) return "u32";
   if (strcmp(name, "std.codec.base64EncodedLen") == 0) return "usize";

@@ -826,6 +826,8 @@ static const StdHelperInfo std_helpers[] = {
   {"std.codec.readU8", "u8", 1, "codec", "target-neutral", "little-endian byte read", true},
   {"std.codec.readU16", "u16", 1, "codec", "target-neutral", "little-endian byte read", true},
   {"std.codec.readU32", "u32", 1, "codec", "target-neutral", "little-endian byte read", true},
+  {"std.codec.readF32Le", "f32", 2, "codec", "target-neutral", "little-endian f32 read from byte view", true},
+  {"std.codec.readF64Le", "f64", 2, "codec", "target-neutral", "little-endian f64 read from byte view", true},
   {"std.codec.writeU16", "u32", 1, "codec", "target-neutral", "little-endian byte write primitive", true},
   {"std.codec.writeU32", "u32", 1, "codec", "target-neutral", "little-endian byte write primitive", true},
   {"std.codec.base64EncodedLen", "usize", 1, "codec", "target-neutral", "no allocation", true},
