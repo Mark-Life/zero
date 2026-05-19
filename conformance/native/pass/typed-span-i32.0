@@ -1,0 +1,29 @@
+fun sumThree(values: Span<i32>) -> i32 {
+    return values[0] + values[1] + values[2]
+}
+
+fun setLast(out: MutSpan<i32>, value: i32) -> Void {
+    out[2] = value
+}
+
+fun copyThree(src: Span<i32>, dst: MutSpan<i32>) -> Void {
+    dst[0] = src[0]
+    dst[1] = src[1]
+    dst[2] = src[2]
+}
+
+pub fun main(world: World) -> Void raises {
+    let mut buf: [3]i32 = [10, 20, 30]
+    let mut dest: [3]i32 = [0, 0, 0]
+    let src_span: Span<i32> = buf
+    let mut_span: MutSpan<i32> = buf
+    let dst_span: MutSpan<i32> = dest
+    setLast(mut_span, 99)
+    copyThree(src_span, dst_span)
+    let total: i32 = sumThree(src_span)
+    let okSum: Bool = total == 129
+    let okCopy: Bool = dest[0] == 10 && dest[1] == 20 && dest[2] == 99
+    if okSum && okCopy {
+        check world.out.write("typed span i32 ok\n")
+    }
+}
