@@ -8,6 +8,7 @@ Hosted APIs report their target requirements in `zero graph` and `zero size`.
 Runnable modules:
 
 - `std.mem`: spans, byte equality, copy/fill, fixed-buffer allocators, byte buffers, and arena-style reset helpers.
+- `std.math`: single-precision square root, exp, trig, power, and inline NaN/infinity helpers backed by musl libm on linux-musl-x64.
 - `std.io`: buffered reader/writer metadata and byte copy helpers over caller-owned storage.
 - `std.args`: hosted process argument count and indexed lookup.
 - `std.env`: hosted environment variable lookup.

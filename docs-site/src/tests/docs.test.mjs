@@ -11,7 +11,7 @@ describe("docs registry", () => {
   it("declares module pages with source files", async () => {
     const moduleDocs = docs.filter((doc) => doc.section === "Modules");
 
-    assert.equal(moduleDocs.length, 15);
+    assert.equal(moduleDocs.length, 16);
     assert.ok(moduleDocs.every((doc) => doc.path.startsWith("/modules/")));
 
     await Promise.all(
@@ -64,7 +64,7 @@ describe("docs registry", () => {
     assert.match(await readDoc("standard-library"), /zero graph --json/);
     assert.match(await readDoc("standard-library"), /usedStdlibHelpers/);
     assert.match(await readDoc("standard-library"), /ownershipNotes/);
-    for (const moduleSlug of ["module-io", "module-rand", "module-proc", "module-crypto", "module-net", "module-http"]) {
+    for (const moduleSlug of ["module-io", "module-rand", "module-proc", "module-crypto", "module-net", "module-http", "module-math"]) {
       const moduleDoc = await readDoc(moduleSlug);
       for (const label of ["effects", "allocation behavior", "target support", "error behavior", "ownership notes", "example"]) {
         assert.match(moduleDoc, new RegExp(label));
@@ -119,6 +119,10 @@ describe("docs registry", () => {
     const memModule = await readDoc("module-mem");
     for (const memTerm of ["NullAlloc", "FixedBufAlloc", "PageAlloc", "GeneralAlloc", "memoryBudgets", "allocatorFacts", "allocationInstrumentation", "collectionFacts", "heapBytes: 0", "hiddenHeapAllocation: false"]) {
       assert.match(memModule, new RegExp(memTerm));
+    }
+    const mathModule = await readDoc("module-math");
+    for (const mathTerm of ["sqrtf", "expf", "cosf", "sinf", "powf", "isNaNf", "piF", "linux-musl-x64", "mathRuntime", "musl", "libm", "tolerance", "ULP"]) {
+      assert.match(mathModule, new RegExp(mathTerm));
     }
     const examples = await readDoc("examples");
     for (const example of [

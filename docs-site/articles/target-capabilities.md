@@ -90,6 +90,34 @@ The same network surface fails clearly on a target without `net`:
 zero check --json --target linux-musl-x64 conformance/check/fail/target-net-unsupported.0
 ```
 
+## Math Runtime
+
+`std.math` exposes f32 square root, exponential, trigonometric, power, and
+inline NaN/infinity helpers. The libm-backed surface (`sqrtf` aside, which is
+lowered to `SQRTSS`) is linked through the same target system-libraries
+pipeline as `std.http` → libcurl.
+
+`zero targets --json` and `zero graph --json` include a `mathRuntime` object
+for each target. On `linux-musl-x64` it reports:
+
+- `provider`: `libm`
+- `providerLink`: `system-library`
+- `systemLibraries`: `["m"]`
+- `capabilityGate`: `none` — math is always-on; there is no `math` capability.
+
+Other targets report `mathRuntime.status == "unsupported"` with a reason such
+as `"math runtime is linux-only in this phase"`. The inline helpers (`absf`,
+`isNaNf`, `piF`, `eF`, `infinityF`, `nanF`) compile to SSE2 sequences or
+constant immediates and do not require the libm link.
+
+Reference numerical outputs (conformance tolerance bands, the future
+`examples/llama2/` token stream) are pinned to musl libm on `linux-musl-x64`.
+Compare libm-derived values with tolerance bands, never `==`; tolerance ≥ a
+few ULPs.
+
+See `docs-site/articles/modules/math.md` for the full API surface, precision
+policy, and per-target migration notes.
+
 ## Target-Neutral Memory
 
 `std.mem.copy` and `std.mem.fill` do not require hosted filesystem support:

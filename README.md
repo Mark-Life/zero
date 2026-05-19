@@ -65,6 +65,8 @@ pnpm run native:test
 pnpm run command-contracts
 ```
 
+libm-linked fixtures (`math-sqrtf`, `math-expf`, `math-cosf-sinf`, `math-powf`, `math-absf-floorf`, `math-rmsnorm-smoke`, `math-softmax-smoke`) require a target-capable C toolchain locally; without one they skip via BLD003 and only validate numerics in CI or the Vercel sandbox. `bash scripts/setup-cross-toolchain.sh` installs the bundled cross-toolchain (zig) on macOS and verifies it built a libm fixture without hitting BLD003.
+
 Benchmarks run locally by default:
 
 ```bash

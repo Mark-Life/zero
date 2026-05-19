@@ -160,6 +160,14 @@ export const docs = [
     section: "Modules",
   },
   {
+    slug: "module-math",
+    title: "std.math",
+    description: "Single-precision square root, exp, trig, power, and inline NaN/infinity helpers backed by musl libm on linux-musl-x64.",
+    path: "/modules/math",
+    sourcePath: "/articles/modules/math.md",
+    section: "Modules",
+  },
+  {
     slug: "module-args",
     title: "std.args",
     description: "Process argument count and indexed lookup for hosted command-line programs.",
