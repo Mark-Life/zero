@@ -620,7 +620,7 @@ static bool compile_zero_http_curl_object(const char *runtime_object_file, const
   return ok;
 }
 
-static bool link_zero_runtime_executable(const char *object_file, const char *runtime_object_file, const char *http_object_file, const char *exe_file, const ZToolchainPlan *plan, const ZTargetInfo *target, ZDiag *diag) {
+static bool link_zero_runtime_executable(const char *object_file, const char *runtime_object_file, const char *http_object_file, bool needs_math, const char *exe_file, const ZToolchainPlan *plan, const ZTargetInfo *target, ZDiag *diag) {
 #if defined(__linux__)
   const char *linux_no_pie = " -no-pie";
 #else
@@ -628,7 +628,12 @@ static bool link_zero_runtime_executable(const char *object_file, const char *ru
 #endif
   const char *object_files[3] = {object_file, runtime_object_file, http_object_file};
   size_t object_count = http_object_file && http_object_file[0] ? 3 : 2;
-  bool ok = z_toolchain_link_objects(plan, target, object_files, object_count, exe_file, linux_no_pie, http_object_file && http_object_file[0] ? "-lcurl 2>/dev/null" : "2>/dev/null");
+  bool has_curl = http_object_file && http_object_file[0];
+  const char *link_flags = "2>/dev/null";
+  if (has_curl && needs_math) link_flags = "-lcurl -lm 2>/dev/null";
+  else if (has_curl) link_flags = "-lcurl 2>/dev/null";
+  else if (needs_math) link_flags = "-lm 2>/dev/null";
+  bool ok = z_toolchain_link_objects(plan, target, object_files, object_count, exe_file, linux_no_pie, link_flags);
   if (!ok && diag) {
     diag->code = 2003;
     diag->line = 1;
@@ -637,7 +642,7 @@ static bool link_zero_runtime_executable(const char *object_file, const char *ru
     snprintf(diag->message, sizeof(diag->message), "host runtime link failed");
     snprintf(diag->expected, sizeof(diag->expected), "direct object plus zero runtime object link successfully");
     snprintf(diag->actual, sizeof(diag->actual), "runtime link command failed");
-    snprintf(diag->help, sizeof(diag->help), http_object_file && http_object_file[0] ? "install libcurl or inspect the direct object, runtime objects, and host C linker diagnostics" : "inspect the direct object, runtime object, and host C linker diagnostics");
+    snprintf(diag->help, sizeof(diag->help), has_curl ? "install libcurl or inspect the direct object, runtime objects, and host C linker diagnostics" : "inspect the direct object, runtime object, and host C linker diagnostics");
   }
   return ok;
 }
@@ -4171,7 +4176,14 @@ static bool ir_value_needs_zero_runtime_object(const IrValue *value) {
       value->kind == IR_VALUE_HTTP_HEADER_VALUE ||
       value->kind == IR_VALUE_HTTP_HEADER_FOUND ||
       value->kind == IR_VALUE_HTTP_HEADER_OFFSET ||
-      value->kind == IR_VALUE_HTTP_HEADER_LEN) return true;
+      value->kind == IR_VALUE_HTTP_HEADER_LEN ||
+      value->kind == IR_VALUE_MATH_SQRTF ||
+      value->kind == IR_VALUE_MATH_EXPF ||
+      value->kind == IR_VALUE_MATH_COSF ||
+      value->kind == IR_VALUE_MATH_SINF ||
+      value->kind == IR_VALUE_MATH_POWF ||
+      value->kind == IR_VALUE_MATH_FABSF ||
+      value->kind == IR_VALUE_MATH_FLOORF) return true;
   if (ir_value_needs_zero_runtime_object(value->index) ||
       ir_value_needs_zero_runtime_object(value->left) ||
       ir_value_needs_zero_runtime_object(value->right)) {
@@ -4473,8 +4485,10 @@ static void append_object_backend_json(ZBuf *buf, const SourceInput *input, cons
     size_t direct_symbol_count = input ? input->direct_function_count : 0;
     bool uses_zero_runtime = input && input->direct_host_runtime_import_count > 0;
     bool uses_http_runtime = input && input->direct_http_runtime_import_count > 0;
+    bool uses_math_runtime = input && input->direct_math_runtime_import_count > 0;
     bool links_zero_runtime = uses_zero_runtime;
     bool links_http_runtime = uses_http_runtime;
+    bool links_math_runtime = uses_math_runtime;
     ZToolchainPlan runtime_toolchain = z_plan_toolchain(command ? command->cc : NULL, command ? command->profile : NULL, target);
     const char *runtime_external_toolchain = links_zero_runtime ? public_compiler_label(&runtime_toolchain) : "none";
     zbuf_append(buf, "{\"internalIr\":{\"typeRepresentation\":\"MIR primitive value types\",\"controlFlowRepresentation\":\"MIR instruction stream lowered to target machine/module code\",\"callRepresentation\":\"same-object direct calls for supported direct subsets\",\"functionIdentity\":\"module-qualified-stable-sorted\",\"debugRepresentation\":\"source spans retained on MIR nodes\"}");
@@ -4506,6 +4520,10 @@ static void append_object_backend_json(ZBuf *buf, const SourceInput *input, cons
       zbuf_append(buf, ",\"httpRuntime\":");
       z_append_http_runtime_json(buf, target);
     }
+    if (links_math_runtime) {
+      zbuf_append(buf, ",\"mathRuntime\":");
+      z_append_math_runtime_json(buf, target);
+    }
     zbuf_append(buf, ",\"linkerPlan\":{\"format\":");
     append_json_string(buf, object_format);
     zbuf_append(buf, ",\"flavor\":");
@@ -4513,7 +4531,10 @@ static void append_object_backend_json(ZBuf *buf, const SourceInput *input, cons
     zbuf_append(buf, ",\"archives\":[],\"staticLibraries\":");
     zbuf_append(buf, links_http_runtime ? "[\"zero_runtime.o\",\"zero_http_curl.o\"]" : (links_zero_runtime ? "[\"zero_runtime.o\"]" : "[]"));
     zbuf_append(buf, ",\"importLibraries\":[],\"systemLibraries\":");
-    zbuf_append(buf, links_http_runtime ? "[\"curl\"]" : "[]");
+    if (links_http_runtime && links_math_runtime) zbuf_append(buf, "[\"curl\",\"m\"]");
+    else if (links_http_runtime) zbuf_append(buf, "[\"curl\"]");
+    else if (links_math_runtime) zbuf_append(buf, "[\"m\"]");
+    else zbuf_append(buf, "[]");
     zbuf_append(buf, ",\"rpaths\":[],\"loadPaths\":[],\"visibility\":\"exported-c-and-main-only\",\"crossLinking\":true,\"externalToolchain\":");
     append_json_string(buf, runtime_external_toolchain);
     zbuf_append(buf, ",\"reproducible\":true,\"libcMode\":");
@@ -8209,6 +8230,9 @@ static void apply_ir_metrics_to_input(SourceInput *input, const IrProgram *ir) {
   input->direct_runtime_helper_count = ir->direct_runtime_helper_count;
   input->direct_host_runtime_import_count = ir->direct_host_runtime_import_count;
   input->direct_http_runtime_import_count = ir->direct_http_runtime_import_count;
+  if (ir->direct_math_runtime_import_count > input->direct_math_runtime_import_count) {
+    input->direct_math_runtime_import_count = ir->direct_math_runtime_import_count;
+  }
 }
 
 static const char *target_backend_expected(const ZTargetInfo *target) {
@@ -8578,6 +8602,8 @@ static void append_graph_json(ZBuf *buf, const SourceInput *input, const Program
   append_target_capability_facts_json(buf, target, &caps);
   zbuf_append(buf, ",\"httpRuntime\":");
   z_append_http_runtime_json(buf, target);
+  zbuf_append(buf, ",\"mathRuntime\":");
+  z_append_math_runtime_json(buf, target);
   zbuf_append(buf, "},\n");
   zbuf_append(buf, "  \"requiresCapabilities\": ");
   append_capability_json_array(buf, &caps);
@@ -9340,6 +9366,9 @@ int main(int argc, char **argv) {
   input.direct_runtime_helper_count = ir.direct_runtime_helper_count;
   input.direct_host_runtime_import_count = ir.direct_host_runtime_import_count;
   input.direct_http_runtime_import_count = ir.direct_http_runtime_import_count;
+  if (ir.direct_math_runtime_import_count > input.direct_math_runtime_import_count) {
+    input.direct_math_runtime_import_count = ir.direct_math_runtime_import_count;
+  }
   if (strcmp(command.command, "mem") == 0) {
     ZBuf mem_json;
     zbuf_init(&mem_json);
@@ -9490,7 +9519,8 @@ int main(int argc, char **argv) {
     }
 
     phase_started = now_ms();
-    bool linked = link_zero_runtime_executable(object_file, runtime_object_file, http_object_file, exe_file, &runtime_toolchain, target, &diag);
+    bool needs_math_runtime = input.direct_math_runtime_import_count > 0;
+    bool linked = link_zero_runtime_executable(object_file, runtime_object_file, http_object_file, needs_math_runtime, exe_file, &runtime_toolchain, target, &diag);
     if (linked) chmod(exe_file, 0755);
     input.link_ms = now_ms() - phase_started;
     remove(object_file);

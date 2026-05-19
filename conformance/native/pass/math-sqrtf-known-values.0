@@ -1,0 +1,12 @@
+pub fun main(world: World) -> Void raises {
+    let four: f32 = 4.0
+    let r: f32 = std.math.sqrtf(four)
+    let zero: f32 = 0.0
+    let rz: f32 = std.math.sqrtf(zero)
+    let neg: f32 = 0.0 - 1.0
+    let rn: f32 = std.math.sqrtf(neg)
+    let nanOk: Bool = std.math.isNaNf(rn)
+    if r == 2.0 && rz == 0.0 && nanOk {
+        check world.out.write("math sqrtf ok\n")
+    }
+}

@@ -506,6 +506,27 @@ typedef struct {
   ElfRuntimePatch *runtime_http_header_len_patches;
   size_t runtime_http_header_len_patch_len;
   size_t runtime_http_header_len_patch_cap;
+  ElfRuntimePatch *runtime_math_sqrtf_patches;
+  size_t runtime_math_sqrtf_patch_len;
+  size_t runtime_math_sqrtf_patch_cap;
+  ElfRuntimePatch *runtime_math_expf_patches;
+  size_t runtime_math_expf_patch_len;
+  size_t runtime_math_expf_patch_cap;
+  ElfRuntimePatch *runtime_math_cosf_patches;
+  size_t runtime_math_cosf_patch_len;
+  size_t runtime_math_cosf_patch_cap;
+  ElfRuntimePatch *runtime_math_sinf_patches;
+  size_t runtime_math_sinf_patch_len;
+  size_t runtime_math_sinf_patch_cap;
+  ElfRuntimePatch *runtime_math_powf_patches;
+  size_t runtime_math_powf_patch_len;
+  size_t runtime_math_powf_patch_cap;
+  ElfRuntimePatch *runtime_math_fabsf_patches;
+  size_t runtime_math_fabsf_patch_len;
+  size_t runtime_math_fabsf_patch_cap;
+  ElfRuntimePatch *runtime_math_floorf_patches;
+  size_t runtime_math_floorf_patch_len;
+  size_t runtime_math_floorf_patch_cap;
   bool emit_rodata_relocations;
   bool seed_main_process_args;
   unsigned rodata_base_offset;
@@ -619,6 +640,20 @@ static bool elf_record_runtime_http_header_offset_patch(ElfEmitContext *ctx, siz
 static bool elf_record_runtime_http_header_len_patch(ElfEmitContext *ctx, size_t patch_offset, ZDiag *diag, const IrValue *value) {
   if (!ctx) return elf_diag(diag, "direct ELF64 HTTP header relocation requires an emit context", value ? value->line : 1, value ? value->column : 1, "missing context");
   return elf_record_runtime_patch(&ctx->runtime_http_header_len_patches, &ctx->runtime_http_header_len_patch_len, &ctx->runtime_http_header_len_patch_cap, patch_offset, diag, value, "zero_http_header_len");
+}
+
+static bool elf_record_runtime_math_patch(ElfEmitContext *ctx, IrValueKind kind, size_t patch_offset, ZDiag *diag, const IrValue *value) {
+  if (!ctx) return elf_diag(diag, "direct ELF64 math relocation requires an emit context", value ? value->line : 1, value ? value->column : 1, "missing context");
+  switch (kind) {
+    case IR_VALUE_MATH_SQRTF: return elf_record_runtime_patch(&ctx->runtime_math_sqrtf_patches, &ctx->runtime_math_sqrtf_patch_len, &ctx->runtime_math_sqrtf_patch_cap, patch_offset, diag, value, "sqrtf");
+    case IR_VALUE_MATH_EXPF:  return elf_record_runtime_patch(&ctx->runtime_math_expf_patches,  &ctx->runtime_math_expf_patch_len,  &ctx->runtime_math_expf_patch_cap,  patch_offset, diag, value, "expf");
+    case IR_VALUE_MATH_COSF:  return elf_record_runtime_patch(&ctx->runtime_math_cosf_patches,  &ctx->runtime_math_cosf_patch_len,  &ctx->runtime_math_cosf_patch_cap,  patch_offset, diag, value, "cosf");
+    case IR_VALUE_MATH_SINF:  return elf_record_runtime_patch(&ctx->runtime_math_sinf_patches,  &ctx->runtime_math_sinf_patch_len,  &ctx->runtime_math_sinf_patch_cap,  patch_offset, diag, value, "sinf");
+    case IR_VALUE_MATH_POWF:  return elf_record_runtime_patch(&ctx->runtime_math_powf_patches,  &ctx->runtime_math_powf_patch_len,  &ctx->runtime_math_powf_patch_cap,  patch_offset, diag, value, "powf");
+    case IR_VALUE_MATH_FABSF: return elf_record_runtime_patch(&ctx->runtime_math_fabsf_patches, &ctx->runtime_math_fabsf_patch_len, &ctx->runtime_math_fabsf_patch_cap, patch_offset, diag, value, "fabsf");
+    case IR_VALUE_MATH_FLOORF:return elf_record_runtime_patch(&ctx->runtime_math_floorf_patches,&ctx->runtime_math_floorf_patch_len,&ctx->runtime_math_floorf_patch_cap,patch_offset, diag, value, "floorf");
+    default: return elf_diag(diag, "direct ELF64 math relocation unknown kind", value ? value->line : 1, value ? value->column : 1, "unknown math op");
+  }
 }
 
 static void elf_patch_call_patches(ZBuf *code, const ElfEmitContext *ctx) {
@@ -1302,6 +1337,44 @@ static bool elf_emit_value(ZBuf *code, const IrFunction *fun, const IrValue *val
       elf_emit_pop_reg64(code, 7);
       size_t patch = elf_emit_jmp32_placeholder(code, 0xe8);
       return elf_record_runtime_http_header_value_patch(ctx, patch, diag, value);
+    }
+    case IR_VALUE_MATH_SQRTF:
+    case IR_VALUE_MATH_EXPF:
+    case IR_VALUE_MATH_COSF:
+    case IR_VALUE_MATH_SINF:
+    case IR_VALUE_MATH_FABSF:
+    case IR_VALUE_MATH_FLOORF: {
+      // Single-arg libm call. Lowering puts arg in XMM0; libm SysV ABI returns f32 in XMM0.
+      if (!elf_emit_value(code, fun, value->left, ctx, diag)) return false;
+      size_t patch = elf_emit_jmp32_placeholder(code, 0xe8);
+      return elf_record_runtime_math_patch(ctx, value->kind, patch, diag, value);
+    }
+    case IR_VALUE_MATH_POWF: {
+      // Two-arg libm call: arg0 in XMM0, arg1 in XMM1.
+      if (!elf_emit_value(code, fun, value->left, ctx, diag)) return false;
+      elf_emit_xmm0_push(code);
+      if (!elf_emit_value(code, fun, value->right, ctx, diag)) return false;
+      elf_emit_xmm_copy(code, 1, 0);
+      elf_emit_xmm_pop(code, 0);
+      size_t patch = elf_emit_jmp32_placeholder(code, 0xe8);
+      return elf_record_runtime_math_patch(ctx, value->kind, patch, diag, value);
+    }
+    case IR_VALUE_MATH_ISNANF: {
+      // Inline: NaN is the only value where x != x. UCOMISS sets PF on unordered.
+      if (!elf_emit_value(code, fun, value->left, ctx, diag)) return false;
+      // UCOMISS xmm0, xmm0
+      elf_append_u8(code, 0x0f);
+      elf_append_u8(code, 0x2e);
+      elf_append_u8(code, 0xc0);
+      // SETP al
+      elf_append_u8(code, 0x0f);
+      elf_append_u8(code, 0x9a);
+      elf_append_u8(code, 0xc0);
+      // MOVZX eax, al
+      elf_append_u8(code, 0x0f);
+      elf_append_u8(code, 0xb6);
+      elf_append_u8(code, 0xc0);
+      return true;
     }
     case IR_VALUE_ARGS_LEN:
       if (ctx && ctx->seed_main_process_args) {
@@ -2988,6 +3061,13 @@ bool z_emit_elf64_object_from_ir(const IrProgram *ir, ZBuf *out, ZDiag *diag) {
       free(ctx.runtime_http_header_found_patches);
       free(ctx.runtime_http_header_offset_patches);
       free(ctx.runtime_http_header_len_patches);
+      free(ctx.runtime_math_sqrtf_patches);
+      free(ctx.runtime_math_expf_patches);
+      free(ctx.runtime_math_cosf_patches);
+      free(ctx.runtime_math_sinf_patches);
+      free(ctx.runtime_math_powf_patches);
+      free(ctx.runtime_math_fabsf_patches);
+      free(ctx.runtime_math_floorf_patches);
       zbuf_free(&text);
       zbuf_free(&rodata);
       zbuf_free(&rela_text);
@@ -3014,6 +3094,13 @@ bool z_emit_elf64_object_from_ir(const IrProgram *ir, ZBuf *out, ZDiag *diag) {
   const bool has_runtime_http_header_found = ctx.runtime_http_header_found_patch_len > 0;
   const bool has_runtime_http_header_offset = ctx.runtime_http_header_offset_patch_len > 0;
   const bool has_runtime_http_header_len = ctx.runtime_http_header_len_patch_len > 0;
+  const bool has_runtime_math_sqrtf = ctx.runtime_math_sqrtf_patch_len > 0;
+  const bool has_runtime_math_expf = ctx.runtime_math_expf_patch_len > 0;
+  const bool has_runtime_math_cosf = ctx.runtime_math_cosf_patch_len > 0;
+  const bool has_runtime_math_sinf = ctx.runtime_math_sinf_patch_len > 0;
+  const bool has_runtime_math_powf = ctx.runtime_math_powf_patch_len > 0;
+  const bool has_runtime_math_fabsf = ctx.runtime_math_fabsf_patch_len > 0;
+  const bool has_runtime_math_floorf = ctx.runtime_math_floorf_patch_len > 0;
   uint32_t runtime_json_parse_bytes_name = 0;
   uint32_t runtime_http_fetch_name = 0;
   uint32_t runtime_http_result_ok_name = 0;
@@ -3027,6 +3114,13 @@ bool z_emit_elf64_object_from_ir(const IrProgram *ir, ZBuf *out, ZDiag *diag) {
   uint32_t runtime_http_header_found_name = 0;
   uint32_t runtime_http_header_offset_name = 0;
   uint32_t runtime_http_header_len_name = 0;
+  uint32_t runtime_math_sqrtf_name = 0;
+  uint32_t runtime_math_expf_name = 0;
+  uint32_t runtime_math_cosf_name = 0;
+  uint32_t runtime_math_sinf_name = 0;
+  uint32_t runtime_math_powf_name = 0;
+  uint32_t runtime_math_fabsf_name = 0;
+  uint32_t runtime_math_floorf_name = 0;
   if (has_runtime_json_parse_bytes) {
     runtime_json_parse_bytes_name = (uint32_t)strtab.len;
     zbuf_append(&strtab, "zero_json_parse_bytes");
@@ -3092,6 +3186,41 @@ bool z_emit_elf64_object_from_ir(const IrProgram *ir, ZBuf *out, ZDiag *diag) {
     zbuf_append(&strtab, "zero_http_header_len");
     elf_append_u8(&strtab, 0);
   }
+  if (has_runtime_math_sqrtf) {
+    runtime_math_sqrtf_name = (uint32_t)strtab.len;
+    zbuf_append(&strtab, "sqrtf");
+    elf_append_u8(&strtab, 0);
+  }
+  if (has_runtime_math_expf) {
+    runtime_math_expf_name = (uint32_t)strtab.len;
+    zbuf_append(&strtab, "expf");
+    elf_append_u8(&strtab, 0);
+  }
+  if (has_runtime_math_cosf) {
+    runtime_math_cosf_name = (uint32_t)strtab.len;
+    zbuf_append(&strtab, "cosf");
+    elf_append_u8(&strtab, 0);
+  }
+  if (has_runtime_math_sinf) {
+    runtime_math_sinf_name = (uint32_t)strtab.len;
+    zbuf_append(&strtab, "sinf");
+    elf_append_u8(&strtab, 0);
+  }
+  if (has_runtime_math_powf) {
+    runtime_math_powf_name = (uint32_t)strtab.len;
+    zbuf_append(&strtab, "powf");
+    elf_append_u8(&strtab, 0);
+  }
+  if (has_runtime_math_fabsf) {
+    runtime_math_fabsf_name = (uint32_t)strtab.len;
+    zbuf_append(&strtab, "fabsf");
+    elf_append_u8(&strtab, 0);
+  }
+  if (has_runtime_math_floorf) {
+    runtime_math_floorf_name = (uint32_t)strtab.len;
+    zbuf_append(&strtab, "floorf");
+    elf_append_u8(&strtab, 0);
+  }
   elf_patch_call_patches(&text, &ctx);
   for (size_t i = 0; i < ctx.rodata_patch_len; i++) {
     elf_append_rela(&rela_text, ctx.rodata_patches[i].patch_offset, 1, 1, ctx.rodata_patches[i].data_offset - ctx.rodata_base_offset);
@@ -3111,6 +3240,13 @@ bool z_emit_elf64_object_from_ir(const IrProgram *ir, ZBuf *out, ZDiag *diag) {
   uint32_t runtime_http_header_found_symbol = 0;
   uint32_t runtime_http_header_offset_symbol = 0;
   uint32_t runtime_http_header_len_symbol = 0;
+  uint32_t runtime_math_sqrtf_symbol = 0;
+  uint32_t runtime_math_expf_symbol = 0;
+  uint32_t runtime_math_cosf_symbol = 0;
+  uint32_t runtime_math_sinf_symbol = 0;
+  uint32_t runtime_math_powf_symbol = 0;
+  uint32_t runtime_math_fabsf_symbol = 0;
+  uint32_t runtime_math_floorf_symbol = 0;
   if (has_runtime_json_parse_bytes) runtime_json_parse_bytes_symbol = next_runtime_symbol++;
   if (has_runtime_http_fetch) runtime_http_fetch_symbol = next_runtime_symbol++;
   if (has_runtime_http_result_ok) runtime_http_result_ok_symbol = next_runtime_symbol++;
@@ -3124,6 +3260,13 @@ bool z_emit_elf64_object_from_ir(const IrProgram *ir, ZBuf *out, ZDiag *diag) {
   if (has_runtime_http_header_found) runtime_http_header_found_symbol = next_runtime_symbol++;
   if (has_runtime_http_header_offset) runtime_http_header_offset_symbol = next_runtime_symbol++;
   if (has_runtime_http_header_len) runtime_http_header_len_symbol = next_runtime_symbol++;
+  if (has_runtime_math_sqrtf) runtime_math_sqrtf_symbol = next_runtime_symbol++;
+  if (has_runtime_math_expf) runtime_math_expf_symbol = next_runtime_symbol++;
+  if (has_runtime_math_cosf) runtime_math_cosf_symbol = next_runtime_symbol++;
+  if (has_runtime_math_sinf) runtime_math_sinf_symbol = next_runtime_symbol++;
+  if (has_runtime_math_powf) runtime_math_powf_symbol = next_runtime_symbol++;
+  if (has_runtime_math_fabsf) runtime_math_fabsf_symbol = next_runtime_symbol++;
+  if (has_runtime_math_floorf) runtime_math_floorf_symbol = next_runtime_symbol++;
   for (size_t i = 0; i < ctx.runtime_json_parse_bytes_patch_len; i++) {
     elf_append_rela(&rela_text, ctx.runtime_json_parse_bytes_patches[i].patch_offset, runtime_json_parse_bytes_symbol, 4, -4);
   }
@@ -3162,6 +3305,27 @@ bool z_emit_elf64_object_from_ir(const IrProgram *ir, ZBuf *out, ZDiag *diag) {
   }
   for (size_t i = 0; i < ctx.runtime_http_header_len_patch_len; i++) {
     elf_append_rela(&rela_text, ctx.runtime_http_header_len_patches[i].patch_offset, runtime_http_header_len_symbol, 4, -4);
+  }
+  for (size_t i = 0; i < ctx.runtime_math_sqrtf_patch_len; i++) {
+    elf_append_rela(&rela_text, ctx.runtime_math_sqrtf_patches[i].patch_offset, runtime_math_sqrtf_symbol, 4, -4);
+  }
+  for (size_t i = 0; i < ctx.runtime_math_expf_patch_len; i++) {
+    elf_append_rela(&rela_text, ctx.runtime_math_expf_patches[i].patch_offset, runtime_math_expf_symbol, 4, -4);
+  }
+  for (size_t i = 0; i < ctx.runtime_math_cosf_patch_len; i++) {
+    elf_append_rela(&rela_text, ctx.runtime_math_cosf_patches[i].patch_offset, runtime_math_cosf_symbol, 4, -4);
+  }
+  for (size_t i = 0; i < ctx.runtime_math_sinf_patch_len; i++) {
+    elf_append_rela(&rela_text, ctx.runtime_math_sinf_patches[i].patch_offset, runtime_math_sinf_symbol, 4, -4);
+  }
+  for (size_t i = 0; i < ctx.runtime_math_powf_patch_len; i++) {
+    elf_append_rela(&rela_text, ctx.runtime_math_powf_patches[i].patch_offset, runtime_math_powf_symbol, 4, -4);
+  }
+  for (size_t i = 0; i < ctx.runtime_math_fabsf_patch_len; i++) {
+    elf_append_rela(&rela_text, ctx.runtime_math_fabsf_patches[i].patch_offset, runtime_math_fabsf_symbol, 4, -4);
+  }
+  for (size_t i = 0; i < ctx.runtime_math_floorf_patch_len; i++) {
+    elf_append_rela(&rela_text, ctx.runtime_math_floorf_patches[i].patch_offset, runtime_math_floorf_symbol, 4, -4);
   }
 
   for (size_t i = 0; i < ir->function_len; i++) {
@@ -3205,6 +3369,27 @@ bool z_emit_elf64_object_from_ir(const IrProgram *ir, ZBuf *out, ZDiag *diag) {
   }
   if (has_runtime_http_header_len) {
     elf_append_symbol(&symtab, runtime_http_header_len_name, 0x12, 0, 0, 0);
+  }
+  if (has_runtime_math_sqrtf) {
+    elf_append_symbol(&symtab, runtime_math_sqrtf_name, 0x12, 0, 0, 0);
+  }
+  if (has_runtime_math_expf) {
+    elf_append_symbol(&symtab, runtime_math_expf_name, 0x12, 0, 0, 0);
+  }
+  if (has_runtime_math_cosf) {
+    elf_append_symbol(&symtab, runtime_math_cosf_name, 0x12, 0, 0, 0);
+  }
+  if (has_runtime_math_sinf) {
+    elf_append_symbol(&symtab, runtime_math_sinf_name, 0x12, 0, 0, 0);
+  }
+  if (has_runtime_math_powf) {
+    elf_append_symbol(&symtab, runtime_math_powf_name, 0x12, 0, 0, 0);
+  }
+  if (has_runtime_math_fabsf) {
+    elf_append_symbol(&symtab, runtime_math_fabsf_name, 0x12, 0, 0, 0);
+  }
+  if (has_runtime_math_floorf) {
+    elf_append_symbol(&symtab, runtime_math_floorf_name, 0x12, 0, 0, 0);
   }
 
   elf_append_u8(&shstrtab, 0);
@@ -3307,6 +3492,13 @@ bool z_emit_elf64_object_from_ir(const IrProgram *ir, ZBuf *out, ZDiag *diag) {
   free(ctx.runtime_http_header_found_patches);
   free(ctx.runtime_http_header_offset_patches);
   free(ctx.runtime_http_header_len_patches);
+  free(ctx.runtime_math_sqrtf_patches);
+  free(ctx.runtime_math_expf_patches);
+  free(ctx.runtime_math_cosf_patches);
+  free(ctx.runtime_math_sinf_patches);
+  free(ctx.runtime_math_powf_patches);
+  free(ctx.runtime_math_fabsf_patches);
+  free(ctx.runtime_math_floorf_patches);
   zbuf_free(&text);
   zbuf_free(&rodata);
   zbuf_free(&rela_text);
@@ -3435,6 +3627,13 @@ bool z_emit_elf64_exe_from_ir(const IrProgram *ir, ZBuf *out, ZDiag *diag) {
       free(ctx.runtime_http_header_found_patches);
       free(ctx.runtime_http_header_offset_patches);
       free(ctx.runtime_http_header_len_patches);
+      free(ctx.runtime_math_sqrtf_patches);
+      free(ctx.runtime_math_expf_patches);
+      free(ctx.runtime_math_cosf_patches);
+      free(ctx.runtime_math_sinf_patches);
+      free(ctx.runtime_math_powf_patches);
+      free(ctx.runtime_math_fabsf_patches);
+      free(ctx.runtime_math_floorf_patches);
       zbuf_free(&text);
       zbuf_free(&rodata);
       return false;
@@ -3452,7 +3651,14 @@ bool z_emit_elf64_exe_from_ir(const IrProgram *ir, ZBuf *out, ZDiag *diag) {
       ctx.runtime_http_header_value_patch_len > 0 ||
       ctx.runtime_http_header_found_patch_len > 0 ||
       ctx.runtime_http_header_offset_patch_len > 0 ||
-      ctx.runtime_http_header_len_patch_len > 0) {
+      ctx.runtime_http_header_len_patch_len > 0 ||
+      ctx.runtime_math_sqrtf_patch_len > 0 ||
+      ctx.runtime_math_expf_patch_len > 0 ||
+      ctx.runtime_math_cosf_patch_len > 0 ||
+      ctx.runtime_math_sinf_patch_len > 0 ||
+      ctx.runtime_math_powf_patch_len > 0 ||
+      ctx.runtime_math_fabsf_patch_len > 0 ||
+      ctx.runtime_math_floorf_patch_len > 0) {
     free(function_offsets);
     free(ctx.call_patches);
     free(ctx.rodata_patches);
@@ -3529,6 +3735,13 @@ bool z_emit_elf64_exe_from_ir(const IrProgram *ir, ZBuf *out, ZDiag *diag) {
   free(ctx.runtime_http_header_found_patches);
   free(ctx.runtime_http_header_offset_patches);
   free(ctx.runtime_http_header_len_patches);
+  free(ctx.runtime_math_sqrtf_patches);
+  free(ctx.runtime_math_expf_patches);
+  free(ctx.runtime_math_cosf_patches);
+  free(ctx.runtime_math_sinf_patches);
+  free(ctx.runtime_math_powf_patches);
+  free(ctx.runtime_math_fabsf_patches);
+  free(ctx.runtime_math_floorf_patches);
   zbuf_free(&text);
   zbuf_free(&rodata);
   return true;

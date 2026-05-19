@@ -1,0 +1,13 @@
+pub fun main(world: World) -> Void raises {
+    let one: f32 = 1.0
+    let zero: f32 = 0.0
+    let nan: f32 = std.math.nanF()
+    let inf: f32 = std.math.infinityF()
+    let normalOk: Bool = std.math.isNaNf(one) == false
+    let zeroOk: Bool = std.math.isNaNf(zero) == false
+    let infOk: Bool = std.math.isNaNf(inf) == false
+    let nanOk: Bool = std.math.isNaNf(nan)
+    if normalOk && zeroOk && infOk && nanOk {
+        check world.out.write("math isNaNf ok\n")
+    }
+}

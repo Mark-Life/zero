@@ -1891,6 +1891,71 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
         *out = value;
         return true;
       }
+      if ((strcmp(callee_name, "std.math.piF") == 0 ||
+           strcmp(callee_name, "std.math.eF") == 0 ||
+           strcmp(callee_name, "std.math.infinityF") == 0 ||
+           strcmp(callee_name, "std.math.nanF") == 0) && expr->args.len == 0) {
+        unsigned long long bits = 0;
+        if (strcmp(callee_name, "std.math.piF") == 0) bits = 0x40490fdbull;
+        else if (strcmp(callee_name, "std.math.eF") == 0) bits = 0x402df854ull;
+        else if (strcmp(callee_name, "std.math.infinityF") == 0) bits = 0x7f800000ull;
+        else bits = 0x7fc00000ull;
+        IrValue *value = ir_new_value(ir, IR_VALUE_FLOAT, IR_TYPE_F32, expr->line, expr->column);
+        value->int_value = bits;
+        free(callee_name);
+        *out = value;
+        return true;
+      }
+      {
+        IrValueKind math_kind = IR_VALUE_FLOAT;
+        int math_arity = 0;
+        if (strcmp(callee_name, "std.math.sqrtf") == 0) { math_kind = IR_VALUE_MATH_SQRTF; math_arity = 1; }
+        else if (strcmp(callee_name, "std.math.expf") == 0) { math_kind = IR_VALUE_MATH_EXPF; math_arity = 1; }
+        else if (strcmp(callee_name, "std.math.cosf") == 0) { math_kind = IR_VALUE_MATH_COSF; math_arity = 1; }
+        else if (strcmp(callee_name, "std.math.sinf") == 0) { math_kind = IR_VALUE_MATH_SINF; math_arity = 1; }
+        else if (strcmp(callee_name, "std.math.absf") == 0) { math_kind = IR_VALUE_MATH_FABSF; math_arity = 1; }
+        else if (strcmp(callee_name, "std.math.floorf") == 0) { math_kind = IR_VALUE_MATH_FLOORF; math_arity = 1; }
+        else if (strcmp(callee_name, "std.math.isNaNf") == 0) { math_kind = IR_VALUE_MATH_ISNANF; math_arity = 1; }
+        else if (strcmp(callee_name, "std.math.powf") == 0) { math_kind = IR_VALUE_MATH_POWF; math_arity = 2; }
+        if (math_arity > 0 && expr->args.len == (size_t)math_arity) {
+          IrValue *left = NULL;
+          IrValue *right = NULL;
+          if (!ir_lower_expr(program, ir, fun, expr->args.items[0], &left)) {
+            free(callee_name);
+            return false;
+          }
+          if (left->type != IR_TYPE_F32) {
+            ir_free_value(left);
+            free(callee_name);
+            ir_mark_unsupported(ir, "direct backend std.math function expects f32 argument", expr->args.items[0]->line, expr->args.items[0]->column, "non-f32 argument");
+            return false;
+          }
+          if (math_arity == 2) {
+            if (!ir_lower_expr(program, ir, fun, expr->args.items[1], &right)) {
+              ir_free_value(left);
+              free(callee_name);
+              return false;
+            }
+            if (right->type != IR_TYPE_F32) {
+              ir_free_value(left);
+              ir_free_value(right);
+              free(callee_name);
+              ir_mark_unsupported(ir, "direct backend std.math.powf expects f32 arguments", expr->args.items[1]->line, expr->args.items[1]->column, "non-f32 argument");
+              return false;
+            }
+          }
+          IrTypeKind result_type = math_kind == IR_VALUE_MATH_ISNANF ? IR_TYPE_BOOL : IR_TYPE_F32;
+          IrValue *value = ir_new_value(ir, math_kind, result_type, expr->line, expr->column);
+          value->left = left;
+          value->right = right;
+          if (math_kind != IR_VALUE_MATH_ISNANF) {
+            if (ir->direct_math_runtime_import_count < 1) ir->direct_math_runtime_import_count = 1;
+          }
+          free(callee_name);
+          *out = value;
+          return true;
+        }
+      }
       if (strcmp(callee_name, "std.args.len") == 0 && expr->args.len == 0) {
         IrValue *value = ir_new_value(ir, IR_VALUE_ARGS_LEN, IR_TYPE_USIZE, expr->line, expr->column);
         free(callee_name);

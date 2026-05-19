@@ -469,6 +469,14 @@ typedef enum {
   IR_VALUE_HTTP_HEADER_FOUND,
   IR_VALUE_HTTP_HEADER_OFFSET,
   IR_VALUE_HTTP_HEADER_LEN,
+  IR_VALUE_MATH_SQRTF,
+  IR_VALUE_MATH_EXPF,
+  IR_VALUE_MATH_COSF,
+  IR_VALUE_MATH_SINF,
+  IR_VALUE_MATH_POWF,
+  IR_VALUE_MATH_FABSF,
+  IR_VALUE_MATH_FLOORF,
+  IR_VALUE_MATH_ISNANF,
   IR_VALUE_FIELD_LOAD,
   IR_VALUE_CHECK,
   IR_VALUE_RESCUE
@@ -623,6 +631,7 @@ typedef struct {
   size_t direct_runtime_helper_count;
   size_t direct_host_runtime_import_count;
   size_t direct_http_runtime_import_count;
+  size_t direct_math_runtime_import_count;
 } IrProgram;
 
 typedef struct {
@@ -693,6 +702,7 @@ typedef struct {
   size_t direct_runtime_helper_count;
   size_t direct_host_runtime_import_count;
   size_t direct_http_runtime_import_count;
+  size_t direct_math_runtime_import_count;
   bool parse_cache_hit;
   bool interface_cache_hit;
   bool check_cache_hit;
@@ -829,6 +839,7 @@ const char *z_direct_object_emitter(const ZTargetInfo *target);
 const char *z_direct_exe_emitter(const ZTargetInfo *target);
 const char *z_direct_backend_reason(const ZTargetInfo *target);
 void z_append_http_runtime_json(ZBuf *buf, const ZTargetInfo *target);
+void z_append_math_runtime_json(ZBuf *buf, const ZTargetInfo *target);
 void z_append_targets_json(ZBuf *buf);
 void z_append_target_names_json(ZBuf *buf);
 

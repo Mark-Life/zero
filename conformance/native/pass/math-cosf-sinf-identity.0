@@ -1,0 +1,17 @@
+pub fun main(world: World) -> Void raises {
+    let zero: f32 = 0.0
+    let cz: f32 = std.math.cosf(zero)
+    let sz: f32 = std.math.sinf(zero)
+    let x: f32 = std.math.piF()
+    let cx: f32 = std.math.cosf(x)
+    let sx: f32 = std.math.sinf(x)
+    let cc: f32 = cx * cx
+    let ss: f32 = sx * sx
+    let sum: f32 = cc + ss
+    let lo: f32 = 0.999
+    let hi: f32 = 1.001
+    let okIdentity: Bool = sum > lo && sum < hi
+    if cz == 1.0 && sz == 0.0 && okIdentity {
+        check world.out.write("math cosf sinf ok\n")
+    }
+}

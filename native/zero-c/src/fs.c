@@ -701,6 +701,9 @@ static bool scan_imports_and_append_dependencies(const char *source, const char 
     }
     if (module_name) {
       if (strncmp(module_name, "std.", 4) == 0) {
+        if (strcmp(module_name, "std.math") == 0 && input->direct_math_runtime_import_count < 1) {
+          input->direct_math_runtime_import_count = 1;
+        }
         free(module_name);
       } else {
         source_input_push_import(input, module_name);

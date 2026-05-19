@@ -1079,6 +1079,18 @@ static const char *std_call_return_type(const Expr *callee) {
   else if (strcmp(name.data, "std.fs.atomicWrite") == 0) result = "Bool";
   else if (strcmp(name.data, "std.fs.fileLen") == 0) result = "Maybe<usize>";
   else if (strcmp(name.data, "std.fs.fileLenOrRaise") == 0) result = "usize";
+  else if (strcmp(name.data, "std.math.sqrtf") == 0) result = "f32";
+  else if (strcmp(name.data, "std.math.expf") == 0) result = "f32";
+  else if (strcmp(name.data, "std.math.cosf") == 0) result = "f32";
+  else if (strcmp(name.data, "std.math.sinf") == 0) result = "f32";
+  else if (strcmp(name.data, "std.math.powf") == 0) result = "f32";
+  else if (strcmp(name.data, "std.math.absf") == 0) result = "f32";
+  else if (strcmp(name.data, "std.math.floorf") == 0) result = "f32";
+  else if (strcmp(name.data, "std.math.isNaNf") == 0) result = "Bool";
+  else if (strcmp(name.data, "std.math.piF") == 0) result = "f32";
+  else if (strcmp(name.data, "std.math.eF") == 0) result = "f32";
+  else if (strcmp(name.data, "std.math.infinityF") == 0) result = "f32";
+  else if (strcmp(name.data, "std.math.nanF") == 0) result = "f32";
   zbuf_free(&name);
   return result;
 }
@@ -1222,6 +1234,18 @@ static int std_call_arg_count(const char *name) {
   if (strcmp(name, "std.fs.atomicWrite") == 0) return 3;
   if (strcmp(name, "std.fs.fileLen") == 0) return 1;
   if (strcmp(name, "std.fs.fileLenOrRaise") == 0) return 1;
+  if (strcmp(name, "std.math.sqrtf") == 0) return 1;
+  if (strcmp(name, "std.math.expf") == 0) return 1;
+  if (strcmp(name, "std.math.cosf") == 0) return 1;
+  if (strcmp(name, "std.math.sinf") == 0) return 1;
+  if (strcmp(name, "std.math.powf") == 0) return 2;
+  if (strcmp(name, "std.math.absf") == 0) return 1;
+  if (strcmp(name, "std.math.floorf") == 0) return 1;
+  if (strcmp(name, "std.math.isNaNf") == 0) return 1;
+  if (strcmp(name, "std.math.piF") == 0) return 0;
+  if (strcmp(name, "std.math.eF") == 0) return 0;
+  if (strcmp(name, "std.math.infinityF") == 0) return 0;
+  if (strcmp(name, "std.math.nanF") == 0) return 0;
   return -1;
 }
 
@@ -1362,6 +1386,14 @@ static const char *std_call_arg_type(const char *name, size_t index) {
   if (strcmp(name, "std.fs.atomicWrite") == 0) return index == 2 ? "Span<u8>" : "String";
   if (strcmp(name, "std.fs.fileLen") == 0) return "mutref<File>";
   if (strcmp(name, "std.fs.fileLenOrRaise") == 0) return "mutref<File>";
+  if (strcmp(name, "std.math.sqrtf") == 0) return "f32";
+  if (strcmp(name, "std.math.expf") == 0) return "f32";
+  if (strcmp(name, "std.math.cosf") == 0) return "f32";
+  if (strcmp(name, "std.math.sinf") == 0) return "f32";
+  if (strcmp(name, "std.math.powf") == 0) return "f32";
+  if (strcmp(name, "std.math.absf") == 0) return "f32";
+  if (strcmp(name, "std.math.floorf") == 0) return "f32";
+  if (strcmp(name, "std.math.isNaNf") == 0) return "f32";
   return NULL;
 }
 

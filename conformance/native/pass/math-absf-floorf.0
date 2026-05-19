@@ -1,0 +1,11 @@
+pub fun main(world: World) -> Void raises {
+    let neg: f32 = 0.0 - 5.5
+    let pos: f32 = 5.5
+    let a1: f32 = std.math.absf(neg)
+    let a2: f32 = std.math.absf(pos)
+    let f1: f32 = std.math.floorf(3.7)
+    let f2: f32 = std.math.floorf(0.0 - 0.5)
+    if a1 == 5.5 && a2 == 5.5 && f1 == 3.0 && f2 == 0.0 - 1.0 {
+        check world.out.write("math absf floorf ok\n")
+    }
+}

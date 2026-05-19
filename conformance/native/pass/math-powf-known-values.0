@@ -1,0 +1,10 @@
+pub fun main(world: World) -> Void raises {
+    let two: f32 = 2.0
+    let ten: f32 = 10.0
+    let r1: f32 = std.math.powf(two, ten)
+    let zero: f32 = 0.0
+    let r2: f32 = std.math.powf(zero, zero)
+    if r1 == 1024.0 && r2 == 1.0 {
+        check world.out.write("math powf ok\n")
+    }
+}
