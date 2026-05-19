@@ -1,0 +1,7 @@
+pub fun main(world: World) -> Void raises {
+    let whole: i32 = 42
+    let asFloat: f32 = whole as f32
+    if asFloat == 42.0 {
+        check world.out.write("float cast i32 to f32 ok\n")
+    }
+}

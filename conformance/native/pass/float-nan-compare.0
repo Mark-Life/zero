@@ -1,0 +1,29 @@
+pub fun main(world: World) -> Void raises {
+    let zero: f32 = 0.0
+    let one: f32 = 1.0
+    let nan: f32 = zero / zero
+    let isNaN: Bool = std.math.isNaNf(nan)
+    let nanGtFinite: Bool = nan > one
+    let nanGeFinite: Bool = nan >= one
+    let finiteGtNan: Bool = one > nan
+    let finiteGeNan: Bool = one >= nan
+    let nanEqNan: Bool = nan == nan
+    let nanEqFinite: Bool = nan == one
+    let finiteEqNan: Bool = one == nan
+    let nanNeNan: Bool = nan != nan
+    let nanNeFinite: Bool = nan != one
+    let finiteNeNan: Bool = one != nan
+    let nanLtFinite: Bool = nan < one
+    let nanLeFinite: Bool = nan <= one
+    let finiteLtNan: Bool = one < nan
+    let finiteLeNan: Bool = one <= nan
+    if isNaN
+        && nanGtFinite == false && nanGeFinite == false
+        && finiteGtNan == false && finiteGeNan == false
+        && nanEqNan == false && nanEqFinite == false && finiteEqNan == false
+        && nanNeNan && nanNeFinite && finiteNeNan
+        && nanLtFinite == false && nanLeFinite == false
+        && finiteLtNan == false && finiteLeNan == false {
+        check world.out.write("float nan compare ok\n")
+    }
+}

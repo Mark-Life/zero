@@ -1,0 +1,17 @@
+pub fun main(world: World) -> Void raises {
+    let one: f32 = 1.0
+    let zero: f32 = 0.0
+    let negOne: f32 = 0.0 - 1.0
+    let posInf: f32 = one / zero
+    let negInf: f32 = negOne / zero
+    let big: f32 = 1.0e30
+    let negBig: f32 = 0.0 - 1.0e30
+    let posInfGtBig: Bool = posInf > big
+    let negInfLtNegBig: Bool = negInf < negBig
+    let posInfEqInfinity: Bool = posInf == std.math.infinityF()
+    let infMinusInf: f32 = posInf - posInf
+    let infMinusInfIsNan: Bool = std.math.isNaNf(infMinusInf)
+    if posInfGtBig && negInfLtNegBig && posInfEqInfinity && infMinusInfIsNan {
+        check world.out.write("float inf arith ok\n")
+    }
+}

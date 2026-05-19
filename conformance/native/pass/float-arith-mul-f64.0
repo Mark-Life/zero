@@ -1,0 +1,8 @@
+pub fun main(world: World) -> Void raises {
+    let a: f64 = 2.5
+    let b: f64 = 4.0
+    let r: f64 = a * b
+    if r == 10.0 {
+        check world.out.write("float mul f64 ok\n")
+    }
+}

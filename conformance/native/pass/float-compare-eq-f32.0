@@ -1,0 +1,10 @@
+pub fun main(world: World) -> Void raises {
+    let a: f32 = 1.5
+    let b: f32 = 1.5
+    let c: f32 = 2.5
+    let same: Bool = a == b
+    let diff: Bool = a == c
+    if same && diff == false {
+        check world.out.write("float eq f32 ok\n")
+    }
+}

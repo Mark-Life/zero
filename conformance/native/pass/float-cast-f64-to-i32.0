@@ -1,0 +1,7 @@
+pub fun main(world: World) -> Void raises {
+    let frac: f64 = 12.75
+    let truncated: i32 = frac as i32
+    if truncated == 12 {
+        check world.out.write("float cast f64 to i32 ok\n")
+    }
+}

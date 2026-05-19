@@ -1,0 +1,11 @@
+pub fun main(world: World) -> Void raises {
+    let small: f64 = 1.0
+    let same: f64 = 1.0
+    let big: f64 = 2.0
+    let greaterThan: Bool = big >= small
+    let equal: Bool = small >= same
+    let less: Bool = small >= big
+    if greaterThan && equal && less == false {
+        check world.out.write("float ge f64 ok\n")
+    }
+}

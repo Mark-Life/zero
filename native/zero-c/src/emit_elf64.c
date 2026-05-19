@@ -76,8 +76,20 @@ static bool elf_type_is_i64(IrTypeKind type) {
   return type == IR_TYPE_I64 || type == IR_TYPE_U64;
 }
 
+static bool elf_type_is_f32(IrTypeKind type) {
+  return type == IR_TYPE_F32;
+}
+
+static bool elf_type_is_f64(IrTypeKind type) {
+  return type == IR_TYPE_F64;
+}
+
+static bool elf_type_is_float(IrTypeKind type) {
+  return elf_type_is_f32(type) || elf_type_is_f64(type);
+}
+
 static bool elf_type_is_supported_scalar(IrTypeKind type) {
-  return elf_type_is_scalar(type) || elf_type_is_i64(type);
+  return elf_type_is_scalar(type) || elf_type_is_i64(type) || elf_type_is_float(type);
 }
 
 static bool elf_type_is_unsigned(IrTypeKind type) {
@@ -95,6 +107,8 @@ static const char *elf_type_name(IrTypeKind type) {
     case IR_TYPE_U32: return "u32";
     case IR_TYPE_I64: return "i64";
     case IR_TYPE_U64: return "u64";
+    case IR_TYPE_F32: return "f32";
+    case IR_TYPE_F64: return "f64";
     case IR_TYPE_MAYBE_SCALAR: return "Maybe<usize>";
     default: return "unsupported";
   }
@@ -179,8 +193,195 @@ static void elf_emit_store_field_from_rax(ZBuf *code, const IrLocal *local, unsi
 
 static unsigned elf_type_byte_size(IrTypeKind type) {
   if (type == IR_TYPE_U8 || type == IR_TYPE_BOOL) return 1;
-  if (elf_type_is_i64(type)) return 8;
+  if (elf_type_is_i64(type) || elf_type_is_f64(type)) return 8;
   return 4;
+}
+
+// SSE2 scalar load/store: MOVSS (F3 0F 10/11) for f32, MOVSD (F2 0F 10/11) for f64.
+// IEEE 754 strict; no flush-to-zero. Scalar moves have no alignment requirement.
+static void elf_emit_xmm_rbp_disp(ZBuf *code, unsigned opcode, unsigned xmm, unsigned frame_offset, bool is64) {
+  elf_append_u8(code, is64 ? 0xf2 : 0xf3);
+  if (xmm >= 8) elf_append_u8(code, 0x44);
+  elf_append_u8(code, 0x0f);
+  elf_append_u8(code, opcode);
+  unsigned reg_low = xmm & 7;
+  if (frame_offset <= 127) {
+    elf_append_u8(code, 0x40 | (reg_low << 3) | 0x05);
+    elf_append_u8(code, (unsigned char)(-(int)frame_offset));
+  } else {
+    elf_append_u8(code, 0x80 | (reg_low << 3) | 0x05);
+    elf_append_u32(code, (uint32_t)(-(int32_t)frame_offset));
+  }
+}
+
+static void elf_emit_xmm_load_local(ZBuf *code, const IrFunction *fun, unsigned local_index, unsigned xmm) {
+  bool is64 = fun && local_index < fun->local_len && elf_type_is_f64(fun->locals[local_index].type);
+  elf_emit_xmm_rbp_disp(code, 0x10, xmm, elf_local_offset(fun, local_index), is64);
+}
+
+static void elf_emit_xmm_store_local(ZBuf *code, const IrFunction *fun, unsigned local_index, unsigned xmm) {
+  bool is64 = fun && local_index < fun->local_len && elf_type_is_f64(fun->locals[local_index].type);
+  elf_emit_xmm_rbp_disp(code, 0x11, xmm, elf_local_offset(fun, local_index), is64);
+}
+
+static void elf_emit_xmm_load_field(ZBuf *code, const IrLocal *local, unsigned field_offset, IrTypeKind type, unsigned xmm) {
+  unsigned disp = elf_record_field_disp(local, field_offset);
+  elf_emit_xmm_rbp_disp(code, 0x10, xmm, disp, elf_type_is_f64(type));
+}
+
+static void elf_emit_xmm_store_field(ZBuf *code, const IrLocal *local, unsigned field_offset, IrTypeKind type, unsigned xmm) {
+  unsigned disp = elf_record_field_disp(local, field_offset);
+  elf_emit_xmm_rbp_disp(code, 0x11, xmm, disp, elf_type_is_f64(type));
+}
+
+// MOVAPS xmm, xmm (0F 28 /r): copy full XMM register. Works for both f32 and f64 scalars.
+static void elf_emit_xmm_copy(ZBuf *code, unsigned dst, unsigned src) {
+  if (dst >= 8 || src >= 8) {
+    unsigned rex = 0x40;
+    if (dst >= 8) rex |= 0x04;
+    if (src >= 8) rex |= 0x01;
+    elf_append_u8(code, rex);
+  }
+  elf_append_u8(code, 0x0f);
+  elf_append_u8(code, 0x28);
+  elf_append_u8(code, 0xc0 | ((dst & 7) << 3) | (src & 7));
+}
+
+// MOVD/MOVQ xmm <- gpr: 66 [REX.W] 0F 6E /r
+static void elf_emit_movd_xmm_from_gpr(ZBuf *code, unsigned xmm, unsigned gpr, bool wide) {
+  elf_append_u8(code, 0x66);
+  unsigned rex = 0;
+  if (wide) rex |= 0x48;
+  if (xmm >= 8) rex |= 0x44;
+  if (gpr >= 8) rex |= 0x41;
+  if (rex) elf_append_u8(code, rex ? rex : 0x40);
+  elf_append_u8(code, 0x0f);
+  elf_append_u8(code, 0x6e);
+  elf_append_u8(code, 0xc0 | ((xmm & 7) << 3) | (gpr & 7));
+}
+
+// Spill XMM0 onto the stack (sub rsp,8 + movsd [rsp], xmm0) and restore into target XMM.
+static void elf_emit_xmm0_push(ZBuf *code) {
+  elf_append_u8(code, 0x48);
+  elf_append_u8(code, 0x83);
+  elf_append_u8(code, 0xec);
+  elf_append_u8(code, 0x08);
+  elf_append_u8(code, 0xf2);
+  elf_append_u8(code, 0x0f);
+  elf_append_u8(code, 0x11);
+  elf_append_u8(code, 0x04);
+  elf_append_u8(code, 0x24);
+}
+
+static void elf_emit_xmm_pop(ZBuf *code, unsigned xmm) {
+  elf_append_u8(code, 0xf2);
+  if (xmm >= 8) elf_append_u8(code, 0x44);
+  elf_append_u8(code, 0x0f);
+  elf_append_u8(code, 0x10);
+  elf_append_u8(code, 0x04 | ((xmm & 7) << 3));
+  elf_append_u8(code, 0x24);
+  elf_append_u8(code, 0x48);
+  elf_append_u8(code, 0x83);
+  elf_append_u8(code, 0xc4);
+  elf_append_u8(code, 0x08);
+}
+
+// Float arithmetic on XMM0, XMM1: ADD/SUB/MUL/DIV scalar.
+// F32 uses F3 prefix; F64 uses F2 prefix. Opcodes: 58 add, 5C sub, 59 mul, 5E div.
+static bool elf_emit_xmm_arith(ZBuf *code, IrBinaryOp op, bool is64) {
+  unsigned opcode;
+  switch (op) {
+    case IR_BIN_ADD: opcode = 0x58; break;
+    case IR_BIN_SUB: opcode = 0x5c; break;
+    case IR_BIN_MUL: opcode = 0x59; break;
+    case IR_BIN_DIV: opcode = 0x5e; break;
+    default: return false;
+  }
+  elf_append_u8(code, is64 ? 0xf2 : 0xf3);
+  elf_append_u8(code, 0x0f);
+  elf_append_u8(code, opcode);
+  elf_append_u8(code, 0xc1);
+  return true;
+}
+
+// UCOMISS/UCOMISD xmm0, xmm1: 0F 2E /r (UCOMISS) or 66 0F 2E /r (UCOMISD).
+// IEEE 754 unordered compare: sets PF on NaN, ZF/CF on order.
+// We follow IEEE: any comparison involving NaN returns false except !=, which returns true.
+static void elf_emit_xmm_compare(ZBuf *code, bool is64) {
+  if (is64) elf_append_u8(code, 0x66);
+  elf_append_u8(code, 0x0f);
+  elf_append_u8(code, 0x2e);
+  elf_append_u8(code, 0xc1);
+}
+
+// Map IR_CMP_* to the primary unsigned setcc opcode applied after UCOMISS/UCOMISD.
+// UCOMISS/SD set EFLAGS: unordered (NaN) → ZF=1, PF=1, CF=1; LT → CF=1; GT → all clear; EQ → ZF=1.
+// SETA (>) and SETAE (>=) already return false on NaN because CF=1.
+// EQ/NE/LT/LE must be combined with a PF-based fixup so NaN compares match IEEE 754:
+//   ==: SETE  & SETNP  (both order and not-unordered)
+//   !=: SETNE | SETP   (different OR unordered)
+//   <:  SETB  & SETNP
+//   <=: SETBE & SETNP
+// See elf_xmm_compare_needs_parity_fixup.
+static unsigned elf_xmm_setcc_opcode(IrCompareOp op) {
+  switch (op) {
+    case IR_CMP_EQ: return 0x94;
+    case IR_CMP_NE: return 0x95;
+    case IR_CMP_LT: return 0x92;
+    case IR_CMP_LE: return 0x96;
+    case IR_CMP_GT: return 0x97;
+    case IR_CMP_GE: return 0x93;
+  }
+  return 0x94;
+}
+
+// >, >= already return false on NaN via SETA/SETAE; the rest need PF fixup.
+static bool elf_xmm_compare_needs_parity_fixup(IrCompareOp op) {
+  return op == IR_CMP_EQ || op == IR_CMP_NE || op == IR_CMP_LT || op == IR_CMP_LE;
+}
+
+// Numeric float<->int and float<->float conversions.
+//   CVTSI2SS: F3 [REX.W] 0F 2A /r (xmm from r32/r64)
+//   CVTSI2SD: F2 [REX.W] 0F 2A /r
+//   CVTTSS2SI: F3 [REX.W] 0F 2C /r (r32/r64 from xmm, truncate)
+//   CVTTSD2SI: F2 [REX.W] 0F 2C /r
+//   CVTSS2SD : F3 0F 5A /r
+//   CVTSD2SS : F2 0F 5A /r
+static void elf_emit_cvtsi2sX(ZBuf *code, unsigned xmm, unsigned gpr, bool dst_is64, bool src_is64) {
+  elf_append_u8(code, dst_is64 ? 0xf2 : 0xf3);
+  unsigned rex = 0;
+  if (src_is64) rex |= 0x48;
+  if (xmm >= 8) rex |= 0x44;
+  if (gpr >= 8) rex |= 0x41;
+  if (rex) elf_append_u8(code, rex);
+  elf_append_u8(code, 0x0f);
+  elf_append_u8(code, 0x2a);
+  elf_append_u8(code, 0xc0 | ((xmm & 7) << 3) | (gpr & 7));
+}
+
+static void elf_emit_cvttsX2si(ZBuf *code, unsigned gpr, unsigned xmm, bool dst_is64, bool src_is64) {
+  elf_append_u8(code, src_is64 ? 0xf2 : 0xf3);
+  unsigned rex = 0;
+  if (dst_is64) rex |= 0x48;
+  if (gpr >= 8) rex |= 0x44;
+  if (xmm >= 8) rex |= 0x41;
+  if (rex) elf_append_u8(code, rex);
+  elf_append_u8(code, 0x0f);
+  elf_append_u8(code, 0x2c);
+  elf_append_u8(code, 0xc0 | ((gpr & 7) << 3) | (xmm & 7));
+}
+
+static void elf_emit_cvtsX2sX(ZBuf *code, unsigned dst_xmm, unsigned src_xmm, bool src_is64) {
+  elf_append_u8(code, src_is64 ? 0xf2 : 0xf3);
+  if (dst_xmm >= 8 || src_xmm >= 8) {
+    unsigned rex = 0x40;
+    if (dst_xmm >= 8) rex |= 0x04;
+    if (src_xmm >= 8) rex |= 0x01;
+    elf_append_u8(code, rex);
+  }
+  elf_append_u8(code, 0x0f);
+  elf_append_u8(code, 0x5a);
+  elf_append_u8(code, 0xc0 | ((dst_xmm & 7) << 3) | (src_xmm & 7));
 }
 
 static void elf_emit_lea_array_base_rax(ZBuf *code, const IrLocal *local) {
@@ -802,7 +1003,7 @@ static bool elf_emit_value(ZBuf *code, const IrFunction *fun, const IrValue *val
       value->kind != IR_VALUE_MAYBE_HAS && value->kind != IR_VALUE_VEC_LEN && value->kind != IR_VALUE_VEC_CAPACITY &&
       value->kind != IR_VALUE_VEC_PUSH && value->kind != IR_VALUE_ARGS_LEN &&
       value->type != IR_TYPE_MAYBE_SCALAR && value->kind != IR_VALUE_FS_CLOSE_FILE) {
-    return elf_diag(diag, "direct ELF64 object backend currently supports only primitive integer values", value->line, value->column, elf_type_name(value->type));
+    return elf_diag(diag, "direct ELF64 object backend currently supports only primitive numeric values", value->line, value->column, elf_type_name(value->type));
   }
   switch (value->kind) {
     case IR_VALUE_BOOL:
@@ -816,6 +1017,19 @@ static bool elf_emit_value(ZBuf *code, const IrFunction *fun, const IrValue *val
         elf_append_u32(code, (uint32_t)value->int_value);
       }
       return true;
+    case IR_VALUE_FLOAT: {
+      bool is64 = elf_type_is_f64(value->type);
+      if (is64) {
+        elf_append_u8(code, 0x48);
+        elf_append_u8(code, 0xb8);
+        elf_append_u64(code, (uint64_t)value->int_value);
+      } else {
+        elf_append_u8(code, 0xb8);
+        elf_append_u32(code, (uint32_t)value->int_value);
+      }
+      elf_emit_movd_xmm_from_gpr(code, 0, 0, is64);
+      return true;
+    }
     case IR_VALUE_LOCAL:
       if (value->local_index >= fun->local_len) {
         return elf_diag(diag, "direct ELF64 local index is out of range", value->line, value->column, "invalid local");
@@ -823,9 +1037,43 @@ static bool elf_emit_value(ZBuf *code, const IrFunction *fun, const IrValue *val
       if (fun->locals[value->local_index].is_array) {
         return elf_diag(diag, "direct ELF64 cannot use fixed array locals as scalar values", value->line, value->column, "array local");
       }
-      elf_emit_load_local_rax(code, fun, value->local_index);
+      if (elf_type_is_float(value->type)) {
+        elf_emit_xmm_load_local(code, fun, value->local_index, 0);
+      } else {
+        elf_emit_load_local_rax(code, fun, value->local_index);
+      }
       return true;
+    case IR_VALUE_CAST: {
+      if (!value->left) return elf_diag(diag, "direct ELF64 cast missing inner expression", value->line, value->column, "missing cast operand");
+      IrTypeKind src = value->left->type;
+      IrTypeKind dst = value->type;
+      if (!elf_emit_value(code, fun, value->left, ctx, diag)) return false;
+      bool src_float = elf_type_is_float(src);
+      bool dst_float = elf_type_is_float(dst);
+      if (src_float && dst_float) {
+        if (src != dst) elf_emit_cvtsX2sX(code, 0, 0, elf_type_is_f64(src));
+      } else if (!src_float && dst_float) {
+        elf_emit_cvtsi2sX(code, 0, 0, elf_type_is_f64(dst), elf_type_is_i64(src));
+      } else if (src_float && !dst_float) {
+        elf_emit_cvttsX2si(code, 0, 0, elf_type_is_i64(dst), elf_type_is_f64(src));
+      } else {
+        return elf_diag(diag, "direct ELF64 cast is not a float conversion", value->line, value->column, elf_type_name(dst));
+      }
+      return true;
+    }
     case IR_VALUE_BINARY: {
+      if (elf_type_is_float(value->type)) {
+        bool is64 = elf_type_is_f64(value->type);
+        if (!elf_emit_value(code, fun, value->left, ctx, diag)) return false;
+        elf_emit_xmm0_push(code);
+        if (!elf_emit_value(code, fun, value->right, ctx, diag)) return false;
+        elf_emit_xmm_copy(code, 1, 0);
+        elf_emit_xmm_pop(code, 0);
+        if (!elf_emit_xmm_arith(code, value->binary_op, is64)) {
+          return elf_diag(diag, "direct ELF64 float binary operator is unsupported", value->line, value->column, "unsupported operator");
+        }
+        return true;
+      }
       bool wide = elf_type_is_i64(value->type);
       if (!elf_emit_value(code, fun, value->left, ctx, diag)) return false;
       elf_append_u8(code, 0x50);
@@ -899,7 +1147,34 @@ static bool elf_emit_value(ZBuf *code, const IrFunction *fun, const IrValue *val
     }
     case IR_VALUE_COMPARE: {
       if (!value->left || !value->right || !elf_type_is_supported_scalar(value->left->type) || value->left->type != value->right->type) {
-        return elf_diag(diag, "direct ELF64 comparison operands must have the same supported integer type", value->line, value->column, "unsupported comparison");
+        return elf_diag(diag, "direct ELF64 comparison operands must have the same supported numeric type", value->line, value->column, "unsupported comparison");
+      }
+      if (elf_type_is_float(value->left->type)) {
+        bool is64 = elf_type_is_f64(value->left->type);
+        if (!elf_emit_value(code, fun, value->left, ctx, diag)) return false;
+        elf_emit_xmm0_push(code);
+        if (!elf_emit_value(code, fun, value->right, ctx, diag)) return false;
+        elf_emit_xmm_copy(code, 1, 0);
+        elf_emit_xmm_pop(code, 0);
+        elf_emit_xmm_compare(code, is64);
+        elf_append_u8(code, 0x0f);
+        elf_append_u8(code, elf_xmm_setcc_opcode(value->compare_op));
+        elf_append_u8(code, 0xc0);
+        if (elf_xmm_compare_needs_parity_fixup(value->compare_op)) {
+          // != is true on NaN (unordered); all others are false. Combine SETcc al with SETP/SETNP cl.
+          bool is_ne = value->compare_op == IR_CMP_NE;
+          // SETP cl (0F 9A C1) for !=, else SETNP cl (0F 9B C1).
+          elf_append_u8(code, 0x0f);
+          elf_append_u8(code, is_ne ? 0x9a : 0x9b);
+          elf_append_u8(code, 0xc1);
+          // OR al, cl (08 C8) for !=, else AND al, cl (20 C8).
+          elf_append_u8(code, is_ne ? 0x08 : 0x20);
+          elf_append_u8(code, 0xc8);
+        }
+        elf_append_u8(code, 0x0f);
+        elf_append_u8(code, 0xb6);
+        elf_append_u8(code, 0xc0);
+        return true;
       }
       bool wide = elf_type_is_i64(value->left->type);
       if (!elf_emit_value(code, fun, value->left, ctx, diag)) return false;
@@ -1676,7 +1951,11 @@ static bool elf_emit_value(ZBuf *code, const IrFunction *fun, const IrValue *val
       if (value->local_index >= fun->local_len) return elf_diag(diag, "direct ELF64 field load record is out of range", value->line, value->column, "invalid record local");
       const IrLocal *local = &fun->locals[value->local_index];
       if (!local->is_record) return elf_diag(diag, "direct ELF64 field load requires record local", value->line, value->column, "non-record local");
-      elf_emit_load_field_rax(code, local, value->field_offset, value->type);
+      if (elf_type_is_float(value->type)) {
+        elf_emit_xmm_load_field(code, local, value->field_offset, value->type, 0);
+      } else {
+        elf_emit_load_field_rax(code, local, value->field_offset, value->type);
+      }
       return true;
     }
     case IR_VALUE_BYTE_VIEW_LEN: {
@@ -2439,7 +2718,11 @@ static bool elf_emit_instr(ZBuf *text, const IrFunction *fun, const IrInstr *ins
       return true;
     }
     if (!elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
-    elf_emit_store_local_from_reg(text, fun, instr->local_index, 0);
+    if (instr->local_index < fun->local_len && elf_type_is_float(fun->locals[instr->local_index].type)) {
+      elf_emit_xmm_store_local(text, fun, instr->local_index, 0);
+    } else {
+      elf_emit_store_local_from_reg(text, fun, instr->local_index, 0);
+    }
     return true;
   }
   if (instr->kind == IR_INSTR_INDEX_STORE) {
@@ -2467,7 +2750,12 @@ static bool elf_emit_instr(ZBuf *text, const IrFunction *fun, const IrInstr *ins
     const IrLocal *local = &fun->locals[instr->local_index];
     if (!local->is_record) return elf_diag(diag, "direct ELF64 field store requires record local", instr->line, instr->column, "non-record local");
     if (!elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
-    elf_emit_store_field_from_rax(text, local, instr->field_offset, instr->value ? instr->value->type : IR_TYPE_I32);
+    IrTypeKind value_type = instr->value ? instr->value->type : IR_TYPE_I32;
+    if (elf_type_is_float(value_type)) {
+      elf_emit_xmm_store_field(text, local, instr->field_offset, value_type, 0);
+    } else {
+      elf_emit_store_field_from_rax(text, local, instr->field_offset, value_type);
+    }
     return true;
   }
   if (instr->kind == IR_INSTR_EXPR) {
@@ -2486,7 +2774,7 @@ static bool elf_emit_instr(ZBuf *text, const IrFunction *fun, const IrInstr *ins
       elf_append_u8(text, 0x48);
       elf_append_u8(text, 0x31);
       elf_append_u8(text, 0xc0);
-    } else if (fun->raises && instr->value && !elf_type_is_i64(instr->value->type)) {
+    } else if (fun->raises && instr->value && !elf_type_is_i64(instr->value->type) && !elf_type_is_float(instr->value->type)) {
       elf_append_u8(text, 0x89);
       elf_append_u8(text, 0xc0);
     }

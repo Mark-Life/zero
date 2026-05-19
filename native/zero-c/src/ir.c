@@ -148,6 +148,8 @@ static IrTypeKind ir_type_kind(const char *type) {
   if (strcmp(type, "u32") == 0) return IR_TYPE_U32;
   if (strcmp(type, "i64") == 0) return IR_TYPE_I64;
   if (strcmp(type, "u64") == 0) return IR_TYPE_U64;
+  if (strcmp(type, "f32") == 0) return IR_TYPE_F32;
+  if (strcmp(type, "f64") == 0) return IR_TYPE_F64;
   if (strcmp(type, "Duration") == 0) return IR_TYPE_I64;
   if (strcmp(type, "RandSource") == 0) return IR_TYPE_U32;
   if (strcmp(type, "ProcStatus") == 0) return IR_TYPE_I32;
@@ -194,8 +196,12 @@ static int ir_std_http_error_code(const char *name) {
   return -1;
 }
 
+static bool ir_type_is_float(IrTypeKind type) {
+  return type == IR_TYPE_F32 || type == IR_TYPE_F64;
+}
+
 static bool ir_type_is_value(IrTypeKind type) {
-  return type == IR_TYPE_U8 || type == IR_TYPE_U16 || type == IR_TYPE_USIZE || type == IR_TYPE_I32 || type == IR_TYPE_U32 || type == IR_TYPE_I64 || type == IR_TYPE_U64;
+  return type == IR_TYPE_U8 || type == IR_TYPE_U16 || type == IR_TYPE_USIZE || type == IR_TYPE_I32 || type == IR_TYPE_U32 || type == IR_TYPE_I64 || type == IR_TYPE_U64 || ir_type_is_float(type);
 }
 
 static bool ir_type_is_direct_local(IrTypeKind type) {
@@ -370,9 +376,11 @@ static unsigned ir_type_byte_size(IrTypeKind type) {
     case IR_TYPE_U16: return 2;
     case IR_TYPE_I32:
     case IR_TYPE_USIZE:
-    case IR_TYPE_U32: return 4;
+    case IR_TYPE_U32:
+    case IR_TYPE_F32: return 4;
     case IR_TYPE_I64:
-    case IR_TYPE_U64: return 8;
+    case IR_TYPE_U64:
+    case IR_TYPE_F64: return 8;
     default: return 0;
   }
 }
@@ -545,6 +553,28 @@ static void ir_mark_unsupported(IrProgram *ir, const char *message, int line, in
   snprintf(ir->mir_actual, sizeof(ir->mir_actual), "%s", actual ? actual : "unsupported construct");
   snprintf(ir->mir_help, sizeof(ir->mir_help), "restrict this program to exported primitive arithmetic functions or choose another supported direct target");
   z_backend_blocker_set(&ir->backend_blocker, NULL, NULL, NULL, "lower", ir->mir_actual);
+}
+
+static bool ir_parse_float_literal(const char *text, IrTypeKind type, unsigned long long *out) {
+  if (!text || !text[0]) return false;
+  char *end = NULL;
+  double parsed = strtod(text, &end);
+  if (!end || *end != 0) return false;
+  unsigned long long bits = 0;
+  if (type == IR_TYPE_F32) {
+    float narrowed = (float)parsed;
+    uint32_t pattern = 0;
+    memcpy(&pattern, &narrowed, sizeof(pattern));
+    bits = pattern;
+  } else if (type == IR_TYPE_F64) {
+    uint64_t pattern = 0;
+    memcpy(&pattern, &parsed, sizeof(pattern));
+    bits = pattern;
+  } else {
+    return false;
+  }
+  if (out) *out = bits;
+  return true;
 }
 
 static bool ir_parse_integer_literal(const char *text, unsigned long long *out) {
@@ -1155,6 +1185,14 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
         ir_mark_unsupported(ir, "direct backend cast target type is unsupported", expr->line, expr->column, expr->resolved_type ? expr->resolved_type : "unknown cast type");
         return false;
       }
+      bool src_is_float = ir_type_is_float(inner->type);
+      bool dst_is_float = ir_type_is_float(cast_type);
+      if (src_is_float || dst_is_float) {
+        IrValue *cast = ir_new_value(ir, IR_VALUE_CAST, cast_type, expr->line, expr->column);
+        cast->left = inner;
+        *out = cast;
+        return true;
+      }
       inner->type = cast_type;
       *out = inner;
       return true;
@@ -1164,6 +1202,17 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
       if (!ir_type_is_value(type)) {
         ir_mark_unsupported(ir, "direct backend numeric expression type is unsupported", expr->line, expr->column, expr->resolved_type);
         return false;
+      }
+      if (ir_type_is_float(type)) {
+        unsigned long long bits = 0;
+        if (!ir_parse_float_literal(expr->text, type, &bits)) {
+          ir_mark_unsupported(ir, "direct backend float literal is malformed", expr->line, expr->column, expr->text);
+          return false;
+        }
+        IrValue *value = ir_new_value(ir, IR_VALUE_FLOAT, type, expr->line, expr->column);
+        value->int_value = bits;
+        *out = value;
+        return true;
       }
       unsigned long long parsed = 0;
       if (!ir_parse_integer_literal(expr->text, &parsed)) {
@@ -2551,7 +2600,7 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
         if (!(left->type == IR_TYPE_BOOL || ir_type_is_value(left->type)) || left->type != right->type) {
           ir_free_value(left);
           ir_free_value(right);
-          ir_mark_unsupported(ir, "direct backend comparison operands must have the same primitive integer type", expr->line, expr->column, expr->text);
+          ir_mark_unsupported(ir, "direct backend comparison operands must have the same primitive numeric type", expr->line, expr->column, expr->text);
           return false;
         }
         IrValue *value = ir_new_value(ir, IR_VALUE_COMPARE, IR_TYPE_BOOL, expr->line, expr->column);
