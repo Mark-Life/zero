@@ -1,0 +1,18 @@
+// A fallible usize return whose value exceeds 2^32. The old single-register ABI
+// masked fallible success values to 32 bits, silently truncating this to
+// 705032704; the two-register ABI returns the full 64-bit value.
+fun bigLen(flag: Bool) -> usize raises {
+    if flag {
+        raise Bad
+    }
+    let v: usize = 5000000000
+    return v
+}
+
+pub fun main(world: World) -> Void raises {
+    let ok: usize = check bigLen(false)
+    let expected: usize = 5000000000
+    if ok == expected {
+        check world.out.write("fallible usize wide ok\n")
+    }
+}

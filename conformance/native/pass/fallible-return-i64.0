@@ -1,0 +1,17 @@
+fun pickI64(flag: Bool) -> i64 raises {
+    if flag {
+        raise Bad
+    }
+    let v: i64 = 5000000000
+    return v
+}
+
+pub fun main(world: World) -> Void raises {
+    let ok: i64 = check pickI64(false)
+    let fallback: i64 = pickI64(true) rescue err { 7 }
+    let expected: i64 = 5000000000
+    let seven: i64 = 7
+    if ok == expected && fallback == seven {
+        check world.out.write("fallible i64 ok\n")
+    }
+}

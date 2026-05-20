@@ -1,0 +1,23 @@
+// Guards the fall-through error-tag clear in the two-register fallible ABI: a
+// fallible Void function whose last operation (a division) clobbers rdx and then
+// falls through with no explicit `return`. The caller's `check` must still read
+// success (the tag is cleared before the implicit epilogue), not a stale rdx.
+fun maybeRaise(flag: Bool) -> i32 raises {
+    if flag {
+        raise Bad
+    }
+    return 42
+}
+
+fun noisy(a: i32, b: i32) -> Void raises {
+    let base: i32 = check maybeRaise(a == 99)
+    let q: i32 = (a / b) + base
+    if q == 99999 {
+        raise Bad
+    }
+}
+
+pub fun main(world: World) -> Void raises {
+    check noisy(7, 2)
+    check world.out.write("fallible void fallthrough ok\n")
+}

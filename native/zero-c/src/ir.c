@@ -273,9 +273,10 @@ static bool ir_type_is_direct_abi(IrTypeKind type) {
 }
 
 static bool ir_type_is_direct_fallible_value(IrTypeKind type) {
-  return type == IR_TYPE_VOID || type == IR_TYPE_BOOL || type == IR_TYPE_U8 ||
-         type == IR_TYPE_U16 || type == IR_TYPE_USIZE || type == IR_TYPE_I32 ||
-         type == IR_TYPE_U32;
+  // The two-register fallible ABI (value in rax/xmm0, error tag in rdx) carries any
+  // direct-ABI value, so fallible returns now match the infallible return set —
+  // including f32/f64/i64/u64 and a full-width usize.
+  return type == IR_TYPE_VOID || ir_type_is_direct_abi(type);
 }
 
 static unsigned ir_error_code_for_name(const char *name) {
@@ -2694,7 +2695,11 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
         ir_mark_unsupported(ir, "direct backend call return type is unsupported", expr->line, expr->column, callee->return_type);
         return false;
       }
-      IrValue *value = ir_new_value(ir, IR_VALUE_CALL, callee->raises ? IR_TYPE_I64 : type, expr->line, expr->column);
+      // Fallible calls carry their value in the natural register and the error tag in
+      // rdx: float results ride xmm0 (typed by their float type), every other result
+      // rides rax full-width (the i64 transit marker). CHECK/RESCUE read rdx for the tag.
+      IrTypeKind call_type = callee->raises ? (ir_type_is_float(type) ? type : IR_TYPE_I64) : type;
+      IrValue *value = ir_new_value(ir, IR_VALUE_CALL, call_type, expr->line, expr->column);
       value->callee_index = callee_index;
       value->element_type = type;
       for (size_t i = 0; i < expr->args.len; i++) {
@@ -2736,7 +2741,9 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
     case EXPR_CHECK: {
       IrValue *checked = NULL;
       if (!ir_lower_expr(program, ir, fun, expr->left, &checked)) return false;
-      if (!checked || checked->type != IR_TYPE_I64) {
+      // Fallible transit marker: i64 for value-in-rax results, the float type for
+      // value-in-xmm0 results (the error tag rides rdx either way).
+      if (!checked || (checked->type != IR_TYPE_I64 && !ir_type_is_float(checked->type))) {
         ir_free_value(checked);
         ir_mark_unsupported(ir, "direct backend check currently supports only fallible values", expr->line, expr->column, "non-fallible check");
         return false;
@@ -2755,7 +2762,7 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
         ir_free_value(fallback);
         return false;
       }
-      if (!fallible || fallible->kind != IR_VALUE_CALL || fallible->type != IR_TYPE_I64 ||
+      if (!fallible || fallible->kind != IR_VALUE_CALL || (fallible->type != IR_TYPE_I64 && !ir_type_is_float(fallible->type)) ||
           !fallback || fallback->type != fallible->element_type) {
         ir_free_value(fallible);
         ir_free_value(fallback);
@@ -3193,7 +3200,7 @@ static bool ir_lower_stmt_to_vec(const Program *program, IrProgram *ir, IrFuncti
   if (stmt->kind == STMT_CHECK) {
     IrValue *checked = NULL;
     if (!ir_lower_expr(program, ir, mir_fun, stmt->expr, &checked)) return false;
-    if (!checked || checked->type != IR_TYPE_I64) {
+    if (!checked || (checked->type != IR_TYPE_I64 && !ir_type_is_float(checked->type))) {
       ir_free_value(checked);
       ir_mark_unsupported(ir, "direct backend check statement requires a fallible value", stmt->line, stmt->column, "non-fallible check");
       return false;

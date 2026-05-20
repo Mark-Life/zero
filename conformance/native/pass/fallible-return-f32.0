@@ -1,0 +1,17 @@
+fun pickF32(flag: Bool) -> f32 raises {
+    if flag {
+        raise Bad
+    }
+    let v: f32 = 2.5
+    return v
+}
+
+pub fun main(world: World) -> Void raises {
+    let ok: f32 = check pickF32(false)
+    let fallback: f32 = pickF32(true) rescue err { 9.0 }
+    let expected: f32 = 2.5
+    let nine: f32 = 9.0
+    if ok == expected && fallback == nine {
+        check world.out.write("fallible f32 ok\n")
+    }
+}

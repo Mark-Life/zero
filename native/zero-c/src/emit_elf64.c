@@ -902,22 +902,20 @@ static bool elf_byte_view_const_byte(const IrProgram *ir, const IrFunction *fun,
   return false;
 }
 
-static void elf_emit_error_condition_from_rax(ZBuf *code) {
+// Fallible ABI: the error tag rides rdx (0 = ok, nonzero = error code), so the
+// success value keeps its natural register (rax full-width, or xmm0 for floats).
+// `test rdx,rdx` sets ZF=1 on success.
+static void elf_emit_test_error_rdx(ZBuf *code) {
   elf_append_u8(code, 0x48);
-  elf_append_u8(code, 0x89);
-  elf_append_u8(code, 0xc1);
-  elf_append_u8(code, 0x48);
-  elf_append_u8(code, 0xc1);
-  elf_append_u8(code, 0xe9);
-  elf_append_u8(code, 32);
   elf_append_u8(code, 0x85);
-  elf_append_u8(code, 0xc9);
+  elf_append_u8(code, 0xd2);
 }
 
-static void elf_emit_packed_error_rax(ZBuf *code, unsigned code_value) {
-  elf_append_u8(code, 0x48);
-  elf_append_u8(code, 0xb8);
-  elf_append_u64(code, ((uint64_t)code_value) << 32);
+// `mov edx, code` — set the rdx error tag (zero-extends into rdx). The value
+// register is left untouched (dead on the error path the caller takes).
+static void elf_emit_set_error_rdx(ZBuf *code, unsigned code_value) {
+  elf_append_u8(code, 0xba);
+  elf_append_u32(code, code_value);
 }
 
 static bool elf_emit_rodata_ptr_rax(ZBuf *code, unsigned data_offset, ElfEmitContext *ctx, ZDiag *diag, const IrValue *value) {
@@ -1531,11 +1529,11 @@ static bool elf_emit_value(ZBuf *code, const IrFunction *fun, const IrValue *val
         elf_append_u8(code, 0x85);
         elf_append_u8(code, 0xc0);
         size_t fail = elf_emit_js_placeholder(code);
-        elf_append_u8(code, 0x89);
-        elf_append_u8(code, 0xc0);
+        elf_append_u8(code, 0x31);
+        elf_append_u8(code, 0xd2);
         size_t end = elf_emit_jmp32_placeholder(code, 0xe9);
         elf_patch_rel32(code, fail, code->len);
-        elf_emit_packed_error_rax(code, value->error_code ? value->error_code : IR_ERROR_UNKNOWN);
+        elf_emit_set_error_rdx(code, value->error_code ? value->error_code : IR_ERROR_UNKNOWN);
         elf_patch_rel32(code, end, code->len);
       }
       return true;
@@ -1830,11 +1828,11 @@ static bool elf_emit_value(ZBuf *code, const IrFunction *fun, const IrValue *val
         elf_append_u8(code, 0x85);
         elf_append_u8(code, 0xc0);
         size_t fail = elf_emit_js_placeholder(code);
-        elf_append_u8(code, 0x89);
-        elf_append_u8(code, 0xc0);
+        elf_append_u8(code, 0x31);
+        elf_append_u8(code, 0xd2);
         size_t end = elf_emit_jmp32_placeholder(code, 0xe9);
         elf_patch_rel32(code, fail, code->len);
-        elf_emit_packed_error_rax(code, value->error_code ? value->error_code : IR_ERROR_UNKNOWN);
+        elf_emit_set_error_rdx(code, value->error_code ? value->error_code : IR_ERROR_UNKNOWN);
         elf_patch_rel32(code, end, code->len);
       }
       return true;
@@ -1859,11 +1857,11 @@ static bool elf_emit_value(ZBuf *code, const IrFunction *fun, const IrValue *val
         elf_append_u8(code, 0x85);
         elf_append_u8(code, 0xc0);
         size_t fail = elf_emit_js_placeholder(code);
-        elf_append_u8(code, 0x89);
-        elf_append_u8(code, 0xc0);
+        elf_append_u8(code, 0x31);
+        elf_append_u8(code, 0xd2);
         size_t end = elf_emit_jmp32_placeholder(code, 0xe9);
         elf_patch_rel32(code, fail, code->len);
-        elf_emit_packed_error_rax(code, value->error_code ? value->error_code : IR_ERROR_UNKNOWN);
+        elf_emit_set_error_rdx(code, value->error_code ? value->error_code : IR_ERROR_UNKNOWN);
         elf_patch_rel32(code, end, code->len);
       }
       return true;
@@ -1897,12 +1895,11 @@ static bool elf_emit_value(ZBuf *code, const IrFunction *fun, const IrValue *val
         elf_append_u8(code, 0x85);
         elf_append_u8(code, 0xc0);
         size_t success = elf_emit_jcc32_placeholder(code, 0x85);
-        elf_emit_packed_error_rax(code, value->error_code ? value->error_code : IR_ERROR_UNKNOWN);
+        elf_emit_set_error_rdx(code, value->error_code ? value->error_code : IR_ERROR_UNKNOWN);
         size_t end = elf_emit_jmp32_placeholder(code, 0xe9);
         elf_patch_rel32(code, success, code->len);
-        elf_append_u8(code, 0x48);
         elf_append_u8(code, 0x31);
-        elf_append_u8(code, 0xc0);
+        elf_append_u8(code, 0xd2);
         elf_patch_rel32(code, end, code->len);
       }
       return true;
@@ -2025,38 +2022,30 @@ static bool elf_emit_value(ZBuf *code, const IrFunction *fun, const IrValue *val
       return true;
     }
     case IR_VALUE_CHECK: {
-      if (!value->left || value->left->type != IR_TYPE_I64) return elf_diag(diag, "direct ELF64 check requires a packed fallible call result", value->line, value->column, "non-fallible value");
+      if (!value->left || (value->left->type != IR_TYPE_I64 && !elf_type_is_float(value->left->type))) return elf_diag(diag, "direct ELF64 check requires a fallible call result", value->line, value->column, "non-fallible value");
       if (!elf_emit_value(code, fun, value->left, ctx, diag)) return false;
-      elf_emit_error_condition_from_rax(code);
+      elf_emit_test_error_rdx(code);
       size_t ok_patch = elf_emit_jcc32_placeholder(code, 0x84);
-      if (elf_function_propagates_to_process_exit(fun)) {
-        elf_emit_epilogue(code, fun, ctx);
-      } else {
-        elf_append_u8(code, 0xb8);
-        elf_append_u32(code, 1);
-        elf_emit_epilogue(code, fun, ctx);
-      }
+      // Error: the rdx tag already holds the callee's code; returning propagates it to
+      // the caller (or to the _start stub, which turns a nonzero tag into exit 1).
+      elf_emit_epilogue(code, fun, ctx);
       elf_patch_rel32(code, ok_patch, code->len);
-      if (!elf_type_is_i64(value->type)) {
-        elf_append_u8(code, 0x89);
-        elf_append_u8(code, 0xc0);
-      }
+      // Success: the value already sits in its natural register (rax full-width, or
+      // xmm0 for floats) per value->type — the two-register ABI needs no unpacking.
       return true;
     }
     case IR_VALUE_RESCUE: {
-      if (!value->left || !value->right || value->left->type != IR_TYPE_I64) {
-        return elf_diag(diag, "direct ELF64 rescue requires a packed fallible call and fallback", value->line, value->column, "unsupported rescue");
+      if (!value->left || !value->right || (value->left->type != IR_TYPE_I64 && !elf_type_is_float(value->left->type))) {
+        return elf_diag(diag, "direct ELF64 rescue requires a fallible call and fallback", value->line, value->column, "unsupported rescue");
       }
       if (!elf_emit_value(code, fun, value->left, ctx, diag)) return false;
-      elf_emit_error_condition_from_rax(code);
+      elf_emit_test_error_rdx(code);
       size_t success_patch = elf_emit_jcc32_placeholder(code, 0x84);
+      // Error: evaluate the fallback into the natural value register (rax/xmm0).
       if (!elf_emit_value(code, fun, value->right, ctx, diag)) return false;
       size_t end_patch = elf_emit_jmp32_placeholder(code, 0xe9);
       elf_patch_rel32(code, success_patch, code->len);
-      if (!elf_type_is_i64(value->type)) {
-        elf_append_u8(code, 0x89);
-        elf_append_u8(code, 0xc0);
-      }
+      // Success: value already in its natural register per value->type.
       elf_patch_rel32(code, end_patch, code->len);
       return true;
     }
@@ -2587,7 +2576,7 @@ static bool elf_emit_read_all_or_raise_to_local(ZBuf *text, const IrFunction *fu
     size_t size_ok = elf_emit_jcc32_placeholder(text, 0x83);
     elf_append_u8(text, 0x58);
     elf_emit_close_rax_fd(text);
-    elf_emit_packed_error_rax(text, IR_ERROR_TOO_LARGE);
+    elf_emit_set_error_rdx(text, IR_ERROR_TOO_LARGE);
     if (!fun->raises) {
       elf_append_u8(text, 0xb8);
       elf_append_u32(text, 1);
@@ -2654,7 +2643,7 @@ static bool elf_emit_read_all_or_raise_to_local(ZBuf *text, const IrFunction *fu
   size_t end = elf_emit_jmp32_placeholder(text, 0xe9);
 
   elf_patch_rel32(text, open_fail, text->len);
-  elf_emit_packed_error_rax(text, IR_ERROR_NOT_FOUND);
+  elf_emit_set_error_rdx(text, IR_ERROR_NOT_FOUND);
   if (!fun->raises) {
     elf_append_u8(text, 0xb8);
     elf_append_u32(text, 1);
@@ -2664,7 +2653,7 @@ static bool elf_emit_read_all_or_raise_to_local(ZBuf *text, const IrFunction *fu
   elf_patch_rel32(text, tell_fail, text->len);
   elf_append_u8(text, 0x58);
   elf_emit_close_rax_fd(text);
-  elf_emit_packed_error_rax(text, IR_ERROR_IO);
+  elf_emit_set_error_rdx(text, IR_ERROR_IO);
   if (!fun->raises) {
     elf_append_u8(text, 0xb8);
     elf_append_u32(text, 1);
@@ -2672,7 +2661,7 @@ static bool elf_emit_read_all_or_raise_to_local(ZBuf *text, const IrFunction *fu
   elf_emit_epilogue(text, fun, ctx);
 
   elf_patch_rel32(text, read_fail, text->len);
-  elf_emit_packed_error_rax(text, IR_ERROR_IO);
+  elf_emit_set_error_rdx(text, IR_ERROR_IO);
   if (!fun->raises) {
     elf_append_u8(text, 0xb8);
     elf_append_u32(text, 1);
@@ -2949,19 +2938,25 @@ static bool elf_emit_instr(ZBuf *text, const IrFunction *fun, const IrInstr *ins
   }
   if (instr->kind == IR_INSTR_RAISE) {
     if (!elf_function_propagates_to_process_exit(fun)) return elf_diag(diag, "direct ELF64 raise requires a fallible function context", instr->line, instr->column, "non-fallible context");
-    elf_emit_packed_error_rax(text, instr->error_code ? instr->error_code : IR_ERROR_UNKNOWN);
+    elf_emit_set_error_rdx(text, instr->error_code ? instr->error_code : IR_ERROR_UNKNOWN);
     elf_emit_epilogue(text, fun, ctx);
     return true;
   }
   if (instr->kind == IR_INSTR_RETURN) {
     if (instr->value && !elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
-    if (fun->raises && !instr->value) {
-      elf_append_u8(text, 0x48);
+    // Fallible/exit-propagating success path: the value already sits in its natural
+    // register (rax full-width, or xmm0 for floats); clear the rdx error tag so the
+    // caller's check (or the _start stub) reads success. A void return also clears rax
+    // so main exits 0. (A plain non-fallible function leaves rdx untouched — its caller
+    // never reads the tag.)
+    if (elf_function_propagates_to_process_exit(fun)) {
+      if (!instr->value) {
+        elf_append_u8(text, 0x48);
+        elf_append_u8(text, 0x31);
+        elf_append_u8(text, 0xc0);
+      }
       elf_append_u8(text, 0x31);
-      elf_append_u8(text, 0xc0);
-    } else if (fun->raises && instr->value && !elf_type_is_i64(instr->value->type) && !elf_type_is_float(instr->value->type)) {
-      elf_append_u8(text, 0x89);
-      elf_append_u8(text, 0xc0);
+      elf_append_u8(text, 0xd2);
     }
     elf_emit_epilogue(text, fun, ctx);
     return true;
@@ -3076,7 +3071,16 @@ static bool elf_emit_function_text(ZBuf *text, const IrFunction *fun, ElfEmitCon
     }
   }
   if (!elf_emit_instrs(text, fun, fun->instrs, fun->instr_len, ctx, diag)) return false;
-  if (fun->instr_len == 0 || fun->instrs[fun->instr_len - 1].kind != IR_INSTR_RETURN) elf_emit_epilogue(text, fun, ctx);
+  if (fun->instr_len == 0 || fun->instrs[fun->instr_len - 1].kind != IR_INSTR_RETURN) {
+    // Fall-through return: clear the rdx error tag for fallible/exit-propagating
+    // functions so a clobbered tag is never misread as an error by the caller's check
+    // (or the _start stub). Plain non-fallible functions leave rdx untouched.
+    if (elf_function_propagates_to_process_exit(fun)) {
+      elf_append_u8(text, 0x31);
+      elf_append_u8(text, 0xd2);
+    }
+    elf_emit_epilogue(text, fun, ctx);
+  }
   return true;
 }
 
@@ -3685,15 +3689,11 @@ static size_t elf_emit_start_stub(ZBuf *text) {
   elf_append_u8(text, 0x89);
   elf_append_u8(text, 0xe7);
   size_t patch = elf_emit_jmp32_placeholder(text, 0xe8);
+  // Two-register fallible ABI: main returns its error tag in rdx (0 = ok). Test it
+  // directly; the exit code is eax on success, or 1 on a propagated error.
   elf_append_u8(text, 0x48);
-  elf_append_u8(text, 0x89);
-  elf_append_u8(text, 0xc1);
-  elf_append_u8(text, 0x48);
-  elf_append_u8(text, 0xc1);
-  elf_append_u8(text, 0xe9);
-  elf_append_u8(text, 32);
   elf_append_u8(text, 0x85);
-  elf_append_u8(text, 0xc9);
+  elf_append_u8(text, 0xd2);
   size_t success_patch = elf_emit_jcc32_placeholder(text, 0x84);
   elf_append_u8(text, 0xbf);
   elf_append_u32(text, 1);
