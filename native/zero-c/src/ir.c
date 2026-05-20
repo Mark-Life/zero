@@ -1513,6 +1513,36 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
         *out = value;
         return true;
       }
+      if ((strcmp(callee_name, "std.codec.readI32Le") == 0 ||
+           strcmp(callee_name, "std.codec.readU32Le") == 0) &&
+          expr->args.len == 2) {
+        IrTypeKind type = strcmp(callee_name, "std.codec.readU32Le") == 0 ? IR_TYPE_U32 : IR_TYPE_I32;
+        IrValue *view = NULL;
+        if (!ir_lower_byte_view(program, ir, fun, expr->args.items[0], &view)) {
+          free(callee_name);
+          return false;
+        }
+        IrValue *offset = NULL;
+        if (!ir_lower_expr(program, ir, fun, expr->args.items[1], &offset)) {
+          ir_free_value(view);
+          free(callee_name);
+          return false;
+        }
+        if (!ir_type_is_value(offset->type)) {
+          ir_free_value(view);
+          ir_free_value(offset);
+          free(callee_name);
+          ir_mark_unsupported(ir, "direct backend std.codec.readI32Le/readU32Le offset must be an integer value", expr->line, expr->column, "non-integer offset");
+          return false;
+        }
+        free(callee_name);
+        IrValue *value = ir_new_value(ir, IR_VALUE_BYTE_VIEW_READ_INT_LE, type, expr->line, expr->column);
+        value->left = view;
+        value->index = offset;
+        value->element_type = type;
+        *out = value;
+        return true;
+      }
       if (strcmp(callee_name, "std.codec.encodedVarintLen") == 0 && expr->args.len == 1) {
         unsigned long long number = 0;
         if (!expr->args.items[0] || expr->args.items[0]->kind != EXPR_NUMBER ||

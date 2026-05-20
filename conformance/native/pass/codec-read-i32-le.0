@@ -1,0 +1,9 @@
+pub fun main(world: World) -> Void raises {
+    let buf: [4]u8 = [1, 2, 3, 4]
+    let span: Span<u8> = buf
+    let read: i32 = std.codec.readI32Le(span, 0)
+    let expected: i32 = 67305985
+    if read == expected {
+        check world.out.write("codec read i32 le ok\n")
+    }
+}

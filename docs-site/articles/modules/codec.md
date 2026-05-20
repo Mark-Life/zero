@@ -12,6 +12,8 @@ Runnable today:
 | `std.codec.readU32(bytes)` | `u32` | Reads four bytes as little-endian. |
 | `std.codec.readF32Le(bytes, offset)` | `f32` | Reads four bytes at `offset` as a little-endian IEEE-754 single. Bit-preserving. Bounds-checked. |
 | `std.codec.readF64Le(bytes, offset)` | `f64` | Reads eight bytes at `offset` as a little-endian IEEE-754 double. Bit-preserving. Bounds-checked. |
+| `std.codec.readI32Le(bytes, offset)` | `i32` | Reads four bytes at `offset` as a little-endian signed integer. Bounds-checked. |
+| `std.codec.readU32Le(bytes, offset)` | `u32` | Reads four bytes at `offset` as a little-endian unsigned integer. Bounds-checked. |
 | `std.codec.writeU16(value)` | `u32` | Packs a `u16` value into the current write representation. |
 | `std.codec.writeU32(value)` | `u32` | Packs a `u32` value into the current write representation. |
 

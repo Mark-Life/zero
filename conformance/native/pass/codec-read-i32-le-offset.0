@@ -1,0 +1,14 @@
+pub fun main(world: World) -> Void raises {
+    let buf: [12]u8 = [1, 0, 0, 0, 0, 1, 0, 0, 255, 255, 255, 255]
+    let span: Span<u8> = buf
+    let a: i32 = std.codec.readI32Le(span, 0)
+    let b: i32 = std.codec.readI32Le(span, 4)
+    let c: i32 = std.codec.readI32Le(span, 8)
+    let neg: i32 = 0 - 1
+    let okA: Bool = a == 1
+    let okB: Bool = b == 256
+    let okC: Bool = c == neg
+    if okA && okB && okC {
+        check world.out.write("codec read i32 le offset ok\n")
+    }
+}
