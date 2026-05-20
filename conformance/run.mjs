@@ -411,6 +411,13 @@ for (const fixture of [
   "conformance/native/pass/shape-field-reference-reassignment-clears-origin.0",
   "conformance/native/pass/index-reference-assignment-clears-origin.0",
   "conformance/native/pass/allocator-primitives.0",
+  "conformance/native/pass/page-alloc-region.0",
+  "conformance/native/pass/mmap-file-readonly.0",
+  "conformance/native/pass/mmap-file-notfound.0",
+  "conformance/native/pass/mmap-maybe-success.0",
+  "conformance/native/pass/mmap-maybe-4gib-len.0",
+  "conformance/native/pass/mmap-munmap-loop.0",
+  "conformance/native/pass/mmap-munmap-early-return.0",
   "conformance/native/pass/std-mem-arena.0",
   "conformance/native/pass/std-mem-collections.0",
   "conformance/native/pass/owned-byte-buffer.0",
@@ -1867,6 +1874,13 @@ for (const runtimeFixture of [
   ["conformance/native/pass/borrow-primitives.0", "borrow-primitives", { stdout: "borrow primitives ok\n" }],
   ["conformance/native/pass/allocator-primitives.0", "allocator-primitives", { stdout: "allocator primitives ok\n" }],
   ["conformance/native/pass/owned-byte-buffer.0", "owned-byte-buffer", { stdout: "owned byte buffer ok\n" }],
+  ["conformance/native/pass/page-alloc-region.0", "page-alloc-region", { stdout: "page alloc region ok\n" }],
+  ["conformance/native/pass/mmap-file-readonly.0", "mmap-file-readonly", { stdout: "mmap file readonly ok\n" }],
+  ["conformance/native/pass/mmap-file-notfound.0", "mmap-file-notfound", { stdout: "mmap notfound ok\n" }],
+  ["conformance/native/pass/mmap-maybe-success.0", "mmap-maybe-success", { stdout: "mmap maybe success ok\n" }],
+  ["conformance/native/pass/mmap-maybe-4gib-len.0", "mmap-maybe-4gib-len", { stdout: "mmap maybe 4gib len ok\n" }],
+  ["conformance/native/pass/mmap-munmap-loop.0", "mmap-munmap-loop", { stdout: "mmap munmap loop ok\n" }],
+  ["conformance/native/pass/mmap-munmap-early-return.0", "mmap-munmap-early-return", { stdout: "mmap early return ok\n" }],
 ]) {
   await assertDirectRuntimeOrUnsupported(...runtimeFixture);
 }

@@ -1,0 +1,7 @@
+pub fun main(world: World) -> Void raises {
+    let fs = std.fs.host()
+    let mapped = std.fs.mmap(fs, "conformance/fixtures/does-not-exist.bin")
+    if mapped.has == false {
+        check world.out.write("mmap notfound ok\n")
+    }
+}

@@ -1083,6 +1083,10 @@ static const char *std_call_return_type(const Expr *callee) {
   else if (strcmp(name.data, "std.fs.atomicWrite") == 0) result = "Bool";
   else if (strcmp(name.data, "std.fs.fileLen") == 0) result = "Maybe<usize>";
   else if (strcmp(name.data, "std.fs.fileLenOrRaise") == 0) result = "usize";
+  else if (strcmp(name.data, "std.fs.mmap") == 0) result = "Maybe<owned<Mapping>>";
+  else if (strcmp(name.data, "std.fs.mmapOrRaise") == 0) result = "owned<Mapping>";
+  else if (strcmp(name.data, "std.fs.mappingBytes") == 0) result = "Span<u8>";
+  else if (strcmp(name.data, "std.fs.munmap") == 0) result = "Void";
   else if (strcmp(name.data, "std.math.sqrtf") == 0) result = "f32";
   else if (strcmp(name.data, "std.math.expf") == 0) result = "f32";
   else if (strcmp(name.data, "std.math.cosf") == 0) result = "f32";
@@ -1242,6 +1246,10 @@ static int std_call_arg_count(const char *name) {
   if (strcmp(name, "std.fs.atomicWrite") == 0) return 3;
   if (strcmp(name, "std.fs.fileLen") == 0) return 1;
   if (strcmp(name, "std.fs.fileLenOrRaise") == 0) return 1;
+  if (strcmp(name, "std.fs.mmap") == 0) return 2;
+  if (strcmp(name, "std.fs.mmapOrRaise") == 0) return 2;
+  if (strcmp(name, "std.fs.mappingBytes") == 0) return 1;
+  if (strcmp(name, "std.fs.munmap") == 0) return 1;
   if (strcmp(name, "std.math.sqrtf") == 0) return 1;
   if (strcmp(name, "std.math.expf") == 0) return 1;
   if (strcmp(name, "std.math.cosf") == 0) return 1;
@@ -1398,6 +1406,10 @@ static const char *std_call_arg_type(const char *name, size_t index) {
   if (strcmp(name, "std.fs.atomicWrite") == 0) return index == 2 ? "Span<u8>" : "String";
   if (strcmp(name, "std.fs.fileLen") == 0) return "mutref<File>";
   if (strcmp(name, "std.fs.fileLenOrRaise") == 0) return "mutref<File>";
+  if (strcmp(name, "std.fs.mmap") == 0) return index == 0 ? "Fs" : "String";
+  if (strcmp(name, "std.fs.mmapOrRaise") == 0) return index == 0 ? "Fs" : "String";
+  if (strcmp(name, "std.fs.mappingBytes") == 0) return "ref<Mapping>";
+  if (strcmp(name, "std.fs.munmap") == 0) return "mutref<Mapping>";
   if (strcmp(name, "std.math.sqrtf") == 0) return "f32";
   if (strcmp(name, "std.math.expf") == 0) return "f32";
   if (strcmp(name, "std.math.cosf") == 0) return "f32";
@@ -2713,7 +2725,8 @@ static bool is_builtin_fallible_call(const Expr *expr) {
                 strcmp(name.data, "std.fs.createOrRaise") == 0 ||
                 strcmp(name.data, "std.fs.readOrRaise") == 0 ||
                 strcmp(name.data, "std.fs.writeAllOrRaise") == 0 ||
-                strcmp(name.data, "std.fs.fileLenOrRaise") == 0;
+                strcmp(name.data, "std.fs.fileLenOrRaise") == 0 ||
+                strcmp(name.data, "std.fs.mmapOrRaise") == 0;
   zbuf_free(&name);
   return result;
 }
@@ -2727,6 +2740,7 @@ static const char *builtin_fallible_return_type(const Expr *expr) {
   if (strcmp(name.data, "std.fs.openOrRaise") == 0 || strcmp(name.data, "std.fs.createOrRaise") == 0) result = "owned<File>";
   else if (strcmp(name.data, "std.fs.readOrRaise") == 0 || strcmp(name.data, "std.fs.fileLenOrRaise") == 0) result = "usize";
   else if (strcmp(name.data, "std.fs.writeAllOrRaise") == 0) result = "Void";
+  else if (strcmp(name.data, "std.fs.mmapOrRaise") == 0) result = "owned<Mapping>";
   zbuf_free(&name);
   return result;
 }
@@ -7502,7 +7516,7 @@ static bool is_builtin_type_name(const char *name) {
   if (!name) return false;
   const char *names[] = {
     "Void", "Bool", "bool", "String", "char", "Type",
-    "World", "WorldStream", "Fs", "File", "ByteBuf", "NullAlloc", "FixedBufAlloc", "PageAlloc", "GeneralAlloc",
+    "World", "WorldStream", "Fs", "File", "ByteBuf", "Mapping", "NullAlloc", "FixedBufAlloc", "PageAlloc", "GeneralAlloc",
     "Vec", "Map", "Set", "Duration", "RandSource", "ProcStatus", "Address", "Net", "Conn", "Listener",
     "HttpMethod", "HttpClient", "HttpServer", "HttpResult", "HttpError", "HttpHeaderValue", "JsonDoc", "BufferedReader", "BufferedWriter",
     "Env", "Args", "Clock", "Rand", "Proc", "Alloc",

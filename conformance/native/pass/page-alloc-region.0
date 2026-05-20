@@ -1,0 +1,16 @@
+pub fun main(world: World) -> Void raises {
+    let alloc = std.mem.pageAlloc()
+    let region = std.mem.allocBytes(alloc, 4194304)
+    if region.has {
+        let dst: MutSpan<u8> = region.value
+        let z0: u8 = dst[0]
+        let zmid: u8 = dst[2097152]
+        let zlast: u8 = dst[4194303]
+        let pattern: [4]u8 = [65, 66, 67, 68]
+        let copied = std.mem.copy(dst, pattern)
+        if z0 == 0_u8 && zmid == 0_u8 && zlast == 0_u8 && copied == 4 &&
+            dst[0] == 65_u8 && dst[1] == 66_u8 && dst[2] == 67_u8 && dst[3] == 68_u8 {
+            check world.out.write("page alloc region ok\n")
+        }
+    }
+}

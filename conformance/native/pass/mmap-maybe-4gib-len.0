@@ -1,0 +1,14 @@
+pub fun main(world: World) -> Void raises {
+    let fs = std.fs.host()
+    let mapped = std.fs.mmap(fs, "conformance/fixtures/mmap-4gib-sparse.bin")
+    if mapped.has {
+        let mut m: owned<Mapping> = mapped.value
+        let bytes = std.fs.mappingBytes(&m)
+        let actual: u64 = std.mem.len(bytes) as u64
+        let expected: u64 = 4294967301
+        if actual == expected {
+            check world.out.write("mmap maybe 4gib len ok\n")
+        }
+        std.fs.munmap(&mut m)
+    }
+}

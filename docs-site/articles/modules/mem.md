@@ -13,9 +13,9 @@ Runnable today:
 | `std.mem.nullAlloc()` | `NullAlloc` | Creates an allocator that always returns `null`, useful for proving code does not allocate. |
 | `std.mem.fixedBufAlloc(buffer)` | `FixedBufAlloc` | Creates a mutable fixed-buffer allocator from caller-owned `MutSpan<u8>` bytes. |
 | `std.mem.arena(buffer)` | `FixedBufAlloc` | Arena-style alias over the fixed-buffer allocator model; `reset` rewinds the caller-owned storage. |
-| `std.mem.pageAlloc()` | `PageAlloc` | Explicit host allocator handle metadata; it never creates an ambient global allocator. |
+| `std.mem.pageAlloc()` | `PageAlloc` | Returns a `PageAlloc` handle backed by anonymous `mmap` (`MAP_ANONYMOUS`). Never creates an ambient global allocator. |
 | `std.mem.generalAlloc()` | `GeneralAlloc` | Explicit general allocator handle metadata; callers still pass allocator state deliberately. |
-| `std.mem.allocBytes(alloc, len)` | `Maybe<MutSpan<u8>>` | Allocates bytes from `NullAlloc` or a mutable `FixedBufAlloc` binding. |
+| `std.mem.allocBytes(alloc, len)` | `Maybe<MutSpan<u8>>` | Allocates `len` bytes. With `NullAlloc` or `FixedBufAlloc`: uses caller-owned storage. With `PageAlloc`: returns a zero-filled `MutSpan<u8>` from a fresh anonymous mapping (kernel-zeroed pages — `calloc` semantics). `Maybe.none` if the mapping fails. |
 | `std.mem.byteBuf(alloc, len)` | `Maybe<owned<ByteBuf>>` | Creates an owned byte buffer backed by explicit caller-provided allocator storage. |
 | `std.mem.bufBytes(&buf)` | `MutSpan<u8>` | Borrows writable bytes from an owned `ByteBuf`. |
 | `std.mem.bufLen(&buf)` | `usize` | Returns the live length of a `ByteBuf`. |
@@ -76,11 +76,58 @@ Allocation behavior:
   storage.
 - `ByteBuf` owns a slice of explicit allocator storage and never reaches for a
   global heap.
+- `PageAlloc` allocates via anonymous `mmap`. `allocBytes(pageAlloc, n)` returns
+  a zero-filled region (kernel-zeroed pages — equivalent to `calloc` semantics).
+  Bump/region-style for v0.1: allocate once, live for the run; the region is
+  reclaimed at process exit. No per-allocation free is provided yet.
+- `GeneralAlloc` is metadata only at this phase.
 
-Ownership: returned spans borrow from the original fixed buffer; no heap
-ownership is created.
+Ownership: spans from `FixedBufAlloc`/`Arena` borrow from the original fixed
+buffer; regions from `PageAlloc` are process-scoped and have no per-allocation
+ownership handle.
 
-Target support: current compiler targets.
+Target support: `FixedBufAlloc`, `Arena`, `NullAlloc`, and `ByteBuf` are
+target-neutral. `PageAlloc` (`MAP_ANONYMOUS`) requires `linux-musl-x64`. The
+`bytesAs*` reinterpret helpers are lowered by the direct backend
+(`linux-musl-x64`); other backends report them as unsupported, like the
+`std.codec.readF*Le` reads.
+
+Capability: `FixedBufAlloc`, `Arena`, `NullAlloc`, and `allocBytes` over
+caller-owned buffers fall under the `alloc` capability. `PageAlloc` and
+`GeneralAlloc` are gated under the dedicated deniable `heap` capability —
+separate from `alloc`, so callers that use only fixed-buffer or arena allocators
+are not affected by a `heap` denial. The `bytesAs*` reinterpret helpers allocate
+nothing and copy nothing, so they require no allocator capability beyond
+`memory`.
+
+## PageAlloc Example
+
+Anonymous-mmap region allocation (based on `conformance/native/pass/page-alloc-region.0`):
+
+```zero
+pub fun main(world: World) -> Void raises {
+    let alloc = std.mem.pageAlloc()
+    let region = std.mem.allocBytes(alloc, 4194304)
+    if region.has {
+        let dst: MutSpan<u8> = region.value
+        let z0: u8 = dst[0]
+        let zmid: u8 = dst[2097152]
+        let zlast: u8 = dst[4194303]
+        let pattern: [4]u8 = [65, 66, 67, 68]
+        let copied = std.mem.copy(dst, pattern)
+        if z0 == 0_u8 && zmid == 0_u8 && zlast == 0_u8 && copied == 4 &&
+            dst[0] == 65_u8 && dst[1] == 66_u8 && dst[2] == 67_u8 && dst[3] == 68_u8 {
+            check world.out.write("page alloc region ok\n")
+        }
+    }
+}
+```
+
+The kernel zeroes pages on delivery (`calloc` semantics). The region lives for
+the duration of the process; there is no per-allocation free in v0.1.
+`PageAlloc` requires the `heap` capability; `FixedBufAlloc`/`Arena`/`NullAlloc`
+require only `alloc`.
+
 
 ## Reporting Contract
 

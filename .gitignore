@@ -7,3 +7,7 @@ npm-debug.log*
 # environment variables
 .env*
 !.env.example
+
+# Large sparse fixture for the >4 GiB mmap-length round-trip test; generate locally
+# (see .docs/llama2/phase-0-followups.md issue 3). Build-tolerated in CI, so never committed.
+conformance/fixtures/mmap-4gib-sparse.bin

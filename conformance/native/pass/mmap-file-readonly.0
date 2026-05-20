@@ -1,0 +1,15 @@
+pub fun main(world: World) -> Void raises {
+    let fs = std.fs.host()
+    let mut m: owned<Mapping> = check std.fs.mmapOrRaise(fs, "conformance/fixtures/mmap-f32le.bin")
+    let bytes = std.fs.mappingBytes(&m)
+    let v0: f32 = std.codec.readF32Le(bytes, 0)
+    let v1: f32 = std.codec.readF32Le(bytes, 4)
+    let v2: f32 = std.codec.readF32Le(bytes, 8)
+    let one: f32 = 1.0
+    let two: f32 = 2.0
+    let three: f32 = 3.0
+    if std.mem.len(bytes) == 12 && v0 == one && v1 == two && v2 == three {
+        check world.out.write("mmap file readonly ok\n")
+    }
+    std.fs.munmap(&mut m)
+}

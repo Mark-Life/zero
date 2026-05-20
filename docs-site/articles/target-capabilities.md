@@ -22,6 +22,7 @@ Only the current host target exposes the full hosted capability set:
 - `args`
 - `env`
 - `fs`
+- `heap`
 - `memory`
 - `net`
 - `proc`
@@ -89,6 +90,32 @@ The same network surface fails clearly on a target without `net`:
 ```sh
 zero check --json --target linux-musl-x64 conformance/check/fail/target-net-unsupported.0
 ```
+
+## Heap Allocation
+
+The `heap` capability gates the OS-backed allocators `std.mem.pageAlloc(...)`
+and `std.mem.generalAlloc(...)`. `pageAlloc` is backed by anonymous `mmap` on
+the direct ELF64 host executable path; it is no longer just an explicit handle.
+Because these allocators ask the operating system for fresh memory, they are a
+target gate, like `fs` and `net`.
+
+All other `std.mem` allocator helpers stay on the `memory`/`alloc` capabilities
+and remain target-neutral:
+
+- `std.mem.nullAlloc`, `std.mem.fixedBufAlloc`, `std.mem.arena`
+- `std.mem.allocBytes`, `std.mem.byteBuf`, `std.mem.reset`, `std.mem.capacity`
+
+`std.mem.allocBytes(...)` works over any allocator, so it does not require
+`heap` on its own. A program only requires `heap` when it constructs a
+`pageAlloc`/`generalAlloc` handle (or passes a `PageAlloc`/`GeneralAlloc`
+parameter).
+
+`heap` is available on the host target and on non-host targets that declare
+`fs` (`darwin-arm64`, `darwin-x64`, `linux-musl-x64`). Targets without
+filesystem support (freestanding, bare, wasm-style) do not expose `heap`. On a
+target that lacks `heap`, a `pageAlloc`/`generalAlloc` program fails with
+`6002` before codegen; `zero mem --json` lists `heap` under
+`requiredCapabilities` and `missingCapabilities`.
 
 ## Math Runtime
 

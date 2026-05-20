@@ -189,7 +189,9 @@ static IrTypeKind ir_type_kind(const char *type) {
   if (strcmp(type, "Fs") == 0 || strcmp(type, "File") == 0 || strcmp(type, "owned<File>") == 0) return IR_TYPE_I32;
   if (strcmp(type, "String") == 0 ||
       strcmp(type, "ByteBuf") == 0 ||
-      strcmp(type, "owned<ByteBuf>") == 0) {
+      strcmp(type, "owned<ByteBuf>") == 0 ||
+      strcmp(type, "Mapping") == 0 ||
+      strcmp(type, "owned<Mapping>") == 0) {
     return IR_TYPE_BYTE_VIEW;
   }
   {
@@ -205,10 +207,10 @@ static IrTypeKind ir_type_kind(const char *type) {
       return IR_TYPE_UNSUPPORTED;
     }
   }
-  if (strcmp(type, "FixedBufAlloc") == 0) return IR_TYPE_ALLOC;
+  if (strcmp(type, "FixedBufAlloc") == 0 || strcmp(type, "PageAlloc") == 0) return IR_TYPE_ALLOC;
   if (strcmp(type, "Vec") == 0) return IR_TYPE_VEC;
   if (strcmp(type, "BufferedReader") == 0 || strcmp(type, "BufferedWriter") == 0) return IR_TYPE_BYTE_VIEW;
-  if (strcmp(type, "Maybe<MutSpan<u8>>") == 0 || strcmp(type, "Maybe<String>") == 0 || strcmp(type, "Maybe<owned<ByteBuf>>") == 0) return IR_TYPE_MAYBE_BYTE_VIEW;
+  if (strcmp(type, "Maybe<MutSpan<u8>>") == 0 || strcmp(type, "Maybe<String>") == 0 || strcmp(type, "Maybe<owned<ByteBuf>>") == 0 || strcmp(type, "Maybe<owned<Mapping>>") == 0) return IR_TYPE_MAYBE_BYTE_VIEW;
   if (strcmp(type, "Maybe<JsonDoc>") == 0 ||
       strcmp(type, "Maybe<u8>") == 0 ||
       strcmp(type, "Maybe<u16>") == 0 ||
@@ -1037,12 +1039,14 @@ static bool ir_lower_byte_view(const Program *program, IrProgram *ir, const IrFu
     char *callee = ir_expr_callee_name(expr->left);
     bool member_span = expr->left && expr->left->kind == EXPR_MEMBER && strcmp(expr->left->text ? expr->left->text : "", "span") == 0;
     bool member_buf_bytes = expr->left && expr->left->kind == EXPR_MEMBER && strcmp(expr->left->text ? expr->left->text : "", "bufBytes") == 0;
+    bool member_mapping_bytes = expr->left && expr->left->kind == EXPR_MEMBER && strcmp(expr->left->text ? expr->left->text : "", "mappingBytes") == 0;
     bool is_span = (callee && strcmp(callee, "std.mem.span") == 0) || member_span;
     bool is_buf_bytes = (callee && strcmp(callee, "std.mem.bufBytes") == 0) || member_buf_bytes;
+    bool is_mapping_bytes = (callee && strcmp(callee, "std.fs.mappingBytes") == 0) || member_mapping_bytes;
     bool is_io_buffer = callee && (strcmp(callee, "std.io.bufferedReader") == 0 || strcmp(callee, "std.io.bufferedWriter") == 0);
     free(callee);
     if (is_span || is_io_buffer) return ir_lower_byte_view(program, ir, fun, expr->args.items[0], out);
-    if (is_buf_bytes) {
+    if (is_buf_bytes || is_mapping_bytes) {
       const Expr *arg = expr->args.items[0];
       if (arg && arg->kind == EXPR_BORROW) arg = arg->left;
       if (arg && arg->kind == EXPR_IDENT) {
@@ -1622,6 +1626,13 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
           return true;
         }
       }
+      if (strcmp(callee_name, "std.mem.pageAlloc") == 0 && expr->args.len == 0) {
+        IrValue *value = ir_new_value(ir, IR_VALUE_PAGE_ALLOC, IR_TYPE_ALLOC, expr->line, expr->column);
+        ir->direct_allocator_helper_count = ir->direct_allocator_helper_count < 1 ? 1 : ir->direct_allocator_helper_count;
+        free(callee_name);
+        *out = value;
+        return true;
+      }
       if (strcmp(callee_name, "std.mem.fixedBufAlloc") == 0 &&
           expr->args.len == 1 &&
           ir_expr_is_mutable_byte_view_dest(fun, expr->args.items[0])) {
@@ -1642,9 +1653,9 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
           expr->args.items[0] &&
           expr->args.items[0]->kind == EXPR_IDENT) {
         const IrLocal *alloc = ir_function_find_local(fun, expr->args.items[0]->text);
-        if (!alloc || alloc->type != IR_TYPE_ALLOC || !alloc->is_mutable) {
+        if (!alloc || alloc->type != IR_TYPE_ALLOC || (!alloc->is_mutable && !alloc->is_page_alloc)) {
           free(callee_name);
-          ir_mark_unsupported(ir, "direct backend std.mem.allocBytes expects a mutable FixedBufAlloc local", expr->args.items[0]->line, expr->args.items[0]->column, "non-mutable allocator");
+          ir_mark_unsupported(ir, "direct backend std.mem.allocBytes expects a mutable FixedBufAlloc or a PageAlloc local", expr->args.items[0]->line, expr->args.items[0]->column, "non-mutable allocator");
           return false;
         }
         IrValue *len = NULL;
@@ -2263,6 +2274,21 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
         *out = value;
         return true;
       }
+      if ((strcmp(callee_name, "std.fs.mmap") == 0 || strcmp(callee_name, "std.fs.mmapOrRaise") == 0) && expr->args.len == 2) {
+        bool raises = strcmp(callee_name, "std.fs.mmapOrRaise") == 0;
+        IrValue *path = NULL;
+        if (!ir_lower_byte_view(program, ir, fun, expr->args.items[1], &path)) {
+          free(callee_name);
+          return false;
+        }
+        IrValue *value = ir_new_value(ir, IR_VALUE_FS_MMAP, raises ? IR_TYPE_I64 : IR_TYPE_MAYBE_BYTE_VIEW, expr->line, expr->column);
+        value->left = path;
+        value->element_type = IR_TYPE_BYTE_VIEW;
+        if (raises) value->error_code = IR_ERROR_NOT_FOUND;
+        free(callee_name);
+        *out = value;
+        return true;
+      }
       if ((strcmp(callee_name, "std.fs.writeAll") == 0 || strcmp(callee_name, "std.fs.writeAllOrRaise") == 0) && expr->args.len == 2) {
         const Expr *first = expr->args.items[0];
         if (!first || first->kind != EXPR_BORROW || !first->left || first->left->kind != EXPR_IDENT) {
@@ -2297,6 +2323,37 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
         }
         IrValue *value = ir_new_value(ir, IR_VALUE_FS_CLOSE_FILE, IR_TYPE_VOID, expr->line, expr->column);
         value->local_index = file->index;
+        free(callee_name);
+        *out = value;
+        return true;
+      }
+      if (strcmp(callee_name, "std.fs.munmap") == 0 && expr->args.len == 1) {
+        const Expr *arg = expr->args.items[0];
+        if (arg && arg->kind == EXPR_BORROW) arg = arg->left;
+        const IrLocal *mapping = arg && arg->kind == EXPR_IDENT ? ir_function_find_local(fun, arg->text) : NULL;
+        if (!mapping || mapping->type != IR_TYPE_BYTE_VIEW) {
+          free(callee_name);
+          ir_mark_unsupported(ir, "direct backend std.fs.munmap expects a Mapping local", expr->line, expr->column, "non-Mapping munmap");
+          return false;
+        }
+        IrValue *value = ir_new_value(ir, IR_VALUE_FS_MUNMAP, IR_TYPE_VOID, expr->line, expr->column);
+        value->local_index = mapping->index;
+        free(callee_name);
+        *out = value;
+        return true;
+      }
+      if (strcmp(callee_name, "std.fs.mappingBytes") == 0 && expr->args.len == 1) {
+        const Expr *arg = expr->args.items[0];
+        if (arg && arg->kind == EXPR_BORROW) arg = arg->left;
+        const IrLocal *mapping = arg && arg->kind == EXPR_IDENT ? ir_function_find_local(fun, arg->text) : NULL;
+        if (!mapping || mapping->type != IR_TYPE_BYTE_VIEW) {
+          free(callee_name);
+          ir_mark_unsupported(ir, "direct backend std.fs.mappingBytes expects a Mapping local", expr->line, expr->column, "non-Mapping mappingBytes");
+          return false;
+        }
+        IrValue *value = ir_new_value(ir, IR_VALUE_LOCAL, IR_TYPE_BYTE_VIEW, expr->line, expr->column);
+        value->local_index = mapping->index;
+        value->element_type = IR_TYPE_U8;
         free(callee_name);
         *out = value;
         return true;
@@ -3353,6 +3410,9 @@ static bool ir_collect_function_locals(const Program *program, IrProgram *ir, Ir
       return false;
     }
     ir_function_push_local(ir, mir_fun, param->name, type, true, false, false, NULL, element_type, 0, 0, 0, is_mut_span, param->line, param->column);
+    if (param->type && strcmp(param->type, "PageAlloc") == 0) {
+      mir_fun->locals[mir_fun->local_len - 1].is_page_alloc = true;
+    }
   }
   if (!ir_collect_stmt_locals(program, ir, mir_fun, &source->body)) return false;
 
@@ -3404,6 +3464,9 @@ static bool ir_collect_stmt_locals(const Program *program, IrProgram *ir, IrFunc
       bool mutable_byte_view = stmt_type && (strncmp(stmt_type, "MutSpan<", 8) == 0);
       IrTypeKind let_element_type = (type == IR_TYPE_BYTE_VIEW) ? ir_byte_view_element_type(stmt_type) : IR_TYPE_UNSUPPORTED;
       ir_function_push_local(ir, mir_fun, stmt->name, type, false, false, false, NULL, let_element_type, 0, 0, 0, stmt->mutable_binding || mutable_byte_view, stmt->line, stmt->column);
+      if (stmt_type && strcmp(stmt_type, "PageAlloc") == 0) {
+        mir_fun->locals[mir_fun->local_len - 1].is_page_alloc = true;
+      }
     } else if (stmt->kind == STMT_IF) {
       if (!ir_collect_stmt_locals(program, ir, mir_fun, &stmt->then_body) || !ir_collect_stmt_locals(program, ir, mir_fun, &stmt->else_body)) return false;
     } else if (stmt->kind == STMT_WHILE) {

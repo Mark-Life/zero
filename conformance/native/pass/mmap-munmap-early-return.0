@@ -1,0 +1,24 @@
+// Exercises an early-return path that still munmaps (plan risk #3), now in the
+// cleaner form of a fallible f32 helper — which also exercises the widened
+// fallible-return ABI (f32 value in xmm0, error tag in rdx).
+fun firstFloat(fs: Fs) -> f32 raises {
+    let mut m: owned<Mapping> = check std.fs.mmapOrRaise(fs, "conformance/fixtures/mmap-f32le.bin")
+    let bytes = std.fs.mappingBytes(&m)
+    let v0: f32 = std.codec.readF32Le(bytes, 0)
+    if std.mem.len(bytes) == 12 {
+        std.fs.munmap(&mut m)
+        return v0
+    }
+    std.fs.munmap(&mut m)
+    let zero: f32 = 0.0
+    return zero
+}
+
+pub fun main(world: World) -> Void raises {
+    let fs = std.fs.host()
+    let v0: f32 = check firstFloat(fs)
+    let one: f32 = 1.0
+    if v0 == one {
+        check world.out.write("mmap early return ok\n")
+    }
+}

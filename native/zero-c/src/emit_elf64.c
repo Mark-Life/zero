@@ -737,12 +737,16 @@ static void elf_emit_strlen_rax_to_ecx(ZBuf *code) {
   elf_patch_rel32(code, done, code->len);
 }
 
+// MAYBE_BYTE_VIEW payload layout (24-byte local, see ir.c byte_size): tag@0 (4b),
+// ptr@8 (8b), len@16 (8b). The len slot is a full 64-bit usize so file/anon mappings
+// and spans >4 GiB round-trip without truncation, matching the raising BYTE_VIEW len@8.
+// Every len@16 store/load below is wide (8b); clearing must zero all 8 bytes too.
 static void elf_emit_maybe_clear(ZBuf *code, const IrLocal *local) {
   elf_append_u8(code, 0x31);
   elf_append_u8(code, 0xc0);
   elf_emit_store_local_slot_reg(code, local, 0, 0, false);
   elf_emit_store_local_slot_reg(code, local, 8, 0, true);
-  elf_emit_store_local_slot_reg(code, local, 16, 0, false);
+  elf_emit_store_local_slot_reg(code, local, 16, 0, true);
 }
 
 static void elf_emit_maybe_scalar_clear(ZBuf *code, const IrLocal *local) {
@@ -1005,7 +1009,7 @@ static bool elf_emit_byte_view_len(ZBuf *code, const IrFunction *fun, const IrVa
     return true;
   }
   if (view && view->kind == IR_VALUE_MAYBE_VALUE && view->local_index < fun->local_len && fun->locals[view->local_index].type == IR_TYPE_MAYBE_BYTE_VIEW) {
-    elf_emit_load_local_slot_reg(code, &fun->locals[view->local_index], 16, 0, false);
+    elf_emit_load_local_slot_reg(code, &fun->locals[view->local_index], 16, 0, true);
     return true;
   }
   (void)ctx;
@@ -1059,7 +1063,7 @@ static bool elf_emit_value(ZBuf *code, const IrFunction *fun, const IrValue *val
   if (!elf_type_is_supported_scalar(value->type) && !((value->kind == IR_VALUE_CALL || value->kind == IR_VALUE_CHECK) && value->type == IR_TYPE_VOID) &&
       value->kind != IR_VALUE_MAYBE_HAS && value->kind != IR_VALUE_VEC_LEN && value->kind != IR_VALUE_VEC_CAPACITY &&
       value->kind != IR_VALUE_VEC_PUSH && value->kind != IR_VALUE_ARGS_LEN &&
-      value->type != IR_TYPE_MAYBE_SCALAR && value->kind != IR_VALUE_FS_CLOSE_FILE) {
+      value->type != IR_TYPE_MAYBE_SCALAR && value->kind != IR_VALUE_FS_CLOSE_FILE && value->kind != IR_VALUE_FS_MUNMAP) {
     return elf_diag(diag, "direct ELF64 object backend currently supports only primitive numeric values", value->line, value->column, elf_type_name(value->type));
   }
   switch (value->kind) {
@@ -1543,6 +1547,23 @@ static bool elf_emit_value(ZBuf *code, const IrFunction *fun, const IrValue *val
       elf_emit_load_local_rax(code, fun, value->local_index);
       elf_emit_close_rax_fd(code);
       return true;
+    case IR_VALUE_FS_MUNMAP: {
+      if (value->local_index >= fun->local_len || fun->locals[value->local_index].type != IR_TYPE_BYTE_VIEW) return elf_diag(diag, "direct ELF64 std.fs.munmap local is invalid", value->line, value->column, "invalid Mapping");
+      const IrLocal *mapping = &fun->locals[value->local_index];
+      elf_emit_load_local_slot_rax(code, mapping, 0);
+      elf_append_u8(code, 0x48);
+      elf_append_u8(code, 0x89);
+      elf_append_u8(code, 0xc7);
+      elf_emit_load_local_slot_rax(code, mapping, 8);
+      elf_append_u8(code, 0x48);
+      elf_append_u8(code, 0x89);
+      elf_append_u8(code, 0xc6);
+      elf_append_u8(code, 0xb8);
+      elf_append_u32(code, 11);
+      elf_append_u8(code, 0x0f);
+      elf_append_u8(code, 0x05);
+      return true;
+    }
     case IR_VALUE_FS_EXISTS:
     case IR_VALUE_FS_IS_DIR: {
       unsigned flags = value->kind == IR_VALUE_FS_IS_DIR ? 65536u : 0u;
@@ -2457,7 +2478,7 @@ static bool elf_emit_args_get_to_local(ZBuf *text, const IrFunction *fun, const 
   elf_emit_store_local_slot_reg(text, local, 0, 0, false);
   elf_append_u8(text, 0x58);
   elf_emit_store_local_slot_rax(text, local, 8);
-  elf_emit_store_local_slot_reg(text, local, 16, 1, false);
+  elf_emit_store_local_slot_reg(text, local, 16, 1, true);
   elf_patch_rel32(text, end, text->len);
   return true;
 }
@@ -2542,7 +2563,7 @@ static bool elf_emit_env_get_to_local(ZBuf *text, const IrFunction *fun, const I
   elf_emit_store_local_slot_reg(text, local, 0, 0, false);
   elf_append_u8(text, 0x58);
   elf_emit_store_local_slot_rax(text, local, 8);
-  elf_emit_store_local_slot_reg(text, local, 16, 1, false);
+  elf_emit_store_local_slot_reg(text, local, 16, 1, true);
   size_t end = elf_emit_jmp32_placeholder(text, 0xe9);
 
   elf_patch_rel32(text, next, text->len);
@@ -2706,6 +2727,131 @@ static bool elf_emit_read_all_or_raise_to_local(ZBuf *text, const IrFunction *fu
   return true;
 }
 
+// Emits open(path, O_RDONLY) -> lseek(SEEK_END) -> mmap(PROT_READ, MAP_PRIVATE, fd) -> close(fd).
+// On exit: rax = mapping address on success, or a negative errno on any failure path;
+//          rdx = file size (valid only on success). The machine stack is balanced on every path,
+//          and the file descriptor is always closed (the mapping survives the close).
+static bool elf_emit_mmap_file_addr_size(ZBuf *text, const IrFunction *fun, const IrValue *path, ElfEmitContext *ctx, ZDiag *diag) {
+  if (!elf_emit_openat_path(text, fun, path, 0, 0, ctx, diag)) return false;
+  elf_append_u8(text, 0x48);
+  elf_append_u8(text, 0x85);
+  elf_append_u8(text, 0xc0);
+  size_t open_fail = elf_emit_js_placeholder(text);
+  elf_append_u8(text, 0x50);
+  elf_append_u8(text, 0x48);
+  elf_append_u8(text, 0x89);
+  elf_append_u8(text, 0xc7);
+  elf_append_u8(text, 0x48);
+  elf_append_u8(text, 0x31);
+  elf_append_u8(text, 0xf6);
+  elf_append_u8(text, 0xba);
+  elf_append_u32(text, 2);
+  elf_append_u8(text, 0xb8);
+  elf_append_u32(text, 8);
+  elf_append_u8(text, 0x0f);
+  elf_append_u8(text, 0x05);
+  elf_append_u8(text, 0x48);
+  elf_append_u8(text, 0x85);
+  elf_append_u8(text, 0xc0);
+  size_t seek_fail = elf_emit_js_placeholder(text);
+  elf_append_u8(text, 0x50);
+  elf_append_u8(text, 0x48);
+  elf_append_u8(text, 0x89);
+  elf_append_u8(text, 0xc6);
+  elf_append_u8(text, 0x31);
+  elf_append_u8(text, 0xff);
+  elf_append_u8(text, 0xba);
+  elf_append_u32(text, 1);
+  elf_append_u8(text, 0x41);
+  elf_append_u8(text, 0xba);
+  elf_append_u32(text, 2);
+  elf_append_u8(text, 0x4c);
+  elf_append_u8(text, 0x8b);
+  elf_append_u8(text, 0x44);
+  elf_append_u8(text, 0x24);
+  elf_append_u8(text, 0x08);
+  elf_append_u8(text, 0x45);
+  elf_append_u8(text, 0x31);
+  elf_append_u8(text, 0xc9);
+  elf_append_u8(text, 0xb8);
+  elf_append_u32(text, 9);
+  elf_append_u8(text, 0x0f);
+  elf_append_u8(text, 0x05);
+  elf_append_u8(text, 0x48);
+  elf_append_u8(text, 0x8b);
+  elf_append_u8(text, 0x7c);
+  elf_append_u8(text, 0x24);
+  elf_append_u8(text, 0x08);
+  elf_append_u8(text, 0x50);
+  elf_append_u8(text, 0xb8);
+  elf_append_u32(text, 3);
+  elf_append_u8(text, 0x0f);
+  elf_append_u8(text, 0x05);
+  elf_append_u8(text, 0x58);
+  elf_append_u8(text, 0x5a);
+  elf_append_u8(text, 0x48);
+  elf_append_u8(text, 0x83);
+  elf_append_u8(text, 0xc4);
+  elf_append_u8(text, 0x08);
+  size_t done = elf_emit_jmp32_placeholder(text, 0xe9);
+  elf_patch_rel32(text, seek_fail, text->len);
+  elf_append_u8(text, 0x48);
+  elf_append_u8(text, 0x8b);
+  elf_append_u8(text, 0x3c);
+  elf_append_u8(text, 0x24);
+  elf_append_u8(text, 0x50);
+  elf_append_u8(text, 0xb8);
+  elf_append_u32(text, 3);
+  elf_append_u8(text, 0x0f);
+  elf_append_u8(text, 0x05);
+  elf_append_u8(text, 0x58);
+  elf_append_u8(text, 0x48);
+  elf_append_u8(text, 0x83);
+  elf_append_u8(text, 0xc4);
+  elf_append_u8(text, 0x08);
+  size_t seek_done = elf_emit_jmp32_placeholder(text, 0xe9);
+  elf_patch_rel32(text, open_fail, text->len);
+  elf_patch_rel32(text, done, text->len);
+  elf_patch_rel32(text, seek_done, text->len);
+  return true;
+}
+
+// `let m = check std.fs.mmap(fs, path)` — unwraps Maybe<owned<Mapping>> into a BYTE_VIEW
+// Mapping local (ptr@0, len@8), raising on failure. Mirrors elf_emit_read_all_or_raise_to_local.
+static bool elf_emit_mmap_or_raise_to_local(ZBuf *text, const IrFunction *fun, const IrInstr *instr, ElfEmitContext *ctx, ZDiag *diag) {
+  if (!fun || !instr || instr->local_index >= fun->local_len || fun->locals[instr->local_index].type != IR_TYPE_BYTE_VIEW) {
+    return elf_diag(diag, "direct ELF64 std.fs.mmap local is invalid", instr ? instr->line : 1, instr ? instr->column : 1, "invalid Mapping local");
+  }
+  if (!instr->value || instr->value->kind != IR_VALUE_CHECK || !instr->value->left || instr->value->left->kind != IR_VALUE_FS_MMAP) {
+    return elf_diag(diag, "direct ELF64 checked std.fs.mmap local requires an mmap check", instr->line, instr->column, "unsupported checked mmap");
+  }
+  if (!elf_function_propagates_to_process_exit(fun)) {
+    return elf_diag(diag, "direct ELF64 std.fs.mmap check requires a fallible function context", instr->line, instr->column, "non-fallible context");
+  }
+  const IrValue *value = instr->value->left;
+  const IrLocal *local = &fun->locals[instr->local_index];
+  if (!elf_emit_mmap_file_addr_size(text, fun, value->left, ctx, diag)) return false;
+  elf_append_u8(text, 0x48);
+  elf_append_u8(text, 0x85);
+  elf_append_u8(text, 0xc0);
+  size_t fail = elf_emit_js_placeholder(text);
+  elf_emit_store_local_slot_rax(text, local, 0);
+  elf_append_u8(text, 0x48);
+  elf_append_u8(text, 0x89);
+  elf_append_u8(text, 0xd0);
+  elf_emit_store_local_slot_rax(text, local, 8);
+  size_t end = elf_emit_jmp32_placeholder(text, 0xe9);
+  elf_patch_rel32(text, fail, text->len);
+  elf_emit_set_error_rdx(text, IR_ERROR_NOT_FOUND);
+  if (!fun->raises) {
+    elf_append_u8(text, 0xb8);
+    elf_append_u32(text, 1);
+  }
+  elf_emit_epilogue(text, fun, ctx);
+  elf_patch_rel32(text, end, text->len);
+  return true;
+}
+
 static bool elf_emit_instr(ZBuf *text, const IrFunction *fun, const IrInstr *instr, ElfEmitContext *ctx, ZDiag *diag) {
   if (instr->kind == IR_INSTR_WORLD_WRITE) {
     return elf_emit_world_write(text, fun, instr, ctx, diag);
@@ -2716,6 +2862,9 @@ static bool elf_emit_instr(ZBuf *text, const IrFunction *fun, const IrInstr *ins
       if (instr->value && instr->value->kind == IR_VALUE_CHECK && instr->value->left && instr->value->left->kind == IR_VALUE_FS_READ_ALL) {
         return elf_emit_read_all_or_raise_to_local(text, fun, instr, ctx, diag);
       }
+      if (instr->value && instr->value->kind == IR_VALUE_CHECK && instr->value->left && instr->value->left->kind == IR_VALUE_FS_MMAP) {
+        return elf_emit_mmap_or_raise_to_local(text, fun, instr, ctx, diag);
+      }
       if (!elf_emit_byte_view_ptr(text, fun, instr->value, ctx, diag)) return false;
       elf_emit_store_local_slot_rax(text, local, 0);
       if (!elf_emit_byte_view_len(text, fun, instr->value, ctx, diag)) return false;
@@ -2724,6 +2873,12 @@ static bool elf_emit_instr(ZBuf *text, const IrFunction *fun, const IrInstr *ins
     }
     if (instr->local_index < fun->local_len && fun->locals[instr->local_index].type == IR_TYPE_ALLOC) {
       const IrLocal *local = &fun->locals[instr->local_index];
+      if (instr->value && instr->value->kind == IR_VALUE_PAGE_ALLOC) {
+        elf_append_u8(text, 0x31);
+        elf_append_u8(text, 0xc0);
+        elf_emit_store_local_slot_reg(text, local, 0, 0, true);
+        return true;
+      }
       if (!instr->value || instr->value->kind != IR_VALUE_FIXED_BUF_ALLOC) return elf_diag(diag, "direct ELF64 FixedBufAlloc local requires std.mem.fixedBufAlloc", instr->line, instr->column, "unsupported allocator initializer");
       if (!elf_emit_byte_view_ptr(text, fun, instr->value->left, ctx, diag)) return false;
       elf_emit_store_local_slot_rax(text, local, 0);
@@ -2795,7 +2950,7 @@ static bool elf_emit_instr(ZBuf *text, const IrFunction *fun, const IrInstr *ins
         elf_emit_store_local_slot_rax(text, local, 8);
         elf_append_u8(text, 0xb8);
         elf_append_u32(text, total_len);
-        elf_emit_store_local_slot_reg(text, local, 16, 0, false);
+        elf_emit_store_local_slot_reg(text, local, 16, 0, true);
         return true;
       }
       if (instr->value && instr->value->kind == IR_VALUE_ARGS_GET) {
@@ -2839,7 +2994,7 @@ static bool elf_emit_instr(ZBuf *text, const IrFunction *fun, const IrInstr *ins
         elf_emit_load_local_slot_reg(text, alloc, 0, 0, true);
         elf_emit_store_local_slot_reg(text, local, 8, 0, true);
         elf_append_u8(text, 0x58);
-        elf_emit_store_local_slot_reg(text, local, 16, 0, false);
+        elf_emit_store_local_slot_reg(text, local, 16, 0, true);
         elf_emit_store_local_slot_reg(text, alloc, 12, 0, false);
         size_t end = elf_emit_jmp32_placeholder(text, 0xe9);
         elf_patch_rel32(text, open_fail, text->len);
@@ -2848,8 +3003,73 @@ static bool elf_emit_instr(ZBuf *text, const IrFunction *fun, const IrInstr *ins
         elf_patch_rel32(text, end, text->len);
         return true;
       }
+      if (instr->value && instr->value->kind == IR_VALUE_FS_MMAP) {
+        if (!elf_emit_mmap_file_addr_size(text, fun, instr->value->left, ctx, diag)) return false;
+        elf_append_u8(text, 0x48);
+        elf_append_u8(text, 0x85);
+        elf_append_u8(text, 0xc0);
+        size_t mmap_fail = elf_emit_js_placeholder(text);
+        elf_append_u8(text, 0x50);
+        elf_append_u8(text, 0xb8);
+        elf_append_u32(text, 1);
+        elf_emit_store_local_slot_reg(text, local, 0, 0, false);
+        elf_append_u8(text, 0x58);
+        elf_emit_store_local_slot_rax(text, local, 8);
+        elf_append_u8(text, 0x48);
+        elf_append_u8(text, 0x89);
+        elf_append_u8(text, 0xd0);
+        elf_emit_store_local_slot_reg(text, local, 16, 0, true);
+        size_t mmap_end = elf_emit_jmp32_placeholder(text, 0xe9);
+        elf_patch_rel32(text, mmap_fail, text->len);
+        elf_emit_maybe_clear(text, local);
+        elf_patch_rel32(text, mmap_end, text->len);
+        return true;
+      }
       if (!instr->value || instr->value->kind != IR_VALUE_ALLOC_BYTES || instr->value->local_index >= fun->local_len || fun->locals[instr->value->local_index].type != IR_TYPE_ALLOC) return elf_diag(diag, "direct ELF64 allocation source is invalid", instr->line, instr->column, "invalid allocation");
       const IrLocal *alloc = &fun->locals[instr->value->local_index];
+      if (alloc->is_page_alloc) {
+        if (!elf_emit_value(text, fun, instr->value->left, ctx, diag)) return false;
+        elf_append_u8(text, 0x50);
+        elf_append_u8(text, 0x48);
+        elf_append_u8(text, 0x89);
+        elf_append_u8(text, 0xc6);
+        elf_append_u8(text, 0x31);
+        elf_append_u8(text, 0xff);
+        elf_append_u8(text, 0xba);
+        elf_append_u32(text, 3);
+        elf_append_u8(text, 0x41);
+        elf_append_u8(text, 0xba);
+        elf_append_u32(text, 0x22);
+        elf_append_u8(text, 0x49);
+        elf_append_u8(text, 0xc7);
+        elf_append_u8(text, 0xc0);
+        elf_append_u32(text, 0xffffffff);
+        elf_append_u8(text, 0x45);
+        elf_append_u8(text, 0x31);
+        elf_append_u8(text, 0xc9);
+        elf_append_u8(text, 0xb8);
+        elf_append_u32(text, 9);
+        elf_append_u8(text, 0x0f);
+        elf_append_u8(text, 0x05);
+        elf_append_u8(text, 0x48);
+        elf_append_u8(text, 0x85);
+        elf_append_u8(text, 0xc0);
+        size_t anon_fail = elf_emit_js_placeholder(text);
+        elf_append_u8(text, 0x50);
+        elf_append_u8(text, 0xb8);
+        elf_append_u32(text, 1);
+        elf_emit_store_local_slot_reg(text, local, 0, 0, false);
+        elf_append_u8(text, 0x58);
+        elf_emit_store_local_slot_rax(text, local, 8);
+        elf_append_u8(text, 0x58);
+        elf_emit_store_local_slot_reg(text, local, 16, 0, true);
+        size_t anon_end = elf_emit_jmp32_placeholder(text, 0xe9);
+        elf_patch_rel32(text, anon_fail, text->len);
+        elf_append_u8(text, 0x58);
+        elf_emit_maybe_clear(text, local);
+        elf_patch_rel32(text, anon_end, text->len);
+        return true;
+      }
       if (!elf_emit_value(text, fun, instr->value->left, ctx, diag)) return false;
       elf_append_u8(text, 0x50);
       elf_emit_load_local_slot_reg(text, alloc, 12, 1, false);
@@ -2862,7 +3082,7 @@ static bool elf_emit_instr(ZBuf *text, const IrFunction *fun, const IrInstr *ins
       elf_emit_store_local_slot_reg(text, local, 0, 0, false);
       elf_emit_store_local_slot_reg(text, local, 8, 2, true);
       elf_append_u8(text, 0x58);
-      elf_emit_store_local_slot_reg(text, local, 16, 0, false);
+      elf_emit_store_local_slot_reg(text, local, 16, 0, true);
       elf_append_u8(text, 0x01);
       elf_append_u8(text, 0xc1);
       elf_emit_store_local_slot_reg(text, alloc, 12, 1, false);

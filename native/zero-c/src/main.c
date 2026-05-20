@@ -734,6 +734,7 @@ typedef struct {
   bool fs;
   bool memory;
   bool alloc;
+  bool heap;
   bool path;
   bool codec;
   bool parse;
@@ -847,8 +848,8 @@ static const StdHelperInfo std_helpers[] = {
   {"std.mem.nullAlloc", "NullAlloc", 0, "alloc", "target-neutral", "never allocates", true},
   {"std.mem.fixedBufAlloc", "FixedBufAlloc", 1, "alloc", "target-neutral", "uses caller buffer", true},
   {"std.mem.arena", "FixedBufAlloc", 1, "alloc", "target-neutral", "bulk allocation over caller buffer", true},
-  {"std.mem.pageAlloc", "PageAlloc", 0, "alloc", "host", "explicit page allocator handle", false},
-  {"std.mem.generalAlloc", "GeneralAlloc", 0, "alloc", "host", "explicit general allocator handle", false},
+  {"std.mem.pageAlloc", "PageAlloc", 0, "heap", "host", "explicit page allocator handle", false},
+  {"std.mem.generalAlloc", "GeneralAlloc", 0, "heap", "host", "explicit general allocator handle", false},
   {"std.mem.allocBytes", "Maybe<MutSpan<u8>>", 2, "alloc", "target-neutral", "uses explicit allocator only", true},
   {"std.mem.byteBuf", "Maybe<owned<ByteBuf>>", 2, "alloc", "target-neutral", "uses explicit allocator only", true},
   {"std.mem.vec", "Vec", 1, "memory", "target-neutral", "uses caller storage", true},
@@ -1037,6 +1038,10 @@ static void capability_summary_set(CapabilitySummary *caps, const char *capabili
   else if (strcmp(capability, "alloc") == 0) {
     caps->alloc = true;
     caps->memory = true;
+  } else if (strcmp(capability, "heap") == 0) {
+    caps->heap = true;
+    caps->alloc = true;
+    caps->memory = true;
   } else if (strcmp(capability, "path") == 0) caps->path = true;
   else if (strcmp(capability, "codec") == 0) caps->codec = true;
   else if (strcmp(capability, "parse") == 0) caps->parse = true;
@@ -1063,6 +1068,7 @@ static void append_capability_json_array(ZBuf *buf, const CapabilitySummary *cap
   APPEND_CAP("fs", caps && caps->fs);
   APPEND_CAP("memory", caps && caps->memory);
   APPEND_CAP("alloc", caps && caps->alloc);
+  APPEND_CAP("heap", caps && caps->heap);
   APPEND_CAP("path", caps && caps->path);
   APPEND_CAP("codec", caps && caps->codec);
   APPEND_CAP("parse", caps && caps->parse);
@@ -1316,6 +1322,8 @@ static void collect_capabilities_from_std_name(const char *name, CapabilitySumma
         strcmp(name, "std.mem.byteBuf") == 0 ||
         strcmp(name, "std.mem.reset") == 0 ||
         strcmp(name, "std.mem.capacity") == 0) caps->alloc = true;
+    if (strcmp(name, "std.mem.pageAlloc") == 0 ||
+        strcmp(name, "std.mem.generalAlloc") == 0) capability_summary_set(caps, "heap");
   }
 }
 
@@ -1385,6 +1393,7 @@ static CapabilitySummary function_capabilities(const Function *fun) {
     else if (strcmp(type, "Proc") == 0) caps.proc = true;
     else if (strcmp(type, "Clock") == 0) caps.time = true;
     else if (strcmp(type, "Rand") == 0) caps.rand = true;
+    else if (strcmp(type, "PageAlloc") == 0 || strcmp(type, "GeneralAlloc") == 0) capability_summary_set(&caps, "heap");
     else if (strcmp(type, "Alloc") == 0 || strcmp(type, "FixedBufAlloc") == 0 || strcmp(type, "NullAlloc") == 0) capability_summary_set(&caps, "alloc");
     if (strstr(type, "Span<") || strstr(type, "MutSpan<") || strstr(type, "ByteBuf")) caps.memory = true;
   }
@@ -1401,6 +1410,7 @@ static CapabilitySummary program_capabilities(const Program *program) {
     caps.fs = caps.fs || fun_caps.fs;
     caps.memory = caps.memory || fun_caps.memory;
     caps.alloc = caps.alloc || fun_caps.alloc;
+    caps.heap = caps.heap || fun_caps.heap;
     caps.path = caps.path || fun_caps.path;
     caps.codec = caps.codec || fun_caps.codec;
     caps.parse = caps.parse || fun_caps.parse;
@@ -1422,6 +1432,7 @@ static CapabilitySummary program_capabilities(const Program *program) {
       caps.fs = caps.fs || fun_caps.fs;
       caps.memory = caps.memory || fun_caps.memory;
       caps.alloc = caps.alloc || fun_caps.alloc;
+      caps.heap = caps.heap || fun_caps.heap;
       caps.path = caps.path || fun_caps.path;
       caps.codec = caps.codec || fun_caps.codec;
       caps.parse = caps.parse || fun_caps.parse;
@@ -1481,6 +1492,7 @@ static bool validate_target_capabilities(const Program *program, const ZTargetIn
   DENY_CAP(net, "net", "Net");
   DENY_CAP(proc, "proc", "Proc");
   DENY_CAP(web, "web", "Web");
+  DENY_CAP(heap, "heap", "Heap");
 #undef DENY_CAP
   if (caps.world && !z_target_has_capability(target, "stdio")) {
     diag->code = 6002;
@@ -4372,7 +4384,7 @@ static const char *release_artifact_kind_for_emit(const ZTargetInfo *target, con
 }
 
 static void append_target_capability_contract_json(ZBuf *buf, const ZTargetInfo *target) {
-  const char *capabilities[] = {"memory", "stdio", "args", "env", "fs", "net", "proc", "time", "rand", "web", NULL};
+  const char *capabilities[] = {"memory", "stdio", "args", "env", "fs", "heap", "net", "proc", "time", "rand", "web", NULL};
   zbuf_append(buf, "[");
   for (int i = 0; capabilities[i]; i++) {
     if (i > 0) zbuf_append(buf, ",");
@@ -4386,7 +4398,7 @@ static void append_target_capability_contract_json(ZBuf *buf, const ZTargetInfo 
 }
 
 static void append_target_capability_names_json(ZBuf *buf, const ZTargetInfo *target) {
-  const char *capabilities[] = {"memory", "stdio", "args", "env", "fs", "net", "proc", "time", "rand", "web", NULL};
+  const char *capabilities[] = {"memory", "stdio", "args", "env", "fs", "heap", "net", "proc", "time", "rand", "web", NULL};
   bool first = true;
   zbuf_append(buf, "[");
   for (int i = 0; capabilities[i]; i++) {
@@ -4669,7 +4681,7 @@ static void append_allocator_facts_json(ZBuf *buf, const MemoryModelSummary *sum
                summary && summary->arena_count > 0 ? "true" : "false",
                summary ? summary->arena_count : 0,
                arena_capacity);
-  zbuf_appendf(buf, ", {\"kind\":\"PageAlloc\",\"used\":%s,\"instances\":%zu,\"capacityBytes\":0,\"status\":\"explicit-host-handle\",\"failure\":\"Maybe.none or target diagnostic before codegen\",\"hiddenGlobalAllocator\":false}",
+  zbuf_appendf(buf, ", {\"kind\":\"PageAlloc\",\"used\":%s,\"instances\":%zu,\"capacityBytes\":0,\"status\":\"anonymous-mmap\",\"capability\":\"heap\",\"failure\":\"Maybe.none or target diagnostic before codegen\",\"hiddenGlobalAllocator\":false}",
                summary && summary->page_allocator_count > 0 ? "true" : "false",
                summary ? summary->page_allocator_count : 0);
   zbuf_appendf(buf, ", {\"kind\":\"GeneralAlloc\",\"used\":%s,\"instances\":%zu,\"capacityBytes\":0,\"status\":\"explicit-handle-no-default-global\",\"failure\":\"Maybe.none on failure\",\"hiddenGlobalAllocator\":false}",
@@ -6013,6 +6025,7 @@ static bool append_missing_capabilities_json(ZBuf *buf, const CapabilitySummary 
   APPEND_MISSING_CAP("fs", caps && caps->fs);
   APPEND_MISSING_CAP("memory", caps && caps->memory);
   APPEND_MISSING_CAP("alloc", caps && caps->alloc);
+  APPEND_MISSING_CAP("heap", caps && caps->heap);
   APPEND_MISSING_CAP("path", caps && caps->path);
   APPEND_MISSING_CAP("codec", caps && caps->codec);
   APPEND_MISSING_CAP("parse", caps && caps->parse);

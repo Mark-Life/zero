@@ -419,6 +419,7 @@ typedef enum {
   IR_VALUE_BYTE_FILL,
   IR_VALUE_CRC32_BYTES,
   IR_VALUE_FIXED_BUF_ALLOC,
+  IR_VALUE_PAGE_ALLOC,
   IR_VALUE_VEC_INIT,
   IR_VALUE_VEC_PUSH,
   IR_VALUE_VEC_LEN,
@@ -446,6 +447,8 @@ typedef enum {
   IR_VALUE_FS_READ_FILE,
   IR_VALUE_FS_WRITE_ALL_FILE,
   IR_VALUE_FS_CLOSE_FILE,
+  IR_VALUE_FS_MMAP,
+  IR_VALUE_FS_MUNMAP,
   IR_VALUE_FS_EXISTS,
   IR_VALUE_FS_REMOVE,
   IR_VALUE_FS_RENAME,
@@ -574,6 +577,7 @@ typedef struct {
   bool is_array;
   bool is_record;
   bool is_mutable;
+  bool is_page_alloc;
   char *shape_name;
   int line;
   int column;
