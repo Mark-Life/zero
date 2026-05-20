@@ -1,0 +1,24 @@
+pub fun main(world: World) -> Void raises {
+    let buf: [16]u8 = [0, 0, 0, 0, 0, 0, 240, 63, 0, 0, 0, 0, 0, 0, 0, 64]
+    let span: Span<u8> = buf
+    let view: Span<f64> = std.mem.bytesAsF64(span)
+    let r0: f64 = view[0]
+    let r1: f64 = view[1]
+    let one: f64 = 1.0
+    let two: f64 = 2.0
+    let alloc = std.mem.pageAlloc()
+    let region = std.mem.allocBytes(alloc, 4096)
+    if region.has && std.mem.len(view) == 2 && r0 == one && r1 == two {
+        let bytes: MutSpan<u8> = region.value
+        let doubles: MutSpan<f64> = std.mem.bytesAsMutF64(bytes)
+        doubles[0] = 1.25
+        doubles[511] = 6.5
+        let a: f64 = doubles[0]
+        let b: f64 = doubles[511]
+        let onePointTwoFive: f64 = 1.25
+        let sixPointFive: f64 = 6.5
+        if std.mem.len(doubles) == 512 && a == onePointTwoFive && b == sixPointFive {
+            check world.out.write("mem bytes as f64 ok\n")
+        }
+    }
+}

@@ -1011,6 +1011,19 @@ static bool ir_lower_array_literal_byte_view(IrProgram *ir, const Expr *expr, Ir
   return true;
 }
 
+static bool ir_byte_view_reinterpret_element(const char *callee, IrTypeKind *out) {
+  if (!callee) return false;
+  if (strcmp(callee, "std.mem.bytesAsF32") == 0 || strcmp(callee, "std.mem.bytesAsMutF32") == 0) {
+    if (out) *out = IR_TYPE_F32;
+    return true;
+  }
+  if (strcmp(callee, "std.mem.bytesAsF64") == 0 || strcmp(callee, "std.mem.bytesAsMutF64") == 0) {
+    if (out) *out = IR_TYPE_F64;
+    return true;
+  }
+  return false;
+}
+
 static bool ir_lower_byte_view(const Program *program, IrProgram *ir, const IrFunction *fun, const Expr *expr, IrValue **out) {
   if (!expr) {
     ir_mark_unsupported(ir, "direct backend byte view is missing", 1, 1, "missing expression");
@@ -1044,8 +1057,19 @@ static bool ir_lower_byte_view(const Program *program, IrProgram *ir, const IrFu
     bool is_buf_bytes = (callee && strcmp(callee, "std.mem.bufBytes") == 0) || member_buf_bytes;
     bool is_mapping_bytes = (callee && strcmp(callee, "std.fs.mappingBytes") == 0) || member_mapping_bytes;
     bool is_io_buffer = callee && (strcmp(callee, "std.io.bufferedReader") == 0 || strcmp(callee, "std.io.bufferedWriter") == 0);
+    IrTypeKind reinterpret_elem = IR_TYPE_VOID;
+    bool is_reinterpret = ir_byte_view_reinterpret_element(callee, &reinterpret_elem);
     free(callee);
     if (is_span || is_io_buffer) return ir_lower_byte_view(program, ir, fun, expr->args.items[0], out);
+    if (is_reinterpret) {
+      IrValue *inner = NULL;
+      if (!ir_lower_byte_view(program, ir, fun, expr->args.items[0], &inner)) return false;
+      IrValue *value = ir_new_value(ir, IR_VALUE_BYTE_VIEW_REINTERPRET, IR_TYPE_BYTE_VIEW, expr->line, expr->column);
+      value->left = inner;
+      value->element_type = reinterpret_elem;
+      *out = value;
+      return true;
+    }
     if (is_buf_bytes || is_mapping_bytes) {
       const Expr *arg = expr->args.items[0];
       if (arg && arg->kind == EXPR_BORROW) arg = arg->left;

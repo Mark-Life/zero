@@ -18,6 +18,8 @@ Runnable today:
 | `std.mem.allocBytes(alloc, len)` | `Maybe<MutSpan<u8>>` | Allocates `len` bytes. With `NullAlloc` or `FixedBufAlloc`: uses caller-owned storage. With `PageAlloc`: returns a zero-filled `MutSpan<u8>` from a fresh anonymous mapping (kernel-zeroed pages — `calloc` semantics). `Maybe.none` if the mapping fails. |
 | `std.mem.byteBuf(alloc, len)` | `Maybe<owned<ByteBuf>>` | Creates an owned byte buffer backed by explicit caller-provided allocator storage. |
 | `std.mem.bufBytes(&buf)` | `MutSpan<u8>` | Borrows writable bytes from an owned `ByteBuf`. |
+| `std.mem.bytesAsF32(bytes)` / `std.mem.bytesAsF64(bytes)` | `Span<f32>` / `Span<f64>` | Reinterprets a `Span<u8>` as a typed float view over the same bytes — no copy, no allocation. Length becomes `byteLen / 4` (or `/ 8`); the pointer is unchanged. |
+| `std.mem.bytesAsMutF32(bytes)` / `std.mem.bytesAsMutF64(bytes)` | `MutSpan<f32>` / `MutSpan<f64>` | Mutable form over `MutSpan<u8>`. Required to *write* float results into a heap region: there is no `writeF32Le`, so kernels store through a typed span. |
 | `std.mem.bufLen(&buf)` | `usize` | Returns the live length of a `ByteBuf`. |
 | `std.mem.reset(&mut arena)` | `Void` | Resets caller-owned arena/fixed-buffer allocation state. |
 | `std.mem.capacity(arena)` | `usize` | Reports fixed-buffer capacity. |
@@ -128,6 +130,35 @@ the duration of the process; there is no per-allocation free in v0.1.
 `PageAlloc` requires the `heap` capability; `FixedBufAlloc`/`Arena`/`NullAlloc`
 require only `alloc`.
 
+## Typed Reinterpret Example
+
+`bytesAs*` views a byte region as floats without copying, so kernels keep their
+`Span<f32>`/`MutSpan<f32>` signatures over mmap'd weights or a `pageAlloc`'d
+scratch region (based on `conformance/native/pass/mem-bytes-as-mut-f32.0`):
+
+```zero
+pub fun main(world: World) -> Void raises {
+    let alloc = std.mem.pageAlloc()
+    let region = std.mem.allocBytes(alloc, 4096)
+    if region.has {
+        let bytes: MutSpan<u8> = region.value
+        let floats: MutSpan<f32> = std.mem.bytesAsMutF32(bytes)
+        floats[0] = 1.5
+        floats[1] = 2.5
+        floats[3] = floats[0] + floats[1]
+        if std.mem.len(floats) == 1024 && floats[3] == 4.0 {
+            check world.out.write("typed reinterpret ok\n")
+        }
+    }
+}
+```
+
+The result aliases the same memory: a 4096-byte region becomes a `MutSpan<f32>`
+of length `4096 / 4 = 1024`. Reinterpreting a read-only `Span<u8>` (for example
+from `std.fs.mappingBytes`) yields a `Span<f32>`; compose with a byte slice to
+carve a tensor at an offset, e.g. `std.mem.bytesAsF32(weights[off..off + n * 4])`.
+Offsets are 4-/8-aligned in practice; loads and stores use unaligned
+`MOVSS`/`MOVSD`, so misaligned regions stay correct.
 
 ## Reporting Contract
 

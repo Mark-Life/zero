@@ -321,6 +321,10 @@ for (const fixture of [
   "conformance/native/pass/codec-read-i32-le.0",
   "conformance/native/pass/codec-read-u32-le.0",
   "conformance/native/pass/codec-read-i32-le-offset.0",
+  "conformance/native/pass/mem-bytes-as-f32.0",
+  "conformance/native/pass/mem-bytes-as-mut-f32.0",
+  "conformance/native/pass/mem-bytes-as-f64.0",
+  "conformance/native/pass/mem-bytes-as-f32-mmap.0",
   "conformance/native/pass/wrapping-saturating-arithmetic.0",
   "conformance/native/pass/maybe-error-flow.0",
   "conformance/native/pass/match-scalar-guards.0",
@@ -1821,6 +1825,10 @@ for (const runtimeFixture of [
   ["conformance/native/pass/codec-read-i32-le.0", "codec-read-i32-le", { stdout: "codec read i32 le ok\n" }],
   ["conformance/native/pass/codec-read-u32-le.0", "codec-read-u32-le", { stdout: "codec read u32 le ok\n" }],
   ["conformance/native/pass/codec-read-i32-le-offset.0", "codec-read-i32-le-offset", { stdout: "codec read i32 le offset ok\n" }],
+  ["conformance/native/pass/mem-bytes-as-f32.0", "mem-bytes-as-f32", { stdout: "mem bytes as f32 ok\n" }],
+  ["conformance/native/pass/mem-bytes-as-mut-f32.0", "mem-bytes-as-mut-f32", { stdout: "mem bytes as mut f32 ok\n" }],
+  ["conformance/native/pass/mem-bytes-as-f64.0", "mem-bytes-as-f64", { stdout: "mem bytes as f64 ok\n" }],
+  ["conformance/native/pass/mem-bytes-as-f32-mmap.0", "mem-bytes-as-f32-mmap", { stdout: "mem bytes as f32 mmap ok\n" }],
   ["conformance/native/pass/checked-bounds-get.0", "checked-bounds-get", { stdout: "checked bounds get ok\n" }],
   ["conformance/native/pass/check-maybe-fallibility.0", "check-maybe-fallibility", { stdout: "check maybe fallibility ok\n" }],
   ["conformance/native/pass/fallibility-error-sets.0", "fallibility-error-sets", { stdout: "fallibility error sets ok\n" }],
@@ -1895,6 +1903,7 @@ await assertBoundsTrap("conformance/native/fail/slice-string.0", "slice-string")
 await assertBoundsTrap("conformance/native/fail/indexed-mutation-oob.0", "indexed-mutation-oob");
 await assertBoundsTrap("conformance/native/fail/codec-read-f32-le-bounds.0", "codec-read-f32-le-bounds");
 await assertBoundsTrap("conformance/native/fail/codec-read-i32-le-bounds.0", "codec-read-i32-le-bounds");
+await assertBoundsTrap("conformance/native/fail/mem-bytes-as-f32-bounds.0", "mem-bytes-as-f32-bounds");
 
 const failed = await execFileAsync(zero, ["check", "conformance/check/fail/unknown-name.0"]).catch((error) => error);
 assert.notEqual(failed.code, 0);

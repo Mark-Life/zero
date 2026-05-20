@@ -884,6 +884,14 @@ static bool elf_byte_view_const_len(const IrFunction *fun, const IrValue *view, 
     if (out) *out = end - start;
     return true;
   }
+  if (view->kind == IR_VALUE_BYTE_VIEW_REINTERPRET) {
+    unsigned base_len = 0;
+    if (!elf_byte_view_const_len(fun, view->left, &base_len)) return false;
+    unsigned size = elf_type_byte_size(view->element_type);
+    if (size == 0) return false;
+    if (out) *out = base_len / size;
+    return true;
+  }
   if (view->kind == IR_VALUE_LOCAL && view->local_index < fun->local_len && fun->locals[view->local_index].type == IR_TYPE_BYTE_VIEW) {
     return false;
   }
@@ -1004,6 +1012,16 @@ static bool elf_emit_byte_view_len(ZBuf *code, const IrFunction *fun, const IrVa
     elf_append_u8(code, 0xc8);
     return true;
   }
+  if (view && view->kind == IR_VALUE_BYTE_VIEW_REINTERPRET && view->left) {
+    if (!elf_emit_byte_view_len(code, fun, view->left, ctx, diag)) return false;
+    unsigned size = elf_type_byte_size(view->element_type);
+    unsigned shift = size == 8 ? 3 : 2;
+    elf_append_u8(code, 0x48);
+    elf_append_u8(code, 0xc1);
+    elf_append_u8(code, 0xe8);
+    elf_append_u8(code, (unsigned char)shift);
+    return true;
+  }
   if (view && view->kind == IR_VALUE_LOCAL && view->local_index < fun->local_len && fun->locals[view->local_index].type == IR_TYPE_BYTE_VIEW) {
     elf_emit_load_local_slot_rax(code, &fun->locals[view->local_index], 8);
     return true;
@@ -1054,6 +1072,9 @@ static bool elf_emit_byte_view_ptr(ZBuf *code, const IrFunction *fun, const IrVa
     elf_append_u8(code, 0x01);
     elf_append_u8(code, 0xc8);
     return true;
+  }
+  if (view->kind == IR_VALUE_BYTE_VIEW_REINTERPRET) {
+    return elf_emit_byte_view_ptr(code, fun, view->left, ctx, diag);
   }
   return elf_diag(diag, "direct ELF64 value is not a supported byte view", view->line, view->column, "unsupported byte view");
 }
