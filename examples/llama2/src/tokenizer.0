@@ -1,0 +1,275 @@
+// llama2.zero — v0.1, Phase 5 (BPE tokenizer).
+//
+// Loads Karpathy's `tokenizer.bin` (already mmap'd into a byte span) and ports
+// `llama2.c` `encode`/`decode`. The file layout is:
+//
+//   [max_token_length: i32]
+//   per token (vocab_size of them):
+//     [score: f32] [len: i32] [bytes: len]
+//
+// `vocab_size` is NOT in the file — it comes from the checkpoint header (Config).
+//
+// Tokens are variable-length, so random access by id walks the vocab from the
+// start (`entryStart`). There is no offset index and no hashmap: `findStr` is a
+// linear scan and each merge step rescans the vocab — O(vocab) per lookup, slow
+// but correct for v0.1 (plan risk #4; overview "What This Forces" #7). For a
+// short prompt over the 32000-entry vocab this is a few ×10^7 ops (<1s).
+//
+// Two adaptations to the direct ELF64 backend:
+//   - the merge candidate is matched against `vocab[a]+vocab[b]` WITHOUT building
+//     the concatenation (`concatMatch` compares the two halves in place), so no
+//     mutable byte scratch buffer is needed (`MutSpan<u8>` stores are unemitted);
+//   - `encode` takes BOS only (no EOS): the 6-integer-register call ABI can't fit
+//     a 7th argument, and the v0.1 prompt path is `encode(..., bos=1, eos=0)` in
+//     `llama2.c` `run.c` — EOS termination lives in the generation loop, not here.
+
+// A loaded tokenizer: the mapped file bytes plus the two header-derived sizes.
+// `max_token_length` is kept for fidelity to the format (it sizes `llama2.c`'s
+// merge buffer, which `concatMatch` makes unnecessary here).
+pub shape Tokenizer {
+    bytes: Span<u8>,
+    vocab_size: i32,
+    max_token_length: i32,
+}
+
+// Wrap an mmap'd `tokenizer.bin` byte span. Reads the leading `max_token_length`;
+// `vocab_size` is supplied by the caller from the checkpoint Config.
+pub fun buildTokenizer(bytes: Span<u8>, vocab_size: i32) -> Tokenizer {
+    let mtl = std.codec.readI32Le(bytes, 0)
+    return Tokenizer { bytes: bytes, vocab_size: vocab_size, max_token_length: mtl }
+}
+
+// Byte offset of token `id`'s entry (its `score` field), found by walking past
+// the `id` preceding variable-length entries from the first one at offset 4.
+fun entryStart(bytes: Span<u8>, id: usize) -> usize {
+    let mut cur: usize = 4
+    let mut i: usize = 0
+    while i < id {
+        let raw = std.codec.readI32Le(bytes, cur + 4)
+        let len = raw as usize
+        cur = cur + 8 + len
+        i = i + 1
+    }
+    return cur
+}
+
+// The token string for `id`, as a zero-copy view into the mapped file.
+fun tokenStr(t: Tokenizer, id: i32) -> Span<u8> {
+    let bytes = t.bytes
+    let idu = id as usize
+    let cur = entryStart(bytes, idu)
+    let raw = std.codec.readI32Le(bytes, cur + 4)
+    let len = raw as usize
+    let s = cur + 8
+    let e = s + len
+    return bytes[s..e]
+}
+
+// Linear scan for the token whose string equals `s`; returns its id or -1.
+// Mirrors `llama2.c` `str_lookup` but without the sorted vocab + binary search
+// (post-v0.1, per overview #7). Walks every entry once.
+fun findStr(t: Tokenizer, s: Span<u8>) -> i32 {
+    let bytes = t.bytes
+    let vocab = t.vocab_size as usize
+    let mut cur: usize = 4
+    let mut id: usize = 0
+    while id < vocab {
+        let raw = std.codec.readI32Le(bytes, cur + 4)
+        let len = raw as usize
+        let cs = cur + 8
+        let ce = cs + len
+        let cand = bytes[cs..ce]
+        let eq = std.mem.eqlBytes(cand, s)
+        if eq {
+            return id as i32
+        }
+        cur = cur + 8 + len
+        id = id + 1
+    }
+    return 0 - 1
+}
+
+// True when `cand` equals `a` followed by `b`, compared in place (no allocation).
+// Lets the merge loop test `vocab[i] == vocab[a]+vocab[b]` without materializing
+// the concatenation that `llama2.c` builds in `str_buffer`.
+fun concatMatch(cand: Span<u8>, a: Span<u8>, b: Span<u8>) -> Bool {
+    let la = std.mem.len(a)
+    let lb = std.mem.len(b)
+    let lc = std.mem.len(cand)
+    if lc != la + lb {
+        return false
+    }
+    let head = cand[0..la]
+    let tail = cand[la..lc]
+    let okh = std.mem.eqlBytes(head, a)
+    let okt = std.mem.eqlBytes(tail, b)
+    return okh && okt
+}
+
+// Exclusive end of the UTF-8 codepoint that starts at `start`: extend over up to
+// three following continuation bytes. A continuation byte has its top two bits
+// set to `10`, i.e. it lies in [128, 191] — `llama2.c` writes this as
+// `(c & 0xC0) == 0x80`, rephrased here because `&` is the borrow operator.
+fun cpEnd(text: Span<u8>, start: usize) -> usize {
+    let n = std.mem.len(text)
+    let mut endi = start + 1
+    let mut go = true
+    while go {
+        if endi >= n {
+            go = false
+        }
+        if go {
+            let span = endi - start
+            if span >= 4 {
+                go = false
+            }
+        }
+        if go {
+            let nb = text[endi]
+            let ge = nb >= (128 as u8)
+            let le = nb <= (191 as u8)
+            let mut cont = false
+            if ge {
+                if le {
+                    cont = true
+                }
+            }
+            if cont {
+                endi = endi + 1
+            }
+            if cont == false {
+                go = false
+            }
+        }
+    }
+    return endi
+}
+
+// BPE-encode `text` into `out`, returning the token count. Ported from `llama2.c`
+// `encode`: optional BOS (=1), a dummy " " prefix token, per-codepoint vocab
+// lookup with byte-fallback (`byte + 3`, since ids 0..2 are <unk>/<s>/</s>), then
+// greedily merge the highest-scoring adjacent pair until none remain. `out` must
+// hold at least `len(text) + 2 + (bos ? 1 : 0)` ids (one per byte, worst case).
+pub fun encode(t: Tokenizer, text: Span<u8>, out: MutSpan<i32>, bos: Bool) -> usize {
+    let mut nTok: usize = 0
+    if bos {
+        out[nTok] = 1
+        nTok = nTok + 1
+    }
+
+    let n = std.mem.len(text)
+
+    // add_dummy_prefix: a leading space token before the first real piece.
+    if n > 0 {
+        let sp = std.mem.span(" ")
+        let spId = findStr(t, sp)
+        if spId >= 0 {
+            out[nTok] = spId
+            nTok = nTok + 1
+        }
+    }
+
+    // one token per codepoint (or per byte, on fallback)
+    let mut i: usize = 0
+    while i < n {
+        let endi = cpEnd(text, i)
+        let cp = text[i..endi]
+        let id = findStr(t, cp)
+        if id >= 0 {
+            out[nTok] = id
+            nTok = nTok + 1
+        }
+        if id < 0 {
+            let mut bi = i
+            while bi < endi {
+                let bv = text[bi]
+                let tk = (bv as i32) + 3
+                out[nTok] = tk
+                nTok = nTok + 1
+                bi = bi + 1
+            }
+        }
+        i = endi
+    }
+
+    // merge the best adjacent pair each pass until no vocab merge applies
+    let mut more = true
+    while more {
+        let neg: f32 = 0.0 - 1000000000.0
+        let mut bestScore: f32 = neg
+        let mut bestId: i32 = 0 - 1
+        let mut bestIdx: i32 = 0 - 1
+
+        let mut p: usize = 0
+        while p + 1 < nTok {
+            let aId = out[p]
+            let bId = out[p + 1]
+            let a = tokenStr(t, aId)
+            let b = tokenStr(t, bId)
+
+            // scan the vocab once for an entry equal to a+b; keep the best score
+            let bytes = t.bytes
+            let vocab = t.vocab_size as usize
+            let mut vcur: usize = 4
+            let mut vid: usize = 0
+            while vid < vocab {
+                let raw = std.codec.readI32Le(bytes, vcur + 4)
+                let len = raw as usize
+                let cs = vcur + 8
+                let ce = cs + len
+                let cand = bytes[cs..ce]
+                let m = concatMatch(cand, a, b)
+                if m {
+                    let sc = std.codec.readF32Le(bytes, vcur)
+                    if sc > bestScore {
+                        bestScore = sc
+                        bestId = vid as i32
+                        bestIdx = p as i32
+                    }
+                }
+                vcur = vcur + 8 + len
+                vid = vid + 1
+            }
+            p = p + 1
+        }
+
+        if bestIdx < 0 {
+            more = false
+        }
+        if bestIdx >= 0 {
+            let mi = bestIdx as usize
+            out[mi] = bestId
+            // delete out[mi+1], shifting the tail left one slot
+            let mut k = mi + 1
+            while k + 1 < nTok {
+                out[k] = out[k + 1]
+                k = k + 1
+            }
+            nTok = nTok - 1
+        }
+    }
+
+    return nTok
+}
+
+// The display bytes for `token`, as a view into the mapped vocab. Mirrors
+// `llama2.c` `decode`: after BOS (prev == 1) a single leading space is stripped
+// (the sentencepiece dummy-prefix convention). The raw-byte `<0xNN>` form is not
+// expanded in v0.1 — those fallback tokens are rare in argmax story output and
+// expanding one needs a writable single-byte buffer the backend can't emit yet.
+pub fun decode(t: Tokenizer, prev: i32, token: i32) -> Span<u8> {
+    let piece = tokenStr(t, token)
+    let plen = std.mem.len(piece)
+    let mut lo: usize = 0
+    if prev == 1 {
+        if plen > 0 {
+            let c0 = piece[0]
+            let isSpace = c0 == (32 as u8)
+            if isSpace {
+                lo = 1
+            }
+        }
+    }
+    let res = piece[lo..plen]
+    return res
+}

@@ -1,0 +1,29 @@
+fun swiglu(hb: MutSpan<f32>, hb2: Span<f32>) -> Void {
+    let n: usize = std.mem.len(hb)
+    let mut i: usize = 0
+    while i < n {
+        let v: f32 = hb[i]
+        let negv: f32 = 0.0 - v
+        let e: f32 = std.math.expf(negv)
+        let denom: f32 = 1.0 + e
+        let sig: f32 = 1.0 / denom
+        let silu: f32 = v * sig
+        let g: f32 = hb2[i]
+        hb[i] = silu * g
+        i = i + 1
+    }
+}
+
+pub fun main(world: World) -> Void raises {
+    let mut hb: [2]f32 = [1.0, 2.0]
+    let hb2: [2]f32 = [3.0, 4.0]
+    let hb_span: MutSpan<f32> = hb
+    let hb2_span: Span<f32> = hb2
+    swiglu(hb_span, hb2_span)
+    // silu(1)=0.731059 -> *3 = 2.193177 ; silu(2)=1.761594 -> *4 = 7.046377
+    let ok0: Bool = hb[0] > 2.192 && hb[0] < 2.194
+    let ok1: Bool = hb[1] > 7.045 && hb[1] < 7.048
+    if ok0 && ok1 {
+        check world.out.write("math swiglu span ok\n")
+    }
+}

@@ -1,0 +1,318 @@
+// llama2.zero — v0.1, Phase 4 (transformer: RunState + forward pass).
+//
+// The activation state and the autoregressive forward pass, ported one-to-one
+// from `llama2.c` (`malloc_run_state` + `forward`). RunState is carved as
+// f32-element sub-views of ONE zeroed, page-allocated region (anonymous mmap =
+// calloc semantics); buffers are addressed by f32-element offsets into `base`
+// via `view()`. Like current `llama2.c`, the key/value vectors for a position
+// are not separate buffers — they are sub-views into the KV cache.
+//
+// `forward` reuses the ops.0 kernels (rmsnorm/matmul/softmax/rope/swiglu), so a
+// temperature-0 run reproduces the C token stream within libm ULPs.
+
+use checkpoint
+use ops
+
+// All forward-pass activations + the KV cache, as offsets into one byte region.
+pub shape RunState {
+    base: MutSpan<u8>,
+    x_off: usize,
+    xb_off: usize,
+    xb2_off: usize,
+    hb_off: usize,
+    hb2_off: usize,
+    q_off: usize,
+    att_off: usize,
+    logits_off: usize,
+    key_off: usize,
+    value_off: usize,
+}
+
+// Per-position key/value width: dim * n_kv_heads / n_heads (kv_dim in llama2.c).
+pub fun kvDim(cfg: Config) -> usize {
+    let dim = cfg.dim as usize
+    let n_heads = cfg.n_heads as usize
+    let n_kv_heads = cfg.n_kv_heads as usize
+    return dim * n_kv_heads / n_heads
+}
+
+// Total f32 elements RunState needs — multiply by 4 for the byte allocation.
+// Order/sizes mirror `malloc_run_state` (x, xb, xb2, hb, hb2, q, att, logits,
+// key_cache, value_cache).
+pub fun runStateFloats(cfg: Config) -> usize {
+    let dim = cfg.dim as usize
+    let hidden = cfg.hidden_dim as usize
+    let n_layers = cfg.n_layers as usize
+    let n_heads = cfg.n_heads as usize
+    let vocab = cfg.vocab_size as usize
+    let seq_len = cfg.seq_len as usize
+    let kv_dim = kvDim(cfg)
+    let cache = n_layers * seq_len * kv_dim
+    let mut total: usize = 0
+    total = total + dim
+    total = total + dim
+    total = total + dim
+    total = total + hidden
+    total = total + hidden
+    total = total + dim
+    total = total + n_heads * seq_len
+    total = total + vocab
+    total = total + cache
+    total = total + cache
+    return total
+}
+
+// Lay RunState out over an already-allocated, zeroed region. `base` must hold at
+// least `runStateFloats(cfg) * 4` bytes. Pure — just records the offsets.
+pub fun mallocRunState(base: MutSpan<u8>, cfg: Config) -> RunState {
+    let dim = cfg.dim as usize
+    let hidden = cfg.hidden_dim as usize
+    let n_layers = cfg.n_layers as usize
+    let n_heads = cfg.n_heads as usize
+    let vocab = cfg.vocab_size as usize
+    let seq_len = cfg.seq_len as usize
+    let kv_dim = kvDim(cfg)
+    let cache = n_layers * seq_len * kv_dim
+
+    let mut off: usize = 0
+    let x_off = off
+    off = off + dim
+    let xb_off = off
+    off = off + dim
+    let xb2_off = off
+    off = off + dim
+    let hb_off = off
+    off = off + hidden
+    let hb2_off = off
+    off = off + hidden
+    let q_off = off
+    off = off + dim
+    let att_off = off
+    off = off + n_heads * seq_len
+    let logits_off = off
+    off = off + vocab
+    let key_off = off
+    off = off + cache
+    let value_off = off
+    off = off + cache
+
+    return RunState {
+        base: base,
+        x_off: x_off,
+        xb_off: xb_off,
+        xb2_off: xb2_off,
+        hb_off: hb_off,
+        hb2_off: hb2_off,
+        q_off: q_off,
+        att_off: att_off,
+        logits_off: logits_off,
+        key_off: key_off,
+        value_off: value_off
+    }
+}
+
+// f32-element [off, off+count) of the region, as a writable view. Slicing the
+// mutable byte region keeps it mutable (compiler), then the reinterpret yields a
+// writable MutSpan<f32> over the same memory (no copy).
+fun view(base: MutSpan<u8>, off: usize, count: usize) -> MutSpan<f32> {
+    let start = off * 4
+    let end = start + count * 4
+    return std.mem.bytesAsMutF32(base[start..end])
+}
+
+// The logits view (vocab_size f32) after a forward pass — the caller samples it.
+pub fun logitsOf(s: RunState, cfg: Config) -> MutSpan<f32> {
+    let base = s.base
+    let vocab = cfg.vocab_size as usize
+    return view(base, s.logits_off, vocab)
+}
+
+// One decoder step at sequence position `pos` for input `token`. Writes the
+// next-token logits into RunState (read via logitsOf). Mirrors `llama2.c`
+// `forward` exactly: embed -> per layer (rmsnorm, QKV, RoPE, masked MHA over the
+// KV cache, output proj + residual, FFN rmsnorm, SwiGLU, residual) -> final
+// rmsnorm -> classifier.
+pub fun forward(cfg: Config, w: TransformerWeights, s: RunState, token: i32, pos: i32) -> Void {
+    let dim = cfg.dim as usize
+    let hidden = cfg.hidden_dim as usize
+    let n_layers = cfg.n_layers as usize
+    let n_heads = cfg.n_heads as usize
+    let n_kv_heads = cfg.n_kv_heads as usize
+    let vocab = cfg.vocab_size as usize
+    let seq_len = cfg.seq_len as usize
+    let kv_dim = kvDim(cfg)
+    let kv_mul = n_heads / n_kv_heads
+    let head_size = dim / n_heads
+    let eps: f32 = 0.00001
+    let posu = pos as usize
+    let cache = n_layers * seq_len * kv_dim
+
+    let base = s.base
+
+    // weight views (sliced per layer below)
+    let tet = w.token_embedding_table
+    let rms_att = w.rms_att_weight
+    let wq = w.wq
+    let wk = w.wk
+    let wv = w.wv
+    let wo = w.wo
+    let rms_ffn = w.rms_ffn_weight
+    let w1 = w.w1
+    let w2 = w.w2
+    let w3 = w.w3
+    let rms_final = w.rms_final_weight
+    let wcls = w.wcls
+
+    // copy the token embedding row into x
+    let x = view(base, s.x_off, dim)
+    let tokenu = token as usize
+    let emb_start = tokenu * dim
+    let emb_end = emb_start + dim
+    let emb = tet[emb_start..emb_end]
+    let mut ce: usize = 0
+    while ce < dim {
+        x[ce] = emb[ce]
+        ce = ce + 1
+    }
+
+    let sqrt_hs = std.math.sqrtf((head_size as i32) as f32)
+
+    let mut l: usize = 0
+    while l < n_layers {
+        let loff = l * seq_len * kv_dim
+
+        // per-layer views into the shared region
+        let xb = view(base, s.xb_off, dim)
+        let xb2 = view(base, s.xb2_off, dim)
+        let q = view(base, s.q_off, dim)
+        let hb = view(base, s.hb_off, hidden)
+        let hb2 = view(base, s.hb2_off, hidden)
+        let att = view(base, s.att_off, n_heads * seq_len)
+        let kc = view(base, s.key_off, cache)
+        let vc = view(base, s.value_off, cache)
+        let k_off = s.key_off + loff + posu * kv_dim
+        let v_off = s.value_off + loff + posu * kv_dim
+        let k = view(base, k_off, kv_dim)
+        let v = view(base, v_off, kv_dim)
+
+        // attention rmsnorm: xb = rmsnorm(x) * rms_att[l]
+        let ra_lo = l * dim
+        let ra_hi = ra_lo + dim
+        let ra = rms_att[ra_lo..ra_hi]
+        rmsnorm(xb, x, ra, eps)
+
+        // qkv matmuls for this position (k, v write straight into the KV cache)
+        let wq_lo = l * dim * dim
+        let wq_hi = wq_lo + dim * dim
+        let wq_l = wq[wq_lo..wq_hi]
+        matmul(q, xb, wq_l)
+
+        let wkv_stride = dim * kv_dim
+        let wk_lo = l * wkv_stride
+        let wk_hi = wk_lo + wkv_stride
+        let wk_l = wk[wk_lo..wk_hi]
+        matmul(k, xb, wk_l)
+
+        let wv_l = wv[wk_lo..wk_hi]
+        matmul(v, xb, wv_l)
+
+        // RoPE on q (dim) and k (kv_dim); the angle depends only on idx%head_size
+        rope(q, pos, head_size)
+        rope(k, pos, head_size)
+
+        // masked multi-head attention over the KV cache
+        let mut h: usize = 0
+        while h < n_heads {
+            let qoff = h * head_size
+            let aoff = h * seq_len
+            let kvh = (h / kv_mul) * head_size
+
+            // scores for timesteps 0..=pos
+            let mut t: usize = 0
+            while t <= posu {
+                let kbase = loff + t * kv_dim + kvh
+                let mut score: f32 = 0.0
+                let mut i: usize = 0
+                while i < head_size {
+                    let qi = qoff + i
+                    let ki = kbase + i
+                    score = score + q[qi] * kc[ki]
+                    i = i + 1
+                }
+                score = score / sqrt_hs
+                att[aoff + t] = score
+                t = t + 1
+            }
+
+            // softmax over the active scores (0..=pos), in place
+            let sm_lo = aoff
+            let sm_hi = aoff + posu + 1
+            let att_h = att[sm_lo..sm_hi]
+            softmax(att_h)
+
+            // weighted sum of value vectors into xb[head]
+            let mut z: usize = 0
+            while z < head_size {
+                xb[qoff + z] = 0.0
+                z = z + 1
+            }
+            let mut t2: usize = 0
+            while t2 <= posu {
+                let vbase = loff + t2 * kv_dim + kvh
+                let a = att[aoff + t2]
+                let mut i2: usize = 0
+                while i2 < head_size {
+                    let xi = qoff + i2
+                    let vi = vbase + i2
+                    xb[xi] = xb[xi] + a * vc[vi]
+                    i2 = i2 + 1
+                }
+                t2 = t2 + 1
+            }
+            h = h + 1
+        }
+
+        // output projection into xb2, then residual back into x
+        let wo_lo = l * dim * dim
+        let wo_hi = wo_lo + dim * dim
+        let wo_l = wo[wo_lo..wo_hi]
+        matmul(xb2, xb, wo_l)
+        let mut r1: usize = 0
+        while r1 < dim {
+            x[r1] = x[r1] + xb2[r1]
+            r1 = r1 + 1
+        }
+
+        // ffn rmsnorm: xb = rmsnorm(x) * rms_ffn[l]
+        let rf_lo = l * dim
+        let rf_hi = rf_lo + dim
+        let rf = rms_ffn[rf_lo..rf_hi]
+        rmsnorm(xb, x, rf, eps)
+
+        // SwiGLU FFN: hb = w1(xb), hb2 = w3(xb); hb = silu(hb) * hb2; xb = w2(hb)
+        let w13_stride = dim * hidden
+        let w13_lo = l * w13_stride
+        let w13_hi = w13_lo + w13_stride
+        let w1_l = w1[w13_lo..w13_hi]
+        matmul(hb, xb, w1_l)
+        let w3_l = w3[w13_lo..w13_hi]
+        matmul(hb2, xb, w3_l)
+        swiglu(hb, hb2)
+        let w2_l = w2[w13_lo..w13_hi]
+        matmul(xb, hb, w2_l)
+
+        // residual back into x
+        let mut r2: usize = 0
+        while r2 < dim {
+            x[r2] = x[r2] + xb[r2]
+            r2 = r2 + 1
+        }
+
+        l = l + 1
+    }
+
+    // final rmsnorm (in place) then classify into logits
+    rmsnorm(x, x, rms_final, eps)
+    let logits = view(base, s.logits_off, vocab)
+    matmul(logits, x, wcls)
+}

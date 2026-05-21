@@ -1,0 +1,190 @@
+// llama2 Phase 6: self-contained sampler primitives.
+//
+// Self-contained mirror of examples/llama2/src/sampler.0, minus the temperature
+// path's softmax (which would pull in libm) — so this runs in CI with no
+// std.math, no fs. Covers the libm-free pieces:
+//   - argmax over a small logits span
+//   - the xorshift* PRNG (rngNext / randomF32) with XOR emulated via xor64,
+//     checked bit-exactly against a llama2.c reference (seed 1):
+//       rngNext(1)            = 33554433,            randomF32 ~ 0.28083503
+//       rngNext(33554433)     = 1126174793148417,    randomF32 ~ 0.67113721
+//   - sampleMult's CDF walk over a fixed distribution
+//   - parseF32's runtime decimal scan (--temperature)
+// The temperature softmax path is exercised end-to-end by the example under
+// Docker (see examples/llama2/README.md). Verifies u64 multiply/divide-by-power
+// -of-two shift emulation and u64->f32 conversion on the direct ELF64 backend.
+
+fun argmax(logits: Span<f32>) -> i32 {
+    let n = std.mem.len(logits)
+    let mut bestI: i32 = 0
+    let mut bestV: f32 = logits[0]
+    let mut i: usize = 1
+    while i < n {
+        let v = logits[i]
+        if v > bestV {
+            bestV = v
+            bestI = i as i32
+        }
+        i = i + 1
+    }
+    return bestI
+}
+
+fun xor64(a: u64, b: u64) -> u64 {
+    let mut result: u64 = 0
+    let mut place: u64 = 1
+    let mut x: u64 = a
+    let mut y: u64 = b
+    let mut i: i32 = 0
+    while i < 64 {
+        let xb = x % 2
+        let yb = y % 2
+        let rb = (xb + yb) % 2
+        result = result + rb * place
+        x = x / 2
+        y = y / 2
+        place = place * 2
+        i = i + 1
+    }
+    return result
+}
+
+fun rngNext(state: u64) -> u64 {
+    let mut s: u64 = state
+    let a = s / 4096
+    s = xor64(s, a)
+    let b = s * 33554432
+    s = xor64(s, b)
+    let c = s / 134217728
+    s = xor64(s, c)
+    return s
+}
+
+fun randomF32(state: u64) -> f32 {
+    let mul: u64 = 2685821657736338717
+    let prod: u64 = state * mul
+    let hi32: u64 = prod / 4294967296
+    let bits24: u64 = hi32 / 256
+    let asF: f32 = bits24 as f32
+    let denom: f32 = 16777216.0
+    return asF / denom
+}
+
+fun sampleMult(probs: Span<f32>, coin: f32) -> i32 {
+    let n = std.mem.len(probs)
+    let mut cdf: f32 = 0.0
+    let mut i: usize = 0
+    while i < n {
+        cdf = cdf + probs[i]
+        let hit = coin < cdf
+        if hit {
+            return i as i32
+        }
+        i = i + 1
+    }
+    let last = n - 1
+    return last as i32
+}
+
+fun parseF32(s: Span<u8>) -> f32 {
+    let n = std.mem.len(s)
+    let zeroc = '0' as u8
+    let ninec = '9' as u8
+    let dotc = '.' as u8
+    let minusc = '-' as u8
+
+    let mut i: usize = 0
+    let mut neg = false
+    if n > 0 {
+        let c0 = s[0]
+        if c0 == minusc {
+            neg = true
+            i = 1
+        }
+    }
+
+    let mut value: f32 = 0.0
+    let mut frac: f32 = 1.0
+    let mut inFrac = false
+    while i < n {
+        let c = s[i]
+        let isDot = c == dotc
+        if isDot {
+            inFrac = true
+        }
+        if isDot == false {
+            let below = c < zeroc
+            let above = c > ninec
+            let bad = below || above
+            if bad == false {
+                let d = (c as i32) - (zeroc as i32)
+                let df = d as f32
+                if inFrac {
+                    frac = frac / 10.0
+                    value = value + df * frac
+                }
+                if inFrac == false {
+                    value = value * 10.0 + df
+                }
+            }
+        }
+        i = i + 1
+    }
+
+    if neg {
+        value = 0.0 - value
+    }
+    return value
+}
+
+pub fun main(world: World) -> Void raises {
+    // argmax: largest logit index, including a negative-valued span.
+    let la: [4]f32 = [0.1, 0.5, 0.3, 0.2]
+    let lasp: Span<f32> = la
+    let okArg1 = argmax(lasp) == 1
+    let lb: [3]f32 = [0.0 - 1.0, 0.0 - 0.5, 0.0 - 2.0]
+    let lbsp: Span<f32> = lb
+    let okArg2 = argmax(lbsp) == 1
+
+    // xorshift* PRNG vs llama2.c reference (seed 1).
+    let seed: u64 = 1
+    let s1 = rngNext(seed)
+    let okS1 = s1 == 33554433
+    let s2 = rngNext(s1)
+    let okS2 = s2 == 1126174793148417
+    let f0 = randomF32(s1)
+    let okF0 = f0 > 0.2803 && f0 < 0.2813
+    let f1 = randomF32(s2)
+    let okF1 = f1 > 0.6706 && f1 < 0.6716
+
+    // sampleMult: walk the CDF of a fixed distribution.
+    let pr: [4]f32 = [0.1, 0.2, 0.3, 0.4]
+    let prsp: Span<f32> = pr
+    let okM0 = sampleMult(prsp, 0.05) == 0
+    let okM2 = sampleMult(prsp, 0.35) == 2
+    let okM3 = sampleMult(prsp, 0.99) == 3
+
+    // parseF32: runtime decimal scan.
+    let b09 = std.mem.span("0.9")
+    let v09 = parseF32(b09)
+    let okP09 = v09 > 0.8995 && v09 < 0.9005
+    let b15 = std.mem.span("1.5")
+    let v15 = parseF32(b15)
+    let okP15 = v15 > 1.4995 && v15 < 1.5005
+    let b2 = std.mem.span("2")
+    let v2 = parseF32(b2)
+    let okP2 = v2 > 1.9995 && v2 < 2.0005
+    let b0 = std.mem.span("0")
+    let v0 = parseF32(b0)
+    let okP0 = v0 > 0.0 - 0.0005 && v0 < 0.0005
+
+    let okArg = okArg1 && okArg2
+    let okRng = okS1 && okS2 && okF0 && okF1
+    let okMult = okM0 && okM2 && okM3
+    let okParse = okP09 && okP15 && okP2 && okP0
+    let okAll = okArg && okRng && okMult && okParse
+    if okAll {
+        check world.out.write("sampler sample ok\n")
+    }
+    return
+}

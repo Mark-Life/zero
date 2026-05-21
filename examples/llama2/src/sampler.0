@@ -1,0 +1,184 @@
+// llama2.zero — v0.1, Phase 6 (sampler).
+//
+// Selects the next token from the forward-pass logits, ported from `llama2.c`
+// `run.c`: greedy argmax when temperature is 0, otherwise temperature-scaled
+// softmax + multinomial sampling driven by the xorshift* PRNG (`random_u32` /
+// `random_f32`). top-p / top-k are deferred (overview "What This Forces").
+//
+// Two adaptations to the direct ELF64 backend, which has no bitwise operators
+// (`^`, `<<`, `>>`, `&`, `|`) — only +, -, *, /, %:
+//   - the PRNG's shifts become unsigned multiply/divide by powers of two
+//     (`x >> n` == `x / 2^n`, `x << n` == `x * 2^n` mod 2^64 — the backend's u64
+//     `imul`/`div` already truncate/wrap to 64 bits), and its XOR is emulated
+//     bit-by-bit in `xor64`. The PRNG is drawn once per token, so the 64-step
+//     loop never matters for throughput.
+//   - `--temperature` text is parsed by a small pure-Zero `parseF32`: `std.parse`
+//     folds only string *literals* at compile time, so a runtime value needs a
+//     hand-rolled scan, mirroring Phase 1's `--tokens` digit check.
+
+use ops
+
+// Index of the largest logit — the greedy, deterministic next token used when
+// temperature is 0. Mirrors `sample_argmax`; assumes a non-empty span.
+pub fun argmax(logits: Span<f32>) -> i32 {
+    let n = std.mem.len(logits)
+    let mut bestI: i32 = 0
+    let mut bestV: f32 = logits[0]
+    let mut i: usize = 1
+    while i < n {
+        let v = logits[i]
+        if v > bestV {
+            bestV = v
+            bestI = i as i32
+        }
+        i = i + 1
+    }
+    return bestI
+}
+
+// Bitwise XOR of two u64s, built from arithmetic because the language exposes no
+// `^`. Walks all 64 bit positions: each result bit is (a_bit + b_bit) % 2,
+// scaled back by its place value. `place` wraps to 0 after the top bit, which is
+// harmless — the backend's u64 multiply truncates and the value is then unused.
+fun xor64(a: u64, b: u64) -> u64 {
+    let mut result: u64 = 0
+    let mut place: u64 = 1
+    let mut x: u64 = a
+    let mut y: u64 = b
+    let mut i: i32 = 0
+    while i < 64 {
+        let xb = x % 2
+        let yb = y % 2
+        let rb = (xb + yb) % 2
+        result = result + rb * place
+        x = x / 2
+        y = y / 2
+        place = place * 2
+        i = i + 1
+    }
+    return result
+}
+
+// Advance the xorshift state by one round — the three shift/xor steps of
+// `random_u32`. Shifts are mul/div by powers of two: `>> 12` == `/ 4096`,
+// `<< 25` == `* 33554432` (mod 2^64), `>> 27` == `/ 134217728`.
+pub fun rngNext(state: u64) -> u64 {
+    let mut s: u64 = state
+    let a = s / 4096
+    s = xor64(s, a)
+    let b = s * 33554432
+    s = xor64(s, b)
+    let c = s / 134217728
+    s = xor64(s, c)
+    return s
+}
+
+// The float in [0, 1) for an already-advanced state — the output half of
+// `random_f32`. `random_u32` returns `(state * MUL) >> 32`: the high 32 bits of
+// the 64-bit product the backend's u64 multiply keeps in the low 64 bits. Then
+// `>> 8` and `/ 2^24` map it into [0, 1). MUL = 0x2545F4914F6CDD1D.
+pub fun randomF32(state: u64) -> f32 {
+    let mul: u64 = 2685821657736338717
+    let prod: u64 = state * mul
+    let hi32: u64 = prod / 4294967296
+    let bits24: u64 = hi32 / 256
+    let asF: f32 = bits24 as f32
+    let denom: f32 = 16777216.0
+    return asF / denom
+}
+
+// Sample an index from a distribution that sums to 1, given a coin in [0, 1).
+// Mirrors `sample_mult`: walk the CDF and take the first bucket the coin falls
+// into; the trailing index guards against floating-point rounding drift.
+pub fun sampleMult(probs: Span<f32>, coin: f32) -> i32 {
+    let n = std.mem.len(probs)
+    let mut cdf: f32 = 0.0
+    let mut i: usize = 0
+    while i < n {
+        cdf = cdf + probs[i]
+        let hit = coin < cdf
+        if hit {
+            return i as i32
+        }
+        i = i + 1
+    }
+    let last = n - 1
+    return last as i32
+}
+
+// Parse a decimal float such as "0.9", "1", or "1.5". `std.parse` only folds
+// literals at compile time, so the runtime `--temperature` value needs this
+// scan. A leading '-' is honored; any other non-digit, non-dot byte is skipped.
+// There is no exponent form (temperatures never use one).
+pub fun parseF32(s: Span<u8>) -> f32 {
+    let n = std.mem.len(s)
+    let zeroc = '0' as u8
+    let ninec = '9' as u8
+    let dotc = '.' as u8
+    let minusc = '-' as u8
+
+    let mut i: usize = 0
+    let mut neg = false
+    if n > 0 {
+        let c0 = s[0]
+        if c0 == minusc {
+            neg = true
+            i = 1
+        }
+    }
+
+    let mut value: f32 = 0.0
+    let mut frac: f32 = 1.0
+    let mut inFrac = false
+    while i < n {
+        let c = s[i]
+        let isDot = c == dotc
+        if isDot {
+            inFrac = true
+        }
+        if isDot == false {
+            let below = c < zeroc
+            let above = c > ninec
+            let bad = below || above
+            if bad == false {
+                let d = (c as i32) - (zeroc as i32)
+                let df = d as f32
+                if inFrac {
+                    frac = frac / 10.0
+                    value = value + df * frac
+                }
+                if inFrac == false {
+                    value = value * 10.0 + df
+                }
+            }
+        }
+        i = i + 1
+    }
+
+    if neg {
+        value = 0.0 - value
+    }
+    return value
+}
+
+// Pick the next token from the forward-pass logits. temperature 0 => greedy
+// argmax; otherwise scale the logits by 1/temperature, softmax them in place,
+// and draw from the resulting distribution with `coin` (from `randomF32`).
+// Mirrors `sample` minus the top-p branch. `logits` is consumed (scaled then
+// softmaxed) exactly as in `llama2.c`.
+pub fun sample(logits: MutSpan<f32>, temperature: f32, coin: f32) -> i32 {
+    let greedy = temperature == 0.0
+    if greedy {
+        let g = argmax(logits)
+        return g
+    }
+    let n = std.mem.len(logits)
+    let mut i: usize = 0
+    while i < n {
+        logits[i] = logits[i] / temperature
+        i = i + 1
+    }
+    softmax(logits)
+    let r = sampleMult(logits, coin)
+    return r
+}

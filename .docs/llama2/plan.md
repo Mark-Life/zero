@@ -40,6 +40,7 @@ CPU within libm tolerance.
 - No `readI32Le`/`readU32Le` over runtime spans — checkpoint header is 7×int32, tokenizer has int32 fields. Workaround: assemble from `span[i]` bytes + shifts. Cleaner: add the ops (mirror F4).
 - ~~No `Span<u8>` → `Span<f32>` reinterpret~~ — ✅ **resolved in 0c.** `std.mem.bytesAsF32`/`bytesAsMutF32` (+ f64) view weight/scratch byte regions as `f32` with no copy. The asymmetry that forced it (reads had `readF32Le`, **writes had no `writeF32Le`**) is closed: f32 results write through `MutSpan<f32>`.
 - No compound assignment (`+=`); use `a = a + b`.
+- **`std.parse.*` is compile-time only** (folds string *literals* → constants; emits no runtime code — confirmed in Phase 1, `ir.c:~1591`). No runtime number *parser* (int or float) and no number→string *formatter* exist in stdlib. Phase 1 validates `--tokens` via a manual digit scan over `std.mem.span(arg)`; Phase 6 landed an inline pure-Zero `parseF32` in `sampler.0` for `--temperature`→f32; Phase 7 landed the int analog `parseUsize` inline in `main.0` for `--tokens`→int (no `std.parse`/`std.fmt` change). No runtime number *formatter* exists, but v0.1 needs none — output is the decoded token bytes.
 
 ## Sizing (stories15M — all dims compile-time constant)
 
@@ -165,49 +166,363 @@ path. Note the asymmetry that forces it: reads have a fallback (`readF32Le`), bu
 
 Mirrors the overview file layout under `examples/llama2/src/`.
 
-### Phase 1 — Scaffolding
+### Phase 1 — Scaffolding — ✅ DONE (2026-05-21, `feat/std-math-llama2`)
 
 `examples/llama2/{zero.json, README.md, src/main.0}`. `zero.json`:
 `{"package":{"name":"llama2","version":"0.1.0"},"targets":{"cli":{"kind":"exe","main":"src/main.0"}}}`.
 CLI parse via `std.args.len`/`get` (manual flag scan — no `std.cli`). Print parsed config; exit.
 
-### Phase 2 — `checkpoint.0`
+**✅ Landed:** `llama2 <model.bin> --prompt <t> --tokens <n> [--temperature <t>]` — positional
+model + a flat flag scan (advance one arg, `std.mem.eql(flag, "--x")`, take the next arg as the
+value), echoes the parsed config, exits 0. Builds on the **default `--emit exe` path (no
+`--backend`)** — uses only `std.args` + `World`, not `fs`, so unlike every later phase it actually
+runs in CI rather than being build-tolerated. Runtime-verified under `docker run --platform
+linux/amd64` (full args, defaults, no-args usage, bad `--tokens`); success exits 0 (the harness
+skips stdout checks on any nonzero exit). Row added to `examples/README.md`.
 
-`mmap` the file (0a). Parse 7×int32 header → `Config` shape (0b or byte-shift). Build
+**Deviations discovered here (carry into later phases):**
+
+- `std.parse` is comptime-only (see Soft gaps), so `--tokens` is digit-validated by hand, not
+  `parseU32`. `--tokens`/`--temperature` stay as raw arg *text* (no runtime number formatter
+  either); their numeric forms are produced where consumed — Phase 6 (f32) and Phase 7 (int).
+- Direct-backend syntax/codegen limits hit while writing `main.0`: no `else if` (PAR100 — nest, or
+  use independent `if`s); `a < b || c > d` mis-parses as a generic call (split each comparison onto
+  its own `let`); `String` is **not** a valid user-function parameter type (pass `Span<u8>` via
+  `std.mem.span`); call args must be plain locals, not nested calls (`f(g(x))` → hoist `g(x)`);
+  falling off `main` after `check world.out.write(...)` leaks that write's return value into the
+  process exit code — end the success path with an explicit `return`.
+
+### Phase 2 — `checkpoint.0` — ✅ DONE (2026-05-21, `feat/std-math-llama2`)
+
+`mmap` the file (0a). Parse 7×int32 header → `Config` shape (0b). Build
 `TransformerWeights` as `Span<f32>` views into the mapping (0c), offsets computed exactly
 as `llama2.c` `memory_map_weights` (shared-classifier flag via sign of `vocab_size`).
 
-### Phase 3 — `ops.0` (kernels)
+**✅ Landed:** `examples/llama2/src/checkpoint.0` with `Config` + `TransformerWeights`
+shapes and pure functions `readConfig(bytes) -> Config`, `mapWeights(bytes, cfg) ->
+TransformerWeights`, `weightView(bytes, off, count) -> Span<f32>`, and `expectedFileFloats(cfg)
+-> usize`. `main.0` now mmaps the model, parses the header, validates the file length against
+the header (`expectedFileFloats`), builds the 12 weight views, and prints `checkpoint: ok`.
+Offsets match `memory_map_weights` exactly incl. the legacy `freq_cis` skip and the shared
+(`vocab_size > 0`) vs. unshared (`< 0`, abs'd) classifier. Runtime-verified under
+`docker run --platform linux/amd64` against synthetic shared + unshared checkpoints (size match,
+`token_embedding_table` length), plus the three error paths (missing / too-small / size-mismatch).
+
+**Phase 0d (unplanned) — aggregate ABI for the direct ELF64 backend.** Phase 2 surfaced that
+the only backend that builds an fs-using program to a runnable `linux-musl-x64` exe (the direct
+ELF64 MVP, `--backend zero-elf64`) could not pass **shapes or spans across function boundaries**
+— shape params, shape returns, span returns, and shape-with-`Span`-field locals were all rejected
+(verified: even an unused such function failed the build; `zero check` accepted the clean code).
+The natural `readConfig -> Config` / `mapWeights(cfg) -> TransformerWeights` API was therefore
+un-buildable. Rather than contort the code, the backend was extended (the Phase-0 precedent):
+
+- **Shape params** — passed by pointer in one int reg, copied into an inline frame slot on entry
+  (value semantics; field access reuses the existing rbp-relative path). `ir.c` + `emit_elf64.c`.
+- **Shape returns (sret)** — caller passes the destination address in `rdi` (params shift to
+  `rsi…`); the result address rides back in `rax`. `return` accepts a shape literal (fields
+  stored through sret), a record local/param (copied through sret), or a record-returning call
+  (callee writes straight through our sret). `let x = recordCall(...)` binds via sret into `x`'s
+  slot; `let x = p` copies a record.
+- **Span returns** — `(ptr, len)` in `rax:rdx`, mirroring the existing two-GPR span *param* ABI.
+- **`Span` fields in records** — 16-byte/8-aligned field layout; field load/store split into
+  ptr@offset + len@offset+8; construction handles span locals, slices, reinterprets, and
+  span-returning calls.
+- **Records/literals as arguments** — a record-returning call or shape literal passed as an
+  argument (or field-accessed) is materialized into a pre-reserved temp slot and passed by
+  pointer, so the natural `f(makeDims(7))` / `area(Dims{…})` work, not just record locals. These
+  + return-by-value were generalized in a post-Phase-6 side effort (see "Side effort (after
+  Phase 6)" below) so the feature stands alone for upstream
+  ([`aggregate-abi.md`](./aggregate-abi.md)); raising aggregate returns remain out of scope.
+
+These are internal-call conventions only (`export c`/`main` unchanged) and gate nothing new.
+Covered by `conformance/native/pass/aggregate-shape-abi.0` (runs in CI — no fs) and exercised
+end-to-end by the llama2 exe. No conformance/`native:test`/`docs:test` regressions. Because
+`main.0` now uses `std.fs`, the example builds **only** via `--backend zero-elf64` (self-host
+gate, Note 3) and is `check`-exercised in CI + Docker-validated, not auto-run.
+
+### Phase 3 — `ops.0` (kernels) — ✅ DONE (2026-05-21, `feat/std-math-llama2`)
 
 `rmsnorm`, `matmul`, `softmax`, `rope`, `swiglu` (silu = `x * sigmoid(x)`, sigmoid via
 `expf`). Pure functions over `Span<f32>`/`MutSpan<f32>`. `rmsnorm`/`softmax` already
 exist as smoke fixtures — lift them in. `matmul` is the hot loop; weights arrive as
 `Span<f32>` views (0c).
 
-### Phase 4 — `transformer.0`
+**✅ Landed:** `examples/llama2/src/ops.0` — five pure kernels over `Span<f32>` /
+`MutSpan<f32>`, ported 1:1 from `llama2.c`. Dimensions are read from the span lengths
+(no separate size args), so the caller slices the right tensor view and the kernel stays
+signature-stable:
 
-`RunState` fields = `MutSpan<f32>` sub-slices of one `pageAlloc`'d, zeroed region (arena
-bump-allocation, runtime-sized from Config — mirrors `malloc_run_state`).
+- `rmsnorm(output, input, weights, eps)` — output-first to match `llama2.c`'s
+  `rmsnorm(o, x, weight, size)` and `matmul`; `eps` (the reference's 1e-5) is the caller's.
+- `matmul(output, input, weights)` — `W (d,n) @ x (n,) -> output`, with `d`/`n` from the
+  output/input lengths and `weights` the `d*n` row-major view. The hot loop: each weight
+  access is a bare `Span<f32>` load (no per-element fat-pointer math), per risk #2.
+- `softmax(x)` — **in place** (the attention path needs it), max-subtraction for stability.
+- `rope(vec, pos, head_size)` — rotates each (even, odd) pair in place; call once per
+  vector (q over `dim`, k over `kv_dim`). Because the angle depends only on
+  `idx % head_size`, rotating each vector over its own length reproduces `llama2.c`'s
+  `rotn` (q for all i, k only for i < kv_dim) exactly.
+- `swiglu(hb, hb2)` — **in place**: `hb[i] = silu(hb[i]) * hb2[i]`, `silu(v)=v/(1+exp(-v))`.
+
+Verification: `matmul` builds + runs end-to-end in Zero (`math matmul span ok`; no libm —
+direct ELF, `generatedCBytes == 0`, so it builds even without a cross toolchain).
+`rope`/`swiglu` numerics validated against libm (`rope -> [0.5403, 0.8415, -0.0100,
+0.99995]`, `swiglu -> [2.1932, 7.0464]`, both inside the fixture bands); they use the same
+`std.math` calls (`powf`/`cosf`/`sinf`, `expf`) as the already-green libm fixtures. All
+five call signatures type-check in a throwaway package using the exact calls Phase 4's
+`transformer.0` will make. New fixtures `conformance/native/pass/math-{matmul,rope,swiglu}-span.0`
+wired into `run.mjs` (check + runtime lists; `rope`/`swiglu` `libm: true`, `matmul` not).
+
+**Notes (carry into Phase 4):**
+
+- Signatures are **output-first** and `softmax`/`rope`/`swiglu` are **in place** — the
+  forward pass needs in-place attention softmax and the FFN gate combine. This differs
+  from the original out-of-place `math-{rmsnorm,softmax}-span.0` smoke fixtures (identical
+  math), which stay as-is; the new fixtures cover the genuinely new kernels.
+- Because `main.0` does not yet `use ops`, the module is **not** type-checked by
+  `zero check examples/llama2` (an unused package module is skipped); its fixtures + Phase
+  4's wiring are the coverage. Wiring `ops` into `main.0`/`transformer.0` in Phase 4 brings
+  it under the package check.
+- Direct-backend quirks applied in `ops.0`: no `+=` (`a = a + b`), no unary minus
+  (`0.0 - x`), usize→f32 via `(x as i32) as f32`, `idx % head_size` modulo is fine.
+
+### Phase 4 — `transformer.0` — ✅ DONE (2026-05-21, `feat/std-math-llama2`)
+
+`RunState` fields = `MutSpan<f32>` sub-views of one `pageAlloc`'d, zeroed region
+(runtime-sized from Config — mirrors `malloc_run_state`).
 `forward(token, pos)`: per layer — rmsnorm → QKV matmuls → RoPE → multi-head attention
 vs KV cache → output proj → residual → rmsnorm → SwiGLU FFN → residual; final rmsnorm →
 classifier → logits.
 
-### Phase 5 — `tokenizer.0`
+**✅ Landed:** `examples/llama2/src/transformer.0` — `RunState` shape (one `MutSpan<u8>`
+`base` + ten f32-element offsets), `kvDim`/`runStateFloats`/`mallocRunState` (lay the ten
+buffers — x, xb, xb2, hb, hb2, q, att, logits, key_cache, value_cache — over one zeroed
+anonymous-`mmap` region), `view(base, off, count)` (writable f32 sub-view via
+`bytesAsMutF32(base[off*4 .. (off+count)*4])`), `logitsOf`, and
+`forward(cfg, weights, state, token, pos)` ported 1:1 from `llama2.c` `forward`, reusing
+the `ops.0` kernels. k/v are sub-views into the KV cache (no separate scratch, matching
+current `llama2.c`). `main.0` now `use`s it: after `checkpoint: ok` it allocates the
+RunState region, runs one `forward(token=1, pos=0)`, and prints `forward: ok` (the package
+is now under `zero check`). Runtime-verified end-to-end via zig+`docker run --platform
+linux/amd64`: the standalone fixture matches a libm C reference, and the example runs on a
+synthetic checkpoint (`checkpoint: ok` / `forward: ok`, exit 0).
+
+**Three backend fixes Phase 4 required (the "extend the compiler when llama2 needs it"
+precedent, cf. Phase 0a–0d):**
+
+1. **Slicing a mutable span yields a mutable span** (`checker.c` `EXPR_SLICE`, both the
+   `expr_type` and check-pass arms). Was always `Span<T>`; now `MutSpan<T>` when the base is
+   a `MutSpan<T>` (immutable spans/arrays/strings stay `Span<T>`, keeping `PROT_READ` mmap
+   views un-writable). Required so a `pageAlloc`'d `MutSpan<u8>` region can be sub-sliced and
+   reinterpreted into writable f32 views (`bytesAsMutF32(base[a..b])`) and a typed view can be
+   sub-sliced for in-place per-head softmax (`att[lo..hi]`). Safe: `MutSpan<T>` is already
+   covariant to `Span<T>` (`types_compatible`).
+2. **Typed-span slice start scales by element size** (`ir.c` sets `IR_VALUE_BYTE_SLICE`
+   `element_type` from the resolved type; `emit_elf64.c` `elf_emit_byte_view_ptr` shifts the
+   start by `log2(elemSize)`). Latent bug: `f32span[1..]` advanced the pointer by 1 byte, not
+   4 — no prior fixture sliced a typed (non-`u8`) span at a nonzero offset. `forward` slices
+   `f32` weight/att views constantly, so this was on the critical path.
+3. **All defined function symbols emit as `STB_GLOBAL`** (`emit_elf64.c` symtab loop). The
+   `.symtab` `sh_info` already declared every function symbol global, but non-exported
+   functions were emitted local (`0x02`) — a local symbol past `sh_info`, which the ELF spec
+   forbids and modern linkers (lld, recent GNU `ld`) reject ("local symbol at index N >=
+   sh_info"). This is the root cause of the long-documented "static-musl libm link fails"
+   rabbit hole; with it fixed, libm exes (the math-`*`-span fixtures, `transformer-forward`,
+   and the fs+libm llama2 example) link via zig and run under Docker locally. Intra-object
+   calls are PC-relative (no function-symbol relocations), so the binding is informational.
+
+Fixtures: `conformance/native/pass/transformer-forward.0` (tiny synthetic model, full
+forward over two positions, numerics vs a libm C reference; `libm: true`) and
+`mem-mut-span-slice.0` (the mutable-slice fix; no libm, runs in CI), both wired into
+`run.mjs` (check + runtime lists). `conformance` + `native:test` green; the previously
+build-tolerated libm fixtures now actually build+run locally.
+
+### Phase 5 — `tokenizer.0` — ✅ DONE (2026-05-21, `feat/std-math-llama2`)
 
 Load `tokenizer.bin` (Karpathy format: `max_token_length:i32`, then per token
 `score:f32`, `len:i32`, bytes). BPE encode prompt; decode token→bytes. Linear vocab
 scan for merges (hashmap is post-v0.1 per overview #7).
 
-### Phase 6 — `sampler.0`
+**✅ Landed:** `examples/llama2/src/tokenizer.0` — `Tokenizer` shape (mapped `bytes` +
+`vocab_size` + `max_token_length`) and `buildTokenizer(bytes, vocab_size)`, `encode(t,
+text, out, bos) -> usize`, `decode(t, prev, token) -> Span<u8>`, ported from `llama2.c`
+`encode`/`decode`. Tokens are variable-length, so accessors **walk the vocab from the
+start** (`entryStart`/`tokenStr`/`findStr`) — no offset index, no hashmap (risk #4 /
+overview #7): O(vocab) per lookup, a few ×10^7 ops for a short prompt over 32000 entries.
+`main.0` now `use`s it: after `checkpoint: ok` it mmaps `--tokenizer` (default
+`tokenizer.bin`), BPE-encodes `--prompt` into a fixed `[1024]i32` stack buffer, and prints
+`tokenizer: ok`. Covered by `conformance/native/pass/tokenizer-encode.0` (self-contained
+synthetic 8-token vocab as a `u8` array literal → **runs in CI**, no fs/libm,
+`generatedCBytes == 0`); the example's full path is `--backend zero-elf64` +
+Docker-validated end-to-end (`checkpoint: ok` / `tokenizer: ok` / `forward: ok` on a
+synthetic checkpoint + matching tokenizer, exit 0).
+
+**Two adaptations to the direct backend (no compiler change needed this phase):**
+
+- **No mutable byte scratch.** `llama2.c` builds each merge candidate by `sprintf`-ing
+  `vocab[a]+vocab[b]` into `str_buffer`, then looks it up. `MutSpan<u8>` stores are
+  unemitted, so instead `concatMatch(cand, a, b)` compares the two halves of `cand`
+  against `a` and `b` **in place** (`eqlBytes` on `cand[0..la]` / `cand[la..]`) — no
+  buffer, and `max_token_length` becomes informational.
+- **BOS-only `encode`.** The natural `encode(t, text, bos, eos, out)` is 7 integer
+  register args (Tok ptr 1 + Span 2 + 2 Bools + MutSpan 2) — over the 6-reg cap. EOS isn't
+  used on the v0.1 prompt path (`llama2.c` `run.c` calls `encode(..., bos=1, eos=0)`; EOS
+  termination is the generation loop's job), so it's dropped → 6 args.
+
+**Notes / deviations (carry into Phase 6/7):**
+
+- **Prompt token buffer is a fixed `[1024]i32` stack array.** The backend has no integer
+  heap region (`bytesAsMut{F32,F64}` exist; there is **no `bytesAsMutI32`**), and stack
+  arrays must be compile-time sized — so prompts are capped at ~1021 bytes for v0.1
+  (`main.0` guards `len(prompt)+3 > 1024` with an error). Phase 7's generation buffer is
+  separate (current token + position; no growing token list needed).
+- **Raw-byte `<0xNN>` decode is not expanded.** Emitting a single computed byte needs a
+  writable 1-byte buffer the backend can't store into; these fallback tokens are rare in
+  argmax story output. Documented limitation.
+- Two new direct-backend frontend gotchas surfaced (both worked around in pure Zero, no
+  compiler change): **`&` is the borrow operator, not bitwise-AND** (the UTF-8 continuation
+  test `(c & 0xC0) == 0x80` is rewritten as the range `c >= 128 && c <= 191`); and **a
+  local NAME may hold only one type per function** — two sibling blocks each binding `id`
+  with different types (`i32` vs `usize`) makes the backend resolve the wrong type at the
+  use site (CGEN004 at the store, though `zero check` passes). Use distinct names.
+
+### Phase 6 — `sampler.0` — ✅ DONE (2026-05-21, `feat/std-math-llama2`)
 
 `argmax(logits)`; temperature path = scale logits, softmax, sample via xorshift PRNG
-(pure Zero, port `llama2.c` `random_f32`). top-p/top-k deferred.
+(pure Zero, port `llama2.c` `random_f32`). top-p/top-k deferred. **Parse `--temperature`
+text → f32 here** (Phase 1 kept it raw; `std.parse` is comptime-only, so this needs a runtime
+float parser — inline pure-Zero, or a new `std.parse` runtime op). `temperature == 0` ⇒ argmax.
 
-### Phase 7 — `main.0`
+**✅ Landed:** `examples/llama2/src/sampler.0` — `argmax`, the xorshift\* PRNG (`rngNext`
+advances the state, `randomF32` reads a draw out of it), `sampleMult` (CDF walk), a runtime
+`parseF32`, and `sample` (temperature 0 ⇒ argmax; else scale logits by `1/temperature`,
+`softmax` in place, draw with the coin), ported 1:1 from `llama2.c` `run.c`. `main.0` now
+`use`s it: after `forward: ok` it parses `--temperature`, draws one coin from a fixed-seed
+PRNG, samples a token, and prints `sampler: ok` (the module is now under `zero check`).
+Runtime-verified end-to-end via zig+`docker run --platform linux/amd64` on a synthetic
+checkpoint+tokenizer for temperature 1.0 (softmax path), 0 (argmax), and 0.5.
+
+**This is the first llama2 phase to need NO compiler change** — ordinary Zero, exactly as the
+plan anticipated ("pure Zero"). The one hard constraint surfaced here and was resolved without
+touching the backend:
+
+- **The direct ELF64 backend has no bitwise operators.** The parser's only binary operators
+  are `|| && == != < <= > >= + - +% +| * / %` (precedence table, `parser.c`); `IrBinaryOp` is
+  `ADD/SUB/MUL/DIV/MOD/AND/OR` where `AND`/`OR` are the logical `&&`/`||` (and `&` is the borrow
+  operator, not bitwise-AND — Phase 5). So the xorshift port cannot use `^`, `<<`, `>>`. Instead:
+  - **shifts → unsigned multiply/divide by powers of two**: `x >> n` is `x / 2^n`, `x << n` is
+    `x * 2^n` mod 2^64. Verified the backend's u64 `imul` keeps the low 64 bits with **no
+    overflow check** (`emit_elf64.c` emits `48 0F AF C1`, no `jo`/trap) and unsigned `div`
+    (`48 31 D2; 48 F7 F1`) is correct, so `random_u32`'s wrapping multiply by
+    `0x2545F4914F6CDD1D` and every shift are bit-exact.
+  - **XOR → a 64-step bit loop** (`xor64`): each result bit is `(a_bit + b_bit) % 2` scaled by
+    its place value. The PRNG is drawn once per token, so the loop never matters for throughput.
+  - **u64 → f32 directly** via `cvtsi2ss` with a 64-bit source (`emit_elf64.c` cast path); exact
+    for the `<2^24` mantissa `random_f32` produces. (Int→int casts collapse to a retype in
+    `ir.c`, so `i as i32` etc. stay free; only float casts emit a `CAST` node.)
+- **ABI shape kept inside the tested envelope:** `sample(logits: MutSpan<f32>, temperature: f32,
+  coin: f32) -> i32` — 2 int regs + 2 float regs, scalar return, **no sret/float-field combo**.
+  State threading is explicit in the caller (`rngNext` then `randomF32`), so each token draws
+  exactly one coin — matching `llama2.c` for temperature > 0, harmless for temperature 0
+  (argmax ignores the RNG). `MutSpan<f32>` passes to the `Span<f32>` params of `argmax`/`sampleMult`
+  via the existing covariance (Phase 4).
+
+Fixture `conformance/native/pass/sampler-sample.0` — a self-contained mirror of the libm-free
+primitives (argmax, `rngNext`/`randomF32` checked **bit-exactly** against a `llama2.c` reference
+— `rngNext(1)=33554433`, `rngNext(33554433)=1126174793148417`, `randomF32 ≈ 0.2808/0.6711` —
+plus `sampleMult` and `parseF32`). No `std.math` ⇒ `generatedCBytes == 0` ⇒ **runs in CI**;
+wired into `run.mjs` (check + runtime lists). The temperature `softmax` path (the only
+libm-tainted part) is Docker-validated through the example, not the fixture. `conformance` green.
+
+**Gotcha (carry into Phase 7):** a nested std call as an argument —
+`parseF32(std.mem.span(temperature))` — trips `CGEN004` "non-identifier callee" (the dotted
+`std.mem.span` is not a plain-identifier callee in arg position). Hoist the `std.mem.span` into
+its own `let` first, as the rest of `main.0` already does.
+
+### Side effort (after Phase 6) — Aggregate ABI generalized to full record value semantics
+
+Not a numbered phase. After Phase 6 the llama2 pipeline was functionally complete through the
+sampler, so we turned to hardening the **direct-backend aggregate ABI** (Phase 0d) for an
+upstream PR — it is a *language* change, so "no corners". Phase 0d (born in Phase 2) had shipped
+the minimum the checkpoint loader needed and **deferred four restrictions** on how records/spans
+cross function boundaries; reviewing the post-Phase-6 tree, three of those were lifted so records
+behave as first-class values. Full design + ABI + machine code: [`./aggregate-abi.md`](./aggregate-abi.md).
+
+**Now supported (was rejected before; future phases can use these freely):**
+
+- `return p` — return a record local/param (copied through sret), not just a `return Shape{…}` literal.
+- `return f()` — return a record-returning call (the callee writes straight through our sret).
+- `let q = p` / `q = p` — record-to-record value copy (`Span` fields ride along).
+- `f(makeDims(7))`, `f(Dims{…})` — a record-returning **call** or **shape literal** as an
+  argument (materialized into a hidden temp, passed by pointer); also several at once and nested.
+- `makeDims(7).field` — field access on a call/literal result.
+
+**Still NOT supported (deliberate — design these around, don't fight them):**
+
+- A record **call/literal argument** is only materialized in straight-line statement positions.
+  In a loop condition or a `&&`/`||` right operand it reports `CGEN004` (would mis-evaluate) —
+  hoist a `let` yourself (`let p = mk(i)` then `useP(p)`). A plain record **local** as an arg
+  works everywhere.
+- **Raising functions cannot return aggregates** (#4 — the `rdx` error tag collides with span
+  `len`; no consumer yet). Keep aggregate-returning helpers non-raising.
+- Records still **nest only one level** (a field is a scalar, fixed array, or `Span` — not
+  another record).
+
+Impl: pre-pass reserves record temps before frame layout (so the locals array can't realloc
+mid-lowering); `ir.c` + `emit_elf64.c` + `zero.h` (`elf_emit_record_copy_to`,
+`elf_emit_record_call_with_dest`, `ir_prepare_record_temps_*`, `ir_lower_record_temp`,
+`IrRecordTemp`). Tests: `aggregate-shape-abi.0` (expanded, runs in CI) +
+`fail/aggregate-record-arg-while.0`. Clean `-Wall` build; `conformance` / `native:test` /
+`docs:test` green; Docker-verified. Uncommitted on `feat/std-math-llama2` with the rest of the tree.
+
+### Phase 7 — `main.0` — ✅ DONE (2026-05-21, `feat/std-math-llama2`)
 
 Wire it: load model + tokenizer → encode prompt → generation loop (forward → sample →
 `world.out.write` decoded token → append) until `--tokens` or BOS/EOS. Stream
-unbuffered.
+unbuffered. **Parse `--tokens` text → int here** for the loop bound (Phase 1 only
+digit-validated it; needs a runtime int parser, same gap as Phase 6's float).
+
+**✅ Landed:** `examples/llama2/src/main.0` now runs the full v0.1 pipeline —
+load+validate checkpoint → mmap+encode tokenizer → allocate RunState → autoregressive
+generation loop → stream decoded tokens to stdout, ported 1:1 from `llama2.c` `generate`.
+Each step `forward`s at `pos`, forces `prompt_tokens[pos+1]` while `pos+1 < n_prompt` else
+draws one coin and `sample`s, then (unless the token is BOS) `decode`s and writes the piece
+via `world.out.write`, feeding the token back in. `--tokens` is parsed by an inline
+`parseUsize` (the int analog of Phase 6's `parseF32`) and clamped to `seq_len` (0 ⇒
+seq_len), matching `llama2.c`'s `steps` clamp. The per-phase stdout smoke markers
+(`checkpoint: ok` … `sampler: ok`) are gone — stdout is now the generated token stream; the
+error paths still report distinct `error: …` on stderr. Runtime-verified end-to-end via
+zig+`docker run --platform linux/amd64` on a synthetic checkpoint+tokenizer: full prompt
+echo (BOS dummy-space stripped), deterministic argmax (temperature 0) and sampled
+(temperature 0.5/1.0; softmax+libm+PRNG) continuations, BOS termination, `--tokens 0`→seq_len
+clamp, and every error path.
+
+**Second llama2 phase to need NO compiler change** (after Phase 6) — ordinary Zero. Two
+direct-backend constraints shaped the loop, both handled in pure Zero:
+
+- **`world.out.write` already accepts a runtime `Span<u8>`.** The checker allows `String` *or*
+  `Span<u8>` (`checker.c` 3005 path) and the backend lowers the argument through
+  `ir_lower_byte_view` (the slice/reinterpret path), so streaming `decode`'s `Span<u8>` piece
+  — a view into the live tokenizer mapping — needs no copy and no new op.
+- **The direct ELF64 backend has no `break`/`continue`** (neither is lowered in `ir.c`; the
+  `break-continue.0` fixture is tolerate-skipped on this backend). The data-dependent BOS exit
+  is expressed without `break`: set `pos = steps` to end the `while pos < steps` loop and guard
+  the emit with `if stop == false`.
+
+**Notes / ordering fix:**
+
+- **The tokenizer mapping must outlive the loop.** `decode` returns `Span<u8>` views into the
+  mmap'd vocab, so the tokenizer `munmap` moved from right after `encode` (Phases 5/6) to after
+  the generation loop; the RunState-alloc-failure path now unmaps both mappings.
+- Fixed PRNG seed (12345) ⇒ reproducible temperature>0 runs; temperature 0 ignores it.
+- Carries Phase 6's gotcha: the `--tokens`/`--temperature` spans are hoisted into `let`s before
+  `parseUsize`/`parseF32` (a nested `std.mem.span(...)` arg trips CGEN004).
+
+Fixture `conformance/native/pass/generate-loop.0` — a self-contained, libm-free, fs-free mirror
+of the new logic (`parseUsize`, the `seq_len` clamp, and the prompt-force/BOS-stop sequencing
+incl. the no-`break` exit), `generatedCBytes == 0` ⇒ **runs in CI**; wired into `run.mjs` (check
++ runtime lists). The full libm+fs pipeline is Docker-validated through the example.
+`conformance` + `docs:test` green.
 
 ### Phase 8 — Validation
 
@@ -225,17 +540,19 @@ argmax → exact token stream modulo libm ULPs). Land as a conformance fixture
 | `native/zero-c/src/ir.c` | 0a/0b/0c | lower the new calls |
 | `native/zero-c/src/target.c` | 0a | file mmap (fs-read cap); anon `pageAlloc` (heap cap) |
 | `native/zero-c/src/main.c` | 0a/0b | capability-table entries |
-| `native/zero-c/include/zero.h` | 0a/0b/0c | new IR ops (mmap, anon alloc, int reads, reinterpret) |
+| `native/zero-c/include/zero.h` | 0a/0b/0c/2 | new IR ops (mmap, anon alloc, int reads, reinterpret); `IrFunction` record-return fields |
+| `native/zero-c/src/{emit_elf64,ir}.c` | 2 | aggregate ABI — shape params/returns, span returns, span-in-record locals ([`aggregate-abi.md`](./aggregate-abi.md)) |
 | `docs-site/articles/modules/{fs,mem,codec}.md` | 0a/0b | status entries |
-| `conformance/native/{pass,fail}/mmap-*.0`, `page-alloc-*.0`, `codec-read-i32-le.0` | 0a/0b | fixtures |
-| `examples/llama2/zero.json` + `README.md` | 1 | manifest, weight download |
-| `examples/llama2/src/main.0` | 1/7 | CLI, load, loop |
+| `conformance/native/{pass,fail}/mmap-*.0`, `page-alloc-*.0`, `codec-read-i32-le.0`, `aggregate-shape-abi.0` | 0a/0b/2 | fixtures |
+| `conformance/native/pass/generate-loop.0` | 7 | `parseUsize` + generation control-flow fixture (CI) |
+| `examples/llama2/zero.json` + `README.md` | 1/2/7 | manifest, weight download, `--backend` build, run/stream |
+| `examples/llama2/src/main.0` | 1/2/7 | CLI, load, generation loop |
 | `examples/llama2/src/checkpoint.0` | 2 | header + weight views |
 | `examples/llama2/src/ops.0` | 3 | rmsnorm/matmul/softmax/rope/swiglu |
 | `examples/llama2/src/transformer.0` | 4 | RunState + forward pass |
 | `examples/llama2/src/tokenizer.0` | 5 | BPE encode/decode |
 | `examples/llama2/src/sampler.0` | 6 | argmax/temperature |
-| `conformance/run.mjs` | 8 | llama2 fixture entry |
+| `conformance/run.mjs` | 7/8 | llama2 fixture entries |
 
 ## Risks
 
@@ -267,4 +584,5 @@ argmax → exact token stream modulo libm ULPs). Land as a conformance fixture
 
 - [`./overview.md`](./overview.md) — mission, roadmap, forcing-function rationale.
 - [`./phase-0-followups.md`](./phase-0-followups.md) — Phase 0 hardening items to close before upstream PR.
+- [`./aggregate-abi.md`](./aggregate-abi.md) — the direct-backend shape/span ABI: born in Phase 2 (record params/returns, span returns, span-in-record locals), generalized after Phase 6 to full record value semantics (return/copy records, calls/literals as args, field-on-call). See "Side effort (after Phase 6)".
 - [`../math/plan.md`](../math/plan.md) — the float/math/codec/span foundation this builds on (F1–F5 landed).

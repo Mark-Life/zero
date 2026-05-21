@@ -1,0 +1,41 @@
+fun rope(vec: MutSpan<f32>, pos: i32, head_size: usize) -> Void {
+    let n: usize = std.mem.len(vec)
+    let posf: f32 = pos as f32
+    let hsf: f32 = (head_size as i32) as f32
+    let base: f32 = 10000.0
+    let mut i: usize = 0
+    while i < n {
+        let head_dim: usize = i % head_size
+        let hd: f32 = (head_dim as i32) as f32
+        let exponent: f32 = hd / hsf
+        let denom: f32 = std.math.powf(base, exponent)
+        let freq: f32 = 1.0 / denom
+        let val: f32 = posf * freq
+        let fcr: f32 = std.math.cosf(val)
+        let fci: f32 = std.math.sinf(val)
+        let i1: usize = i + 1
+        let v0: f32 = vec[i]
+        let v1: f32 = vec[i1]
+        vec[i] = v0 * fcr - v1 * fci
+        vec[i1] = v0 * fci + v1 * fcr
+        i = i + 2
+    }
+}
+
+pub fun main(world: World) -> Void raises {
+    // head_size 4, pos 1. Pair 0 rotates by 1 rad; pair 1 by 0.01 rad.
+    let mut vec: [4]f32 = [1.0, 0.0, 0.0, 1.0]
+    let vs: MutSpan<f32> = vec
+    rope(vs, 1, 4)
+    // pair 0: (1,0) -> (cos1, sin1)            = ( 0.54030,  0.84147)
+    // pair 1: (0,1) -> (-sin0.01, cos0.01)     = (-0.01000,  0.99995)
+    let lo2: f32 = 0.0 - 0.011
+    let hi2: f32 = 0.0 - 0.009
+    let ok0: Bool = vec[0] > 0.539 && vec[0] < 0.541
+    let ok1: Bool = vec[1] > 0.840 && vec[1] < 0.842
+    let ok2: Bool = vec[2] > lo2 && vec[2] < hi2
+    let ok3: Bool = vec[3] > 0.9998 && vec[3] < 1.0001
+    if ok0 && ok1 && ok2 && ok3 {
+        check world.out.write("math rope span ok\n")
+    }
+}

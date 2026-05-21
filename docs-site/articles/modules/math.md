@@ -45,7 +45,9 @@ Metadata labels:
   `conformance/native/pass/math-rmsnorm-smoke.0`,
   `conformance/native/pass/math-softmax-smoke.0`,
   `conformance/native/pass/math-rmsnorm-span.0`,
-  `conformance/native/pass/math-softmax-span.0`
+  `conformance/native/pass/math-softmax-span.0`,
+  `conformance/native/pass/math-rope-span.0`,
+  `conformance/native/pass/math-swiglu-span.0`
 
 ## Example
 

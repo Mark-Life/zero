@@ -1,0 +1,187 @@
+// llama2.zero — v0.1, Phase 2 (checkpoint parsing).
+//
+// Parses a Karpathy `llama2.c` checkpoint that has already been mmap'd into a
+// byte span: the 7×int32 header becomes a `Config`, and the weight section is
+// sliced into zero-copy `Span<f32>` views (a `TransformerWeights`). Offsets are
+// computed exactly as `llama2.c` `memory_map_weights`, including the legacy
+// freq_cis skip and the shared-classifier flag (sign of `vocab_size`).
+
+// Hyperparameters from the checkpoint header. Mirrors `llama2.c` `Config` (7
+// int32 fields) plus a derived `shared_weights` flag: the reference keeps that
+// as a local in `read_checkpoint`, but the split here (readConfig + mapWeights)
+// needs to carry it. `vocab_size` is stored as its absolute value.
+pub shape Config {
+    dim: i32,
+    hidden_dim: i32,
+    n_layers: i32,
+    n_heads: i32,
+    n_kv_heads: i32,
+    vocab_size: i32,
+    seq_len: i32,
+    shared_weights: Bool,
+}
+
+// Zero-copy views into the mapped weight section. Field order and tensor shapes
+// match `llama2.c` `TransformerWeights`; `wcls` aliases `token_embedding_table`
+// when the classifier is shared.
+pub shape TransformerWeights {
+    token_embedding_table: Span<f32>,
+    rms_att_weight: Span<f32>,
+    wq: Span<f32>,
+    wk: Span<f32>,
+    wv: Span<f32>,
+    wo: Span<f32>,
+    rms_ffn_weight: Span<f32>,
+    w1: Span<f32>,
+    w2: Span<f32>,
+    w3: Span<f32>,
+    rms_final_weight: Span<f32>,
+    wcls: Span<f32>,
+}
+
+// Read the 7×int32 little-endian header. A negative `vocab_size` is the
+// reference's hacky signal for unshared classifier weights; store its absolute
+// value and record the flag. Assumes `bytes` holds at least 28 bytes.
+pub fun readConfig(bytes: Span<u8>) -> Config {
+    let dim = std.codec.readI32Le(bytes, 0)
+    let hidden_dim = std.codec.readI32Le(bytes, 4)
+    let n_layers = std.codec.readI32Le(bytes, 8)
+    let n_heads = std.codec.readI32Le(bytes, 12)
+    let n_kv_heads = std.codec.readI32Le(bytes, 16)
+    let raw_vocab = std.codec.readI32Le(bytes, 20)
+    let seq_len = std.codec.readI32Le(bytes, 24)
+
+    let mut shared = false
+    if raw_vocab > 0 {
+        shared = true
+    }
+    let mut vocab = raw_vocab
+    if raw_vocab < 0 {
+        vocab = 0 - raw_vocab
+    }
+
+    return Config {
+        dim: dim,
+        hidden_dim: hidden_dim,
+        n_layers: n_layers,
+        n_heads: n_heads,
+        n_kv_heads: n_kv_heads,
+        vocab_size: vocab,
+        seq_len: seq_len,
+        shared_weights: shared
+    }
+}
+
+// Slice the byte span [off, off+count) — measured in f32 elements from the
+// start of the file — into a typed `Span<f32>` view. No copy; offsets are
+// 4-aligned because the header is 28 bytes and every region is f32-sized.
+fun weightView(bytes: Span<u8>, off: usize, count: usize) -> Span<f32> {
+    let start = off * 4
+    let end = start + count * 4
+    return std.mem.bytesAsF32(bytes[start..end])
+}
+
+// Build the weight views from a mapped checkpoint, walking the regions in the
+// exact order and with the exact sizes of `llama2.c` `memory_map_weights`. The
+// running cursor `off` is in f32 elements and starts at 7 (past the header).
+pub fun mapWeights(bytes: Span<u8>, cfg: Config) -> TransformerWeights {
+    let dim = cfg.dim as usize
+    let hidden = cfg.hidden_dim as usize
+    let n_layers = cfg.n_layers as usize
+    let n_heads = cfg.n_heads as usize
+    let n_kv_heads = cfg.n_kv_heads as usize
+    let vocab = cfg.vocab_size as usize
+    let seq_len = cfg.seq_len as usize
+    let head_size = dim / n_heads
+
+    // Region sizes, named once and reused for both the cursor advance and the view.
+    let tet_count = vocab * dim
+    let rms_count = n_layers * dim
+    let wq_count = n_layers * dim * (n_heads * head_size)
+    let wkv_count = n_layers * dim * (n_kv_heads * head_size)
+    let wo_count = n_layers * (n_heads * head_size) * dim
+    let w13_count = n_layers * dim * hidden
+    let w2_count = n_layers * hidden * dim
+    let rope_half = seq_len * head_size / 2
+
+    let mut off: usize = 7
+
+    let tet_off = off
+    off = off + tet_count
+    let rms_att_off = off
+    off = off + rms_count
+    let wq_off = off
+    off = off + wq_count
+    let wk_off = off
+    off = off + wkv_count
+    let wv_off = off
+    off = off + wkv_count
+    let wo_off = off
+    off = off + wo_count
+    let rms_ffn_off = off
+    off = off + rms_count
+    let w1_off = off
+    off = off + w13_count
+    let w2_off = off
+    off = off + w2_count
+    let w3_off = off
+    off = off + w13_count
+    let rms_final_off = off
+    off = off + dim
+    off = off + rope_half
+    off = off + rope_half
+
+    let mut wcls_off = off
+    if cfg.shared_weights {
+        wcls_off = tet_off
+    }
+
+    return TransformerWeights {
+        token_embedding_table: weightView(bytes, tet_off, tet_count),
+        rms_att_weight: weightView(bytes, rms_att_off, rms_count),
+        wq: weightView(bytes, wq_off, wq_count),
+        wk: weightView(bytes, wk_off, wkv_count),
+        wv: weightView(bytes, wv_off, wkv_count),
+        wo: weightView(bytes, wo_off, wo_count),
+        rms_ffn_weight: weightView(bytes, rms_ffn_off, rms_count),
+        w1: weightView(bytes, w1_off, w13_count),
+        w2: weightView(bytes, w2_off, w2_count),
+        w3: weightView(bytes, w3_off, w13_count),
+        rms_final_weight: weightView(bytes, rms_final_off, dim),
+        wcls: weightView(bytes, wcls_off, tet_count)
+    }
+}
+
+// Total f32-element count of a well-formed checkpoint file: the 7-element header
+// plus every region `memory_map_weights` walks (including the legacy freq_cis
+// tables it skips), plus a separate classifier block only when not shared. Used
+// to validate a mapping's byte length against the parsed header.
+pub fun expectedFileFloats(cfg: Config) -> usize {
+    let dim = cfg.dim as usize
+    let hidden = cfg.hidden_dim as usize
+    let n_layers = cfg.n_layers as usize
+    let n_heads = cfg.n_heads as usize
+    let n_kv_heads = cfg.n_kv_heads as usize
+    let vocab = cfg.vocab_size as usize
+    let seq_len = cfg.seq_len as usize
+    let head_size = dim / n_heads
+
+    let mut total: usize = 7
+    total = total + vocab * dim
+    total = total + n_layers * dim
+    total = total + n_layers * dim * (n_heads * head_size)
+    total = total + n_layers * dim * (n_kv_heads * head_size)
+    total = total + n_layers * dim * (n_kv_heads * head_size)
+    total = total + n_layers * (n_heads * head_size) * dim
+    total = total + n_layers * dim
+    total = total + n_layers * dim * hidden
+    total = total + n_layers * hidden * dim
+    total = total + n_layers * dim * hidden
+    total = total + dim
+    total = total + seq_len * head_size / 2
+    total = total + seq_len * head_size / 2
+    if cfg.shared_weights == false {
+        total = total + vocab * dim
+    }
+    return total
+}

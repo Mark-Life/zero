@@ -1,0 +1,120 @@
+// llama2 Phase 7: self-contained generation-loop control flow + parseUsize.
+//
+// Mirrors the libm-free, fs-free pieces of examples/llama2/src/main.0's Phase 7
+// generation loop so they run in CI (no std.math, no fs => generatedCBytes==0):
+//   - parseUsize: the runtime --tokens decimal scan (std.parse is comptime-only)
+//   - clampSteps: --tokens 0 or > seq_len clamps to seq_len (llama2.c steps clamp)
+//   - the prompt-force / sample / BOS-stop sequencing, including the no-`break`
+//     loop exit (the direct backend has no `break`, so the loop ends by setting
+//     pos = steps and guarding the emit instead).
+// The forward/sample/decode integration (libm + fs) is Docker-validated through
+// the example itself (see examples/llama2/README.md).
+
+fun parseUsize(s: Span<u8>) -> usize {
+    let n = std.mem.len(s)
+    let zeroc = '0' as u8
+    let ninec = '9' as u8
+    let mut value: usize = 0
+    let mut i: usize = 0
+    while i < n {
+        let c = s[i]
+        let below = c < zeroc
+        let above = c > ninec
+        let bad = below || above
+        if bad == false {
+            let d = (c as i32) - (zeroc as i32)
+            let du = d as usize
+            value = value * 10 + du
+        }
+        i = i + 1
+    }
+    return value
+}
+
+fun clampSteps(raw: usize, seq_len: usize) -> usize {
+    let mut steps = raw
+    if steps == 0 {
+        steps = seq_len
+    }
+    if steps > seq_len {
+        steps = seq_len
+    }
+    return steps
+}
+
+pub fun main(world: World) -> Void raises {
+    // parseUsize: decimal scan over a runtime byte span (nested std calls as args
+    // trip CGEN004, so the spans are hoisted first, as the example does).
+    let s256 = std.mem.span("256")
+    let okP256 = parseUsize(s256) == 256
+    let s0 = std.mem.span("0")
+    let okP0 = parseUsize(s0) == 0
+    let s42 = std.mem.span("42")
+    let okP42 = parseUsize(s42) == 42
+    let s007 = std.mem.span("007")
+    let okP7 = parseUsize(s007) == 7
+
+    // clampSteps: 0 and over-seq_len clamp to seq_len; in-range passes through.
+    let okC0 = clampSteps(0, 256) == 256
+    let okC8 = clampSteps(8, 256) == 8
+    let okCbig = clampSteps(999, 256) == 256
+
+    // Generation control flow over a fake model: prompt_tokens forces the prompt
+    // (echoing prompt_tokens[1..]), then genTokens supplies sampled tokens until a
+    // BOS (=1) ends it. Captures the emitted token ids and verifies the sequence.
+    let prompt_tokens: [3]i32 = [1, 5, 6]   // BOS, then two prompt tokens
+    let psp: Span<i32> = prompt_tokens
+    let n_prompt: usize = 3
+    let genTokens: [3]i32 = [7, 8, 1]       // two generated tokens, then BOS
+    let gsp: Span<i32> = genTokens
+
+    let mut emitted: [16]i32 = [0_i32; 16]
+    let esp: MutSpan<i32> = emitted
+    let mut nEmit: usize = 0
+    let mut gi: usize = 0
+
+    let steps = clampSteps(10, 64)
+    let mut token: i32 = psp[0]
+    let mut pos: usize = 0
+    while pos < steps {
+        // "forward" is a no-op here; pick next exactly as the example loop does.
+        let mut next: i32 = 0
+        let in_prompt = pos + 1 < n_prompt
+        if in_prompt {
+            next = psp[pos + 1]
+        }
+        if in_prompt == false {
+            next = gsp[gi]
+            gi = gi + 1
+        }
+        pos = pos + 1
+        let stop = next == 1
+        if stop {
+            pos = steps
+        }
+        if stop == false {
+            esp[nEmit] = next
+            nEmit = nEmit + 1
+            token = next
+        }
+    }
+
+    // Expect emitted = [5, 6, 7, 8]: prompt echo (ids 5,6) then generation (7,8),
+    // stopping before the BOS that follows.
+    let okN = nEmit == 4
+    let ok0 = esp[0] == 5
+    let ok1 = esp[1] == 6
+    let ok2 = esp[2] == 7
+    let ok3 = esp[3] == 8
+    let okSeq = ok0 && ok1 && ok2 && ok3
+    let lastToken = token == 8
+
+    let okParse = okP256 && okP0 && okP42 && okP7
+    let okClamp = okC0 && okC8 && okCbig
+    let okGen = okN && okSeq && lastToken
+    let okAll = okParse && okClamp && okGen
+    if okAll {
+        check world.out.write("generate loop ok\n")
+    }
+    return
+}

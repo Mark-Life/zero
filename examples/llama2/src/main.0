@@ -1,0 +1,253 @@
+// llama2.zero — v0.1, Phase 7 (generation loop).
+//
+// Loads the checkpoint + tokenizer, BPE-encodes the prompt, then runs the
+// autoregressive generation loop, ported from `llama2.c` `generate`: forward the
+// transformer at the current position, force the next prompt token while still
+// inside the prompt or otherwise sample from the logits, stream the decoded
+// piece to stdout, and feed the chosen token back in. The loop ends at `--tokens`
+// steps (clamped to seq_len) or when a BOS (=1) delimiter is produced.
+//
+// Numeric flags are parsed at runtime here — `std.parse` folds only string
+// literals at compile time, so `--tokens` uses a hand-rolled `parseUsize` (the
+// int analog of Phase 6's `parseF32`, which parses `--temperature` in sampler.0).
+
+use checkpoint
+use transformer
+use tokenizer
+use sampler
+
+// True when every byte of `bytes` is an ASCII digit (and `bytes` is non-empty).
+// Validates `--tokens` before `parseUsize`, so a bad value reports an error
+// rather than silently parsing to a partial number.
+fun allDigits(bytes: Span<u8>) -> Bool {
+    let n = std.mem.len(bytes)
+    if n == 0 {
+        return false
+    }
+    let lo = ('0' as u8)
+    let hi = ('9' as u8)
+    let mut ok = true
+    let mut i: usize = 0
+    while i < n {
+        let c = bytes[i]
+        let below = c < lo
+        let above = c > hi
+        if below || above {
+            ok = false
+        }
+        i = i + 1
+    }
+    return ok
+}
+
+// Parse a non-negative decimal integer from its byte span. The runtime `--tokens`
+// value needs this because `std.parse` is compile-time only; non-digit bytes are
+// skipped (the value is `allDigits`-validated first). Overflow wraps with the
+// backend's u64 arithmetic — token budgets are tiny, so this never matters.
+fun parseUsize(s: Span<u8>) -> usize {
+    let n = std.mem.len(s)
+    let zeroc = '0' as u8
+    let ninec = '9' as u8
+    let mut value: usize = 0
+    let mut i: usize = 0
+    while i < n {
+        let c = s[i]
+        let below = c < zeroc
+        let above = c > ninec
+        let bad = below || above
+        if bad == false {
+            let d = (c as i32) - (zeroc as i32)
+            let du = d as usize
+            value = value * 10 + du
+        }
+        i = i + 1
+    }
+    return value
+}
+
+pub fun main(world: World) -> Void raises {
+    let argc = std.args.len()
+    let model_arg = std.args.get(1)
+    if argc < 2 || model_arg.has == false {
+        check world.err.write("usage: llama2 <model.bin> --prompt <text> --tokens <n> [--temperature <t>]\n")
+        return
+    }
+    let model = model_arg.value
+
+    let mut prompt: String = ""
+    let mut tokens_arg: String = "256"
+    let mut temperature: String = "1.0"
+    let mut tokenizer_path: String = "tokenizer.bin"
+
+    // Minimal flag scan: advance one arg at a time, match a known flag, and read
+    // the following arg as its value. Values are assumed not to collide with flag
+    // names — sufficient for v0.1.
+    let mut i: usize = 2
+    while i < argc {
+        let flag = std.args.get(i)
+        if flag.has {
+            let f = flag.value
+            if std.mem.eql(f, "--prompt") {
+                let v = std.args.get(i + 1)
+                if v.has {
+                    prompt = v.value
+                }
+            }
+            if std.mem.eql(f, "--tokens") {
+                let v = std.args.get(i + 1)
+                if v.has {
+                    tokens_arg = v.value
+                }
+            }
+            if std.mem.eql(f, "--temperature") {
+                let v = std.args.get(i + 1)
+                if v.has {
+                    temperature = v.value
+                }
+            }
+            if std.mem.eql(f, "--tokenizer") {
+                let v = std.args.get(i + 1)
+                if v.has {
+                    tokenizer_path = v.value
+                }
+            }
+        }
+        i = i + 1
+    }
+
+    // Validate the runtime --tokens value digit-by-digit over its byte span
+    // (std.parse.* is compile-time only).
+    let tokens_bytes = std.mem.span(tokens_arg)
+    if allDigits(tokens_bytes) == false {
+        check world.err.write("error: --tokens must be a non-negative integer\n")
+        return
+    }
+
+    // mmap the checkpoint, parse its header into a Config, validate the file
+    // length against the header, and build the zero-copy weight views.
+    let fs = std.fs.host()
+    let mapped = std.fs.mmap(fs, model)
+    if mapped.has == false {
+        check world.err.write("error: cannot open model file\n")
+        return
+    }
+    let mut m: owned<Mapping> = mapped.value
+    let bytes = std.fs.mappingBytes(&m)
+    if std.mem.len(bytes) < 28 {
+        check world.err.write("error: model file too small for a checkpoint header\n")
+        std.fs.munmap(&mut m)
+        return
+    }
+
+    let cfg = readConfig(bytes)
+    let expected = expectedFileFloats(cfg)
+    let actual = std.mem.len(bytes) / 4
+    let size_ok = expected == actual
+    if size_ok == false {
+        check world.err.write("error: checkpoint size does not match its header\n")
+        std.fs.munmap(&mut m)
+        return
+    }
+    let weights = mapWeights(bytes, cfg)
+
+    // mmap the tokenizer and BPE-encode the prompt. The mapping stays live for
+    // the whole run because `decode` returns views into it — it is unmapped after
+    // the generation loop, not here.
+    let tok_mapped = std.fs.mmap(fs, tokenizer_path)
+    if tok_mapped.has == false {
+        check world.err.write("error: cannot open tokenizer file\n")
+        std.fs.munmap(&mut m)
+        return
+    }
+    let mut tm: owned<Mapping> = tok_mapped.value
+    let tok_bytes = std.fs.mappingBytes(&tm)
+    let tk = buildTokenizer(tok_bytes, cfg.vocab_size)
+    let prompt_bytes = std.mem.span(prompt)
+    let prompt_need = std.mem.len(prompt_bytes) + 3
+    if prompt_need > 1024 {
+        check world.err.write("error: prompt too long for v0.1 (max 1021 bytes)\n")
+        std.fs.munmap(&mut tm)
+        std.fs.munmap(&mut m)
+        return
+    }
+    let mut prompt_tokens: [1024]i32 = [0_i32; 1024]
+    let pt: MutSpan<i32> = prompt_tokens
+    let n_prompt = encode(tk, prompt_bytes, pt, true)
+    if n_prompt < 1 {
+        check world.err.write("error: prompt encoded to zero tokens\n")
+        std.fs.munmap(&mut tm)
+        std.fs.munmap(&mut m)
+        return
+    }
+
+    // Allocate the zeroed RunState region (anonymous mmap, sized from Config) once
+    // — the KV cache persists across positions for the whole generation.
+    let rs_floats = runStateFloats(cfg)
+    let rs_bytes = rs_floats * 4
+    let heap = std.mem.pageAlloc()
+    let rs_region = std.mem.allocBytes(heap, rs_bytes)
+    if rs_region.has == false {
+        check world.err.write("error: cannot allocate run state\n")
+        std.fs.munmap(&mut tm)
+        std.fs.munmap(&mut m)
+        return
+    }
+    let rs_base: MutSpan<u8> = rs_region.value
+    let state = mallocRunState(rs_base, cfg)
+
+    // Parse the numeric flags. `--tokens` 0 (or over seq_len) clamps to seq_len,
+    // matching `llama2.c`'s `steps` clamp.
+    let temp_bytes = std.mem.span(temperature)
+    let temp = parseF32(temp_bytes)
+    let mut steps = parseUsize(tokens_bytes)
+    let seq_len_u = cfg.seq_len as usize
+    if steps == 0 {
+        steps = seq_len_u
+    }
+    if steps > seq_len_u {
+        steps = seq_len_u
+    }
+
+    // Autoregressive generation loop (llama2.c `generate`). A fixed PRNG seed
+    // keeps temperature>0 runs reproducible; temperature 0 (argmax) ignores it.
+    let mut rng: u64 = 12345
+    let mut token: i32 = pt[0]
+    let mut pos: usize = 0
+    while pos < steps {
+        forward(cfg, weights, state, token, pos as i32)
+        let step_logits = logitsOf(state, cfg)
+
+        // While still inside the prompt, force the next prompt token; afterwards
+        // sample (drawing one coin per token, as llama2.c does for temperature>0).
+        let mut next: i32 = 0
+        let in_prompt = pos + 1 < n_prompt
+        if in_prompt {
+            next = pt[pos + 1]
+        }
+        if in_prompt == false {
+            rng = rngNext(rng)
+            let coin = randomF32(rng)
+            next = sample(step_logits, temp, coin)
+        }
+        pos = pos + 1
+
+        // The BOS (=1) token delimits sequences — stop before emitting it. The
+        // direct backend has no `break`, so end the loop by jumping `pos` to the
+        // bound and guard the emit instead.
+        let stop = next == 1
+        if stop {
+            pos = steps
+        }
+        if stop == false {
+            // Stream the decoded piece (a view into the live tokenizer mapping).
+            let piece = decode(tk, token, next)
+            check world.out.write(piece)
+            token = next
+        }
+    }
+    check world.out.write("\n")
+
+    std.fs.munmap(&mut tm)
+    std.fs.munmap(&mut m)
+    return
+}
