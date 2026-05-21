@@ -1031,13 +1031,13 @@ grep -q '"generatedCBytes": 0' .zero/native-test/direct-std-fs-breadth.json
 grep -q '"path":"direct-elf64-exe"' .zero/native-test/direct-std-fs-breadth.json
 rm -f .zero/native-test/direct-std-fs-fallible-resources .zero/native-test/direct-std-fs-fallible-resources.c
 bin/zero build --json --emit exe --backend zero-elf64 --target linux-musl-x64 conformance/native/pass/std-fs-fallible-resources.0 --out .zero/native-test/direct-std-fs-fallible-resources > .zero/native-test/direct-std-fs-fallible-resources.json
-node -e 'const fs=require("fs"); const b=fs.readFileSync(".zero/native-test/direct-std-fs-fallible-resources"); const packed=(code)=>{const x=Buffer.alloc(10); x[0]=0x48; x[1]=0xb8; x.writeBigUInt64LE(BigInt(code)<<32n,2); return x}; if (!b.includes(packed(2)) || !b.includes(packed(4))) process.exit(1);'
+node -e 'const fs=require("fs"); const b=fs.readFileSync(".zero/native-test/direct-std-fs-fallible-resources"); const tag=(code)=>{const x=Buffer.alloc(5); x[0]=0xba; x.writeUInt32LE(code,1); return x}; if (!b.includes(tag(2)) || !b.includes(tag(4))) process.exit(1);'
 test ! -f .zero/native-test/direct-std-fs-fallible-resources.c
 grep -q '"generatedCBytes": 0' .zero/native-test/direct-std-fs-fallible-resources.json
 grep -q '"path":"direct-elf64-exe"' .zero/native-test/direct-std-fs-fallible-resources.json
 rm -f .zero/native-test/direct-std-fs-fallible .zero/native-test/direct-std-fs-fallible.c
 bin/zero build --json --emit exe --backend zero-elf64 --target linux-musl-x64 conformance/native/pass/std-fs-fallible.0 --out .zero/native-test/direct-std-fs-fallible > .zero/native-test/direct-std-fs-fallible.json
-node -e 'const fs=require("fs"); const b=fs.readFileSync(".zero/native-test/direct-std-fs-fallible"); const packed=(code)=>{const x=Buffer.alloc(10); x[0]=0x48; x[1]=0xb8; x.writeBigUInt64LE(BigInt(code)<<32n,2); return x}; if (!b.includes(packed(2)) || !b.includes(packed(3)) || !b.includes(packed(4))) process.exit(1);'
+node -e 'const fs=require("fs"); const b=fs.readFileSync(".zero/native-test/direct-std-fs-fallible"); const tag=(code)=>{const x=Buffer.alloc(5); x[0]=0xba; x.writeUInt32LE(code,1); return x}; if (!b.includes(tag(2)) || !b.includes(tag(3)) || !b.includes(tag(4))) process.exit(1);'
 test ! -f .zero/native-test/direct-std-fs-fallible.c
 grep -q '"generatedCBytes": 0' .zero/native-test/direct-std-fs-fallible.json
 grep -q '"path":"direct-elf64-exe"' .zero/native-test/direct-std-fs-fallible.json
