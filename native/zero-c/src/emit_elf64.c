@@ -3751,7 +3751,15 @@ bool z_emit_elf64_object_from_ir(const IrProgram *ir, ZBuf *out, ZDiag *diag) {
   }
 
   for (size_t i = 0; i < ir->function_len; i++) {
-    elf_append_symbol(&symtab, symbol_names[i], ir->functions[i].is_exported ? 0x12 : 0x02, 1, function_offsets[i], function_sizes[i]);
+    // All defined function symbols are GLOBAL (STB_GLOBAL|STT_FUNC). The .symtab
+    // sh_info below is fixed at the index past the null + optional section symbol,
+    // i.e. it declares every function symbol global; emitting a non-exported
+    // function as a local (0x02) there put a local symbol past sh_info, which the
+    // ELF spec forbids and modern linkers (lld, recent GNU ld) reject — the cause
+    // of "local symbol at index N (>= sh_info)" when linking against libm. Intra-
+    // object calls are PC-relative (no function-symbol relocations), so the
+    // binding is purely informational for the final exe link.
+    elf_append_symbol(&symtab, symbol_names[i], 0x12, 1, function_offsets[i], function_sizes[i]);
   }
   if (has_runtime_json_parse_bytes) {
     elf_append_symbol(&symtab, runtime_json_parse_bytes_name, 0x12, 0, 0, 0);
