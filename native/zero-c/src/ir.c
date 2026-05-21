@@ -443,11 +443,13 @@ static unsigned ir_type_byte_size(IrTypeKind type) {
     case IR_TYPE_I64:
     case IR_TYPE_U64:
     case IR_TYPE_F64: return 8;
+    case IR_TYPE_BYTE_VIEW: return 16;
     default: return 0;
   }
 }
 
 static unsigned ir_type_alignment(IrTypeKind type) {
+  if (type == IR_TYPE_BYTE_VIEW) return 8;
   unsigned size = ir_type_byte_size(type);
   if (size >= 4) return 4;
   return size ? size : 1;
@@ -472,7 +474,7 @@ static bool ir_shape_layout(const Program *program, const char *shape_name, unsi
     unsigned array_len = 0;
     IrTypeKind element_type = IR_TYPE_UNSUPPORTED;
     bool is_array = ir_parse_fixed_array_type_for_program(program, field_type_text, &array_len, &element_type);
-    if (!(field_type == IR_TYPE_BOOL || ir_type_is_value(field_type) || is_array)) {
+    if (!(field_type == IR_TYPE_BOOL || ir_type_is_value(field_type) || is_array || field_type == IR_TYPE_BYTE_VIEW)) {
       free(field_type_text);
       ir_type_arg_vec_free(&args);
       return false;
@@ -503,7 +505,7 @@ static bool ir_shape_field_info(const Program *program, const char *shape_name, 
     unsigned array_len = 0;
     IrTypeKind element_type = IR_TYPE_UNSUPPORTED;
     bool is_array = ir_parse_fixed_array_type_for_program(program, field_type_text, &array_len, &element_type);
-    if (!(field_type == IR_TYPE_BOOL || ir_type_is_value(field_type) || is_array)) {
+    if (!(field_type == IR_TYPE_BOOL || ir_type_is_value(field_type) || is_array || field_type == IR_TYPE_BYTE_VIEW)) {
       free(field_type_text);
       ir_type_arg_vec_free(&args);
       return false;
@@ -541,7 +543,7 @@ static bool ir_shape_field_storage_info(const Program *program, const char *shap
     unsigned array_len = 0;
     IrTypeKind element_type = IR_TYPE_UNSUPPORTED;
     bool is_array = ir_parse_fixed_array_type_for_program(program, field_type_text, &array_len, &element_type);
-    if (!(field_type == IR_TYPE_BOOL || ir_type_is_value(field_type) || is_array)) {
+    if (!(field_type == IR_TYPE_BOOL || ir_type_is_value(field_type) || is_array || field_type == IR_TYPE_BYTE_VIEW)) {
       free(field_type_text);
       ir_type_arg_vec_free(&args);
       return false;
@@ -951,6 +953,150 @@ static bool ir_is_world_stream_write(const IrFunction *fun, const Expr *expr, co
 }
 
 static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunction *fun, const Expr *expr, IrValue **out);
+static bool ir_lower_shape_initializer(const Program *program, IrProgram *ir, IrFunction *mir_fun, unsigned target_index, const char *shape_name, const Expr *expr, IrInstr **out_items, size_t *out_len, size_t *out_cap, int line, int column);
+static void ir_instr_vec_push(IrProgram *ir, IrInstr **items, size_t *len, size_t *cap, IrInstr instr);
+
+// ---- Record temporaries (see IrRecordTemp) -------------------------------------
+//
+// A record-returning call or a shape literal that appears where an *addressable*
+// record value is required — as a record call argument, or the receiver of a field
+// access — has no named local whose slot can be pointed at. We give each such
+// occurrence its own temp record local. The temps are allocated in a pre-pass before
+// the body is lowered (ir_prepare_record_temps), so the locals array never reallocs
+// during lowering and held IrLocal* stay valid; lowering then materializes the temp
+// (the call's sret target, or the literal's field stores) in front of its use and
+// substitutes a local reference.
+
+// True for an expression that yields a record value but is not a plain local: it must
+// be materialized into a temp before its address can be taken. `out_shape` receives
+// the shape name. Generic record returns are not resolved here (they fall back to the
+// graceful "record arg must be a local" path).
+static bool ir_expr_is_record_temp_source(const Program *program, const Expr *expr, const char **out_shape) {
+  if (!expr) return false;
+  if (expr->kind == EXPR_SHAPE_LITERAL) {
+    if (out_shape) *out_shape = expr->text;
+    return expr->text && ir_shape_layout(program, expr->text, NULL, NULL);
+  }
+  if (expr->kind == EXPR_CALL && expr->left && expr->left->kind == EXPR_IDENT && expr->type_args.len == 0) {
+    const Function *callee = ir_find_source_function(program, expr->left->text, NULL);
+    if (callee && !callee->raises && callee->return_type && ir_shape_layout(program, callee->return_type, NULL, NULL)) {
+      if (out_shape) *out_shape = callee->return_type;
+      return true;
+    }
+  }
+  return false;
+}
+
+static unsigned *ir_record_temp_slot(IrProgram *ir, const Expr *expr) {
+  for (size_t i = 0; i < ir->record_temp_len; i++) {
+    if (ir->record_temps[i].expr == expr) return &ir->record_temps[i].local_index;
+  }
+  return NULL;
+}
+
+// Reserve a temp record local for `expr` (once) and remember the mapping.
+static void ir_record_temp_register(IrProgram *ir, IrFunction *fun, const Expr *expr, const char *shape) {
+  if (ir_record_temp_slot(ir, expr)) return;
+  unsigned size = 0;
+  unsigned align = 0;
+  if (!ir_shape_layout(&ir->program, shape, &size, &align)) return;
+  char name[40];
+  snprintf(name, sizeof(name), "__agg_tmp_%zu", ir->record_temp_len);
+  ir_function_push_local(ir, fun, name, IR_TYPE_RECORD, false, false, true, shape, IR_TYPE_UNSUPPORTED, 0, size, align, false, expr->line, expr->column);
+  unsigned index = (unsigned)(fun->local_len - 1);
+  ir->record_temps = ir_grow_tracked_items(ir, ir->record_temps, ir->record_temp_len, &ir->record_temp_cap, 4, sizeof(IrRecordTemp));
+  ir->record_temps[ir->record_temp_len++] = (IrRecordTemp){.expr = expr, .local_index = index, .materialized = false};
+}
+
+// Pre-pass: walk an expression and reserve temps for record call-args / field
+// receivers. Descends only through unconditionally-evaluated positions so a temp's
+// construction can be safely hoisted in front of its statement — notably it does not
+// enter the right operand of `&&`/`||` (short-circuit) or other conditionally-taken
+// sub-expressions, which fall back to the graceful unsupported path at lowering.
+static void ir_prepare_record_temps_expr(IrProgram *ir, IrFunction *fun, const Expr *expr) {
+  if (!expr) return;
+  if (expr->kind == EXPR_CALL) {
+    for (size_t i = 0; i < expr->args.len; i++) {
+      const Expr *arg = expr->args.items[i];
+      const char *shape = NULL;
+      if (ir_expr_is_record_temp_source(&ir->program, arg, &shape)) ir_record_temp_register(ir, fun, arg, shape);
+      ir_prepare_record_temps_expr(ir, fun, arg);
+    }
+    return;
+  }
+  if (expr->kind == EXPR_MEMBER) {
+    const char *shape = NULL;
+    if (ir_expr_is_record_temp_source(&ir->program, expr->left, &shape)) ir_record_temp_register(ir, fun, expr->left, shape);
+    ir_prepare_record_temps_expr(ir, fun, expr->left);
+    return;
+  }
+  if (expr->kind == EXPR_BINARY && expr->text && (strcmp(expr->text, "&&") == 0 || strcmp(expr->text, "||") == 0)) {
+    // Right side is conditionally evaluated — do not hoist temps out of it.
+    ir_prepare_record_temps_expr(ir, fun, expr->left);
+    return;
+  }
+  ir_prepare_record_temps_expr(ir, fun, expr->left);
+  ir_prepare_record_temps_expr(ir, fun, expr->right);
+  for (size_t i = 0; i < expr->args.len; i++) ir_prepare_record_temps_expr(ir, fun, expr->args.items[i]);
+  for (size_t i = 0; i < expr->fields.len; i++) ir_prepare_record_temps_expr(ir, fun, expr->fields.items[i].value);
+}
+
+static void ir_prepare_record_temps_stmts(IrProgram *ir, IrFunction *fun, const StmtVec *body);
+
+static void ir_prepare_record_temps_stmt(IrProgram *ir, IrFunction *fun, const Stmt *stmt) {
+  if (!stmt) return;
+  // Loop conditions/bounds re-evaluate, so temps there cannot be hoisted once; skip
+  // them (graceful unsupported at lowering) but always recurse into bodies, whose
+  // statements set their own sink and materialize per iteration.
+  if (stmt->kind != STMT_WHILE && stmt->kind != STMT_FOR) {
+    ir_prepare_record_temps_expr(ir, fun, stmt->expr);
+    ir_prepare_record_temps_expr(ir, fun, stmt->target);
+  }
+  ir_prepare_record_temps_stmts(ir, fun, &stmt->then_body);
+  ir_prepare_record_temps_stmts(ir, fun, &stmt->else_body);
+  for (size_t i = 0; i < stmt->match_arms.len; i++) ir_prepare_record_temps_stmts(ir, fun, &stmt->match_arms.items[i].body);
+}
+
+static void ir_prepare_record_temps_stmts(IrProgram *ir, IrFunction *fun, const StmtVec *body) {
+  if (!body) return;
+  for (size_t i = 0; i < body->len; i++) ir_prepare_record_temps_stmt(ir, fun, body->items[i]);
+}
+
+// Lower a record temp occurrence: materialize it once into its slot (a record call's
+// sret, or a shape literal's field stores) via the active statement sink, then return
+// a local reference. Returns false (with a diagnostic) only if no temp was reserved
+// for this expression (a context the pre-pass skipped) or the sink is unset.
+static bool ir_lower_record_temp(const Program *program, IrProgram *ir, const Expr *expr, IrValue **out) {
+  unsigned *slot = ir_record_temp_slot(ir, expr);
+  if (!slot || !ir->lower_sink_items || !ir->lower_sink_fun) {
+    ir_mark_unsupported(ir, "direct backend record value is unsupported in this position", expr->line, expr->column, "record temporary");
+    return false;
+  }
+  unsigned index = *slot;
+  IrRecordTemp *entry = NULL;
+  for (size_t i = 0; i < ir->record_temp_len; i++) {
+    if (ir->record_temps[i].expr == expr) { entry = &ir->record_temps[i]; break; }
+  }
+  if (entry && !entry->materialized) {
+    entry->materialized = true;
+    if (expr->kind == EXPR_SHAPE_LITERAL) {
+      if (!ir_lower_shape_initializer(program, ir, ir->lower_sink_fun, index, ir->lower_sink_fun->locals[index].shape_name, expr, ir->lower_sink_items, ir->lower_sink_len, ir->lower_sink_cap, expr->line, expr->column)) return false;
+    } else {
+      IrValue *call = NULL;
+      if (!ir_lower_expr(program, ir, ir->lower_sink_fun, expr, &call)) return false;
+      if (call->type != IR_TYPE_RECORD) {
+        ir_free_value(call);
+        ir_mark_unsupported(ir, "direct backend record temporary requires a record value", expr->line, expr->column, "non-record temporary");
+        return false;
+      }
+      ir_instr_vec_push(ir, ir->lower_sink_items, ir->lower_sink_len, ir->lower_sink_cap, (IrInstr){.kind = IR_INSTR_LOCAL_SET, .local_index = index, .value = call, .line = expr->line, .column = expr->column});
+    }
+  }
+  IrValue *ref = ir_new_value(ir, IR_VALUE_LOCAL, IR_TYPE_RECORD, expr->line, expr->column);
+  ref->local_index = index;
+  *out = ref;
+  return true;
+}
 
 static bool ir_u8_literal_byte(const Expr *expr, unsigned char *out) {
   if (!expr || !out) return false;
@@ -1162,8 +1308,39 @@ static bool ir_lower_byte_view(const Program *program, IrProgram *ir, const IrFu
     value->left = base;
     value->index = start;
     value->right = end;
+    // Element size of the slice (from its resolved Span<T>/MutSpan<T> type) so the
+    // backend scales the start offset by it: slicing a typed span at element i
+    // advances the pointer by i*sizeof(T), not i bytes. u8 slices stay byte-wise.
+    value->element_type = ir_byte_view_element_type(expr->resolved_type);
     *out = value;
     return true;
+  }
+  if (expr->kind == EXPR_MEMBER && expr->left && expr->left->kind == EXPR_IDENT) {
+    // A span-typed field of a record local, read as a byte view (ptr at the field
+    // offset, len 8 bytes higher).
+    const IrLocal *local = ir_function_find_local(fun, expr->left->text);
+    unsigned field_offset = 0;
+    IrTypeKind field_type = IR_TYPE_UNSUPPORTED;
+    if (local && local->is_record && ir_shape_field_info(program, local->shape_name, expr->text, &field_offset, &field_type) && field_type == IR_TYPE_BYTE_VIEW) {
+      IrValue *value = ir_new_value(ir, IR_VALUE_FIELD_LOAD, IR_TYPE_BYTE_VIEW, expr->line, expr->column);
+      value->local_index = local->index;
+      value->field_offset = field_offset;
+      *out = value;
+      return true;
+    }
+  }
+  if (expr->kind == EXPR_CALL) {
+    // A user function that returns a span: lower the call and carry its (ptr, len)
+    // through the byte-view machinery. The callee returns ptr in rax and len in rdx.
+    IrValue *call = NULL;
+    if (!ir_lower_expr(program, ir, fun, expr, &call)) return false;
+    if (call->type == IR_TYPE_BYTE_VIEW) {
+      *out = call;
+      return true;
+    }
+    ir_free_value(call);
+    ir_mark_unsupported(ir, "direct backend byte view call must return a span", expr->line, expr->column, "non-span call");
+    return false;
   }
   ir_mark_unsupported(ir, "direct backend byte views currently support string literals and slices", expr->line, expr->column, "unsupported byte view source");
   return false;
@@ -1378,6 +1555,26 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
           *out = value;
           return true;
         }
+      }
+      // Field access on a record-returning call / shape literal: materialize it into a
+      // temp, then read the field from that slot (e.g. `makeDims(7).width`).
+      if (expr->left && ir_record_temp_slot(ir, expr->left)) {
+        IrValue *record = NULL;
+        if (!ir_lower_record_temp(program, ir, expr->left, &record)) return false;
+        unsigned temp_index = record->local_index;
+        ir_free_value(record);
+        unsigned field_offset = 0;
+        IrTypeKind field_type = IR_TYPE_UNSUPPORTED;
+        const char *shape = temp_index < fun->local_len ? fun->locals[temp_index].shape_name : NULL;
+        if (!shape || !ir_shape_field_info(program, shape, expr->text, &field_offset, &field_type)) {
+          ir_mark_unsupported(ir, "direct backend record field is unknown", expr->line, expr->column, expr->text);
+          return false;
+        }
+        IrValue *value = ir_new_value(ir, IR_VALUE_FIELD_LOAD, field_type, expr->line, expr->column);
+        value->local_index = temp_index;
+        value->field_offset = field_offset;
+        *out = value;
+        return true;
       }
       if (ir_expr_is_byte_view_source(expr)) return ir_lower_byte_view(program, ir, fun, expr, out);
       ir_mark_unsupported(ir, "direct backend member access supports Maybe<MutSpan<u8>> .has and .value", expr->line, expr->column, expr->text);
@@ -2801,11 +2998,13 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
         ir_mark_unsupported(ir, "direct backend fallible call return type is unsupported", expr->line, expr->column, callee->return_type);
         return false;
       }
-      if (!callee->raises && type != IR_TYPE_VOID && !ir_type_is_direct_abi(type)) {
+      bool record_return = type == IR_TYPE_UNSUPPORTED && ir_shape_layout(program, return_type_text, NULL, NULL);
+      if (!callee->raises && type != IR_TYPE_VOID && !ir_type_is_direct_abi(type) && type != IR_TYPE_BYTE_VIEW && !record_return) {
         free(specialized_name);
         ir_mark_unsupported(ir, "direct backend call return type is unsupported", expr->line, expr->column, callee->return_type);
         return false;
       }
+      if (record_return) type = IR_TYPE_RECORD;
       // Fallible calls carry their value in the natural register and the error tag in
       // rdx: float results ride xmm0 (typed by their float type), every other result
       // rides rax full-width (the i64 transit marker). CHECK/RESCUE read rdx for the tag.
@@ -2824,14 +3023,28 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
             free(inner);
           }
         }
-        if (!ir_type_is_direct_abi(expected) && !span_param) {
+        bool record_param = expected == IR_TYPE_UNSUPPORTED && ir_shape_layout(program, param_type_text, NULL, NULL);
+        if (record_param) expected = IR_TYPE_RECORD;
+        if (!ir_type_is_direct_abi(expected) && !span_param && !record_param) {
           free(specialized_name);
           ir_free_value(value);
           ir_mark_unsupported(ir, "direct backend call parameter type is unsupported", callee->params.items[i].line, callee->params.items[i].column, callee->params.items[i].type);
           return false;
         }
         IrValue *arg = NULL;
-        if (!ir_lower_expr(program, ir, fun, expr->args.items[i], &arg)) {
+        // A record-returning call or shape literal passed as a record argument is
+        // materialized into a pre-reserved temp and passed by pointer; a plain record
+        // local lowers to a local reference directly.
+        bool lowered = false;
+        if (record_param && ir_record_temp_slot(ir, expr->args.items[i])) {
+          if (!ir_lower_record_temp(program, ir, expr->args.items[i], &arg)) {
+            free(specialized_name);
+            ir_free_value(value);
+            return false;
+          }
+          lowered = true;
+        }
+        if (!lowered && !ir_lower_expr(program, ir, fun, expr->args.items[i], &arg)) {
           free(specialized_name);
           ir_free_value(value);
           return false;
@@ -2944,6 +3157,27 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
 }
 
 static bool ir_lower_stmt_vec(const Program *program, IrProgram *ir, IrFunction *mir_fun, const StmtVec *body, IrInstr **out_items, size_t *out_len, size_t *out_cap, bool *saw_return);
+static bool ir_lower_stmt_to_vec_inner(const Program *program, IrProgram *ir, IrFunction *mir_fun, const Stmt *stmt, IrInstr **out_items, size_t *out_len, size_t *out_cap, bool *saw_return);
+
+// Lower a statement, exposing its output vector as the active record-temporary sink
+// (saved/restored so nested blocks and sibling match arms can't strand it) so any
+// record temporary materializes in front of this statement.
+static bool ir_lower_stmt_to_vec(const Program *program, IrProgram *ir, IrFunction *mir_fun, const Stmt *stmt, IrInstr **out_items, size_t *out_len, size_t *out_cap, bool *saw_return) {
+  IrInstr **prev_items = ir->lower_sink_items;
+  size_t *prev_len = ir->lower_sink_len;
+  size_t *prev_cap = ir->lower_sink_cap;
+  IrFunction *prev_fun = ir->lower_sink_fun;
+  ir->lower_sink_items = out_items;
+  ir->lower_sink_len = out_len;
+  ir->lower_sink_cap = out_cap;
+  ir->lower_sink_fun = mir_fun;
+  bool ok = ir_lower_stmt_to_vec_inner(program, ir, mir_fun, stmt, out_items, out_len, out_cap, saw_return);
+  ir->lower_sink_items = prev_items;
+  ir->lower_sink_len = prev_len;
+  ir->lower_sink_cap = prev_cap;
+  ir->lower_sink_fun = prev_fun;
+  return ok;
+}
 
 static bool ir_lower_index_store(const Program *program, IrProgram *ir, IrFunction *mir_fun, const Expr *target, const Expr *source, IrInstr **out_items, size_t *out_len, size_t *out_cap, int line, int column) {
   if (!target || target->kind != EXPR_INDEX || !target->left || target->left->kind != EXPR_IDENT) {
@@ -3036,15 +3270,18 @@ static const FieldInit *ir_shape_literal_find_field(const Expr *expr, const char
   return NULL;
 }
 
-static bool ir_lower_shape_initializer(const Program *program, IrProgram *ir, IrFunction *mir_fun, const IrLocal *local, const Expr *expr, IrInstr **out_items, size_t *out_len, size_t *out_cap, int line, int column) {
-  if (!local || !local->is_record || !expr || expr->kind != EXPR_SHAPE_LITERAL) {
-    ir_mark_unsupported(ir, "direct backend record locals require shape literal initialization", line, column, local ? local->name : "record local");
+// Lower a shape literal into FIELD_STORE instructions targeting `target_index`
+// (a record local), or the function's sret pointer when target_index == UINT_MAX
+// (used by `return <shape literal>` in a record-returning function).
+static bool ir_lower_shape_initializer(const Program *program, IrProgram *ir, IrFunction *mir_fun, unsigned target_index, const char *shape_name, const Expr *expr, IrInstr **out_items, size_t *out_len, size_t *out_cap, int line, int column) {
+  if (!shape_name || !expr || expr->kind != EXPR_SHAPE_LITERAL) {
+    ir_mark_unsupported(ir, "direct backend record locals require shape literal initialization", line, column, shape_name ? shape_name : "record local");
     return false;
   }
   const Shape *shape = NULL;
   TypeArgVec shape_args = {0};
-  if (!ir_shape_instance(program, local->shape_name, &shape, &shape_args)) {
-    ir_mark_unsupported(ir, "direct backend record shape is unknown", line, column, local->shape_name);
+  if (!ir_shape_instance(program, shape_name, &shape, &shape_args)) {
+    ir_mark_unsupported(ir, "direct backend record shape is unknown", line, column, shape_name);
     return false;
   }
   for (size_t i = 0; i < shape->fields.len; i++) {
@@ -3061,7 +3298,7 @@ static bool ir_lower_shape_initializer(const Program *program, IrProgram *ir, Ir
     bool field_is_array = false;
     unsigned field_array_len = 0;
     IrTypeKind field_element_type = IR_TYPE_UNSUPPORTED;
-    if (!ir_shape_field_storage_info(program, local->shape_name, field->name, &field_offset, &field_type, &field_is_array, &field_array_len, &field_element_type)) {
+    if (!ir_shape_field_storage_info(program, shape_name, field->name, &field_offset, &field_type, &field_is_array, &field_array_len, &field_element_type)) {
       ir_type_arg_vec_free(&shape_args);
       ir_mark_unsupported(ir, "direct backend record field type is unsupported", field->line, field->column, field->type);
       return false;
@@ -3097,7 +3334,7 @@ static bool ir_lower_shape_initializer(const Program *program, IrProgram *ir, Ir
           return false;
         }
         unsigned element_offset = field_offset + (unsigned)element_index * ir_type_byte_size(field_element_type);
-        ir_instr_vec_push(ir, out_items, out_len, out_cap, (IrInstr){.kind = IR_INSTR_FIELD_STORE, .local_index = local->index, .field_offset = element_offset, .value = element, .line = element_expr->line, .column = element_expr->column});
+        ir_instr_vec_push(ir, out_items, out_len, out_cap, (IrInstr){.kind = IR_INSTR_FIELD_STORE, .local_index = target_index, .field_offset = element_offset, .value = element, .line = element_expr->line, .column = element_expr->column});
       }
       continue;
     }
@@ -3121,7 +3358,7 @@ static bool ir_lower_shape_initializer(const Program *program, IrProgram *ir, Ir
       ir_mark_unsupported(ir, "direct backend record field initializer type does not match field", field_expr->line, field_expr->column, field->name);
       return false;
     }
-    ir_instr_vec_push(ir, out_items, out_len, out_cap, (IrInstr){.kind = IR_INSTR_FIELD_STORE, .local_index = local->index, .field_offset = field_offset, .value = value, .line = field_expr->line, .column = field_expr->column});
+    ir_instr_vec_push(ir, out_items, out_len, out_cap, (IrInstr){.kind = IR_INSTR_FIELD_STORE, .local_index = target_index, .field_offset = field_offset, .value = value, .line = field_expr->line, .column = field_expr->column});
   }
   ir_type_arg_vec_free(&shape_args);
   return true;
@@ -3209,14 +3446,28 @@ static bool ir_lower_enum_match(const Program *program, IrProgram *ir, IrFunctio
   return true;
 }
 
-static bool ir_lower_stmt_to_vec(const Program *program, IrProgram *ir, IrFunction *mir_fun, const Stmt *stmt, IrInstr **out_items, size_t *out_len, size_t *out_cap, bool *saw_return) {
+static bool ir_lower_stmt_to_vec_inner(const Program *program, IrProgram *ir, IrFunction *mir_fun, const Stmt *stmt, IrInstr **out_items, size_t *out_len, size_t *out_cap, bool *saw_return) {
   if (stmt->kind == STMT_LET) {
     const IrLocal *local = ir_function_find_local(mir_fun, stmt->name);
     if (local && local->is_array) {
       return ir_lower_array_initializer(program, ir, mir_fun, local, stmt->expr, out_items, out_len, out_cap, stmt->line, stmt->column);
     }
     if (local && local->is_record) {
-      return ir_lower_shape_initializer(program, ir, mir_fun, local, stmt->expr, out_items, out_len, out_cap, stmt->line, stmt->column);
+      if (stmt->expr && stmt->expr->kind == EXPR_SHAPE_LITERAL) {
+        return ir_lower_shape_initializer(program, ir, mir_fun, local->index, local->shape_name, stmt->expr, out_items, out_len, out_cap, stmt->line, stmt->column);
+      }
+      // A record-returning call binds via sret into this local's slot; another record
+      // local/param binds as a value copy. Both lower to LOCAL_SET (the emit side
+      // distinguishes call vs. copy).
+      IrValue *value = NULL;
+      if (!ir_lower_expr(program, ir, mir_fun, stmt->expr, &value)) return false;
+      if (value->type != IR_TYPE_RECORD) {
+        ir_free_value(value);
+        ir_mark_unsupported(ir, "direct backend record local requires a shape literal, record value, or record-returning call", stmt->line, stmt->column, local->name);
+        return false;
+      }
+      ir_instr_vec_push(ir, out_items, out_len, out_cap, (IrInstr){.kind = IR_INSTR_LOCAL_SET, .local_index = local->index, .value = value, .line = stmt->line, .column = stmt->column});
+      return true;
     }
     IrValue *value = NULL;
     if (!local) return false;
@@ -3277,6 +3528,30 @@ static bool ir_lower_stmt_to_vec(const Program *program, IrProgram *ir, IrFuncti
   if (stmt->kind == STMT_RETURN) {
     *saw_return = true;
     IrValue *value = NULL;
+    if (mir_fun->value_return_type == IR_TYPE_RECORD) {
+      if (!stmt->expr) {
+        ir_mark_unsupported(ir, "direct backend record return requires a value", stmt->line, stmt->column, mir_fun->name);
+        return false;
+      }
+      // `return <shape literal>` builds the record directly into the caller-provided
+      // sret slot (no intermediate), then returns.
+      if (stmt->expr->kind == EXPR_SHAPE_LITERAL) {
+        if (!ir_lower_shape_initializer(program, ir, mir_fun, UINT_MAX, mir_fun->record_return_shape, stmt->expr, out_items, out_len, out_cap, stmt->line, stmt->column)) return false;
+        ir_instr_vec_push(ir, out_items, out_len, out_cap, (IrInstr){.kind = IR_INSTR_RETURN, .value = NULL, .line = stmt->line, .column = stmt->column});
+        return true;
+      }
+      // `return p` (record local/param, copied through sret) or `return f()` (a
+      // record-returning call writing straight through our sret pointer).
+      IrValue *value = NULL;
+      if (!ir_lower_expr(program, ir, mir_fun, stmt->expr, &value)) return false;
+      if (value->type != IR_TYPE_RECORD) {
+        ir_free_value(value);
+        ir_mark_unsupported(ir, "direct backend record return requires a shape literal, record local, or record-returning call", stmt->line, stmt->column, mir_fun->name);
+        return false;
+      }
+      ir_instr_vec_push(ir, out_items, out_len, out_cap, (IrInstr){.kind = IR_INSTR_RETURN, .value = value, .line = stmt->line, .column = stmt->column});
+      return true;
+    }
     if (mir_fun->return_type == IR_TYPE_VOID) {
       if (stmt->expr) {
         ir_mark_unsupported(ir, "direct backend void function cannot return a value", stmt->line, stmt->column, mir_fun->name);
@@ -3285,6 +3560,8 @@ static bool ir_lower_stmt_to_vec(const Program *program, IrProgram *ir, IrFuncti
     } else if (!stmt->expr && mir_fun->return_type == IR_TYPE_I32) {
       value = ir_new_value(ir, IR_VALUE_INT, IR_TYPE_I32, stmt->line, stmt->column);
       value->int_value = 0;
+    } else if (mir_fun->value_return_type == IR_TYPE_BYTE_VIEW) {
+      if (!ir_lower_byte_view(program, ir, mir_fun, stmt->expr, &value)) return false;
     } else if (!ir_lower_expr(program, ir, mir_fun, stmt->expr, &value)) {
       return false;
     }
@@ -3429,6 +3706,13 @@ static bool ir_collect_function_locals(const Program *program, IrProgram *ir, Ir
         free(inner);
       }
     }
+    unsigned record_size = 0;
+    unsigned record_align = 0;
+    if (type == IR_TYPE_UNSUPPORTED && ir_shape_layout(program, param->type, &record_size, &record_align)) {
+      // Record param: passed by pointer and copied into this inline slot on entry.
+      ir_function_push_local(ir, mir_fun, param->name, IR_TYPE_RECORD, true, false, true, param->type, IR_TYPE_UNSUPPORTED, 0, record_size, record_align, false, param->line, param->column);
+      continue;
+    }
     if (!ir_type_is_direct_abi(type) && !is_span_param) {
       ir_mark_unsupported(ir, "direct backend parameter type is unsupported", param->line, param->column, param->type);
       return false;
@@ -3439,6 +3723,12 @@ static bool ir_collect_function_locals(const Program *program, IrProgram *ir, Ir
     }
   }
   if (!ir_collect_stmt_locals(program, ir, mir_fun, &source->body)) return false;
+
+  // Reserve record-temp locals (record call args / field receivers) before assigning
+  // frame offsets, so each temp gets a properly-sized slot and the locals array is
+  // then stable for the whole body lowering.
+  ir->record_temp_len = 0;
+  ir_prepare_record_temps_stmts(ir, mir_fun, &source->body);
 
   size_t offset = 0;
   for (size_t i = 0; i < mir_fun->local_len; i++) {
@@ -3507,13 +3797,20 @@ static bool ir_lower_function_body(const Program *program, IrProgram *ir, IrFunc
   }
   bool hosted_world_main = ir_is_hosted_world_main(source);
   IrTypeKind return_type = hosted_world_main ? IR_TYPE_I32 : ir_type_kind(source->return_type);
+  bool record_return = !hosted_world_main && return_type == IR_TYPE_UNSUPPORTED && ir_shape_layout(program, source->return_type, NULL, NULL);
   if (!hosted_world_main && source->raises && !ir_type_is_direct_fallible_value(return_type)) {
     ir_mark_unsupported(ir, "direct backend fallible return type is unsupported", source->line, source->column, source->return_type);
     return false;
   }
-  if (!hosted_world_main && !source->raises && return_type != IR_TYPE_VOID && !ir_type_is_direct_abi(return_type)) {
+  if (!hosted_world_main && !source->raises && return_type != IR_TYPE_VOID && !ir_type_is_direct_abi(return_type) && return_type != IR_TYPE_BYTE_VIEW && !record_return) {
     ir_mark_unsupported(ir, "direct backend return type is unsupported", source->line, source->column, source->return_type);
     return false;
+  }
+  if (record_return) {
+    mir_fun->return_type = IR_TYPE_RECORD;
+    mir_fun->value_return_type = IR_TYPE_RECORD;
+    ir_shape_layout(program, source->return_type, &mir_fun->record_return_size, NULL);
+    mir_fun->record_return_shape = z_strdup(source->return_type);
   }
   if (!ir_collect_function_locals(program, ir, mir_fun, source)) return false;
   bool saw_return = false;
@@ -3837,6 +4134,7 @@ void z_free_ir_program(IrProgram *program) {
     free(fun->name);
     free(fun->stable_id);
     free(fun->world_param_name);
+    free(fun->record_return_shape);
     for (size_t local_index = 0; local_index < fun->local_len; local_index++) {
       free(fun->locals[local_index].name);
       free(fun->locals[local_index].shape_name);
@@ -3846,6 +4144,7 @@ void z_free_ir_program(IrProgram *program) {
     free(fun->instrs);
   }
   free(program->functions);
+  free(program->record_temps);
   for (size_t i = 0; i < program->data_segment_len; i++) {
     free(program->data_segments[i].bytes);
   }

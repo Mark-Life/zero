@@ -3906,8 +3906,14 @@ static const char *expr_type(const Program *program, const Expr *expr, Scope *sc
     case EXPR_SLICE: {
       static char slice_type[128];
       char element_type[96];
-      if (index_element_type(expr_type(program, expr->left, scope), element_type, sizeof(element_type))) {
-        snprintf(slice_type, sizeof(slice_type), "Span<%s>", element_type);
+      const char *base_type = expr_type(program, expr->left, scope);
+      if (index_element_type(base_type, element_type, sizeof(element_type))) {
+        // Slicing a mutable span yields a mutable span; everything else
+        // (immutable spans, arrays, strings) yields an immutable Span. This
+        // keeps PROT_READ mmap views (Span<u8>) un-writable while letting a
+        // MutSpan<u8> heap region be sub-sliced and reinterpreted for writes.
+        const char *span_kind = type_is_named_generic(base_type, "MutSpan") ? "MutSpan" : "Span";
+        snprintf(slice_type, sizeof(slice_type), "%s<%s>", span_kind, element_type);
         return slice_type;
       }
       return "Unknown";
@@ -4480,7 +4486,10 @@ static bool check_expr_expected(const Program *program, const Expr *expr, Scope 
         }
       }
       char slice_type[160];
-      snprintf(slice_type, sizeof(slice_type), "Span<%s>", element_type);
+      // A slice of a mutable span stays mutable; arrays/strings/immutable spans
+      // yield an immutable Span (see expr_type's EXPR_SLICE case for rationale).
+      const char *span_kind = type_is_named_generic(base_type, "MutSpan") ? "MutSpan" : "Span";
+      snprintf(slice_type, sizeof(slice_type), "%s<%s>", span_kind, element_type);
       set_expr_resolved_type(expr, slice_type);
       return true;
     }

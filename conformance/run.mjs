@@ -325,6 +325,7 @@ for (const fixture of [
   "conformance/native/pass/mem-bytes-as-mut-f32.0",
   "conformance/native/pass/mem-bytes-as-f64.0",
   "conformance/native/pass/mem-bytes-as-f32-mmap.0",
+  "conformance/native/pass/mem-mut-span-slice.0",
   "conformance/native/pass/wrapping-saturating-arithmetic.0",
   "conformance/native/pass/maybe-error-flow.0",
   "conformance/native/pass/match-scalar-guards.0",
@@ -351,6 +352,7 @@ for (const fixture of [
   "conformance/native/pass/c-abi-export.0",
   "conformance/native/pass/range-slices.0",
   "conformance/native/pass/generic-spans.0",
+  "conformance/native/pass/aggregate-shape-abi.0",
   "conformance/native/pass/open-ended-slices.0",
   "conformance/native/pass/string-slices.0",
   "conformance/native/pass/string-byte-ergonomics.0",
@@ -1839,6 +1841,7 @@ for (const runtimeFixture of [
   ["conformance/native/pass/math-softmax-smoke.0", "math-softmax-smoke", { stdout: "math softmax ok\n", libm: true }],
   ["conformance/native/pass/typed-span-f32.0", "typed-span-f32", { stdout: "typed span f32 ok\n" }],
   ["conformance/native/pass/typed-span-i32.0", "typed-span-i32", { stdout: "typed span i32 ok\n" }],
+  ["conformance/native/pass/aggregate-shape-abi.0", "aggregate-shape-abi", { stdout: "aggregate shape abi ok\n" }],
   ["conformance/native/pass/math-rmsnorm-span.0", "math-rmsnorm-span", { stdout: "math rmsnorm span ok\n", libm: true }],
   ["conformance/native/pass/math-softmax-span.0", "math-softmax-span", { stdout: "math softmax span ok\n", libm: true }],
   ["conformance/native/pass/codec-read-f32-le.0", "codec-read-f32-le", { stdout: "codec read f32 le ok\n" }],
@@ -1851,6 +1854,7 @@ for (const runtimeFixture of [
   ["conformance/native/pass/mem-bytes-as-mut-f32.0", "mem-bytes-as-mut-f32", { stdout: "mem bytes as mut f32 ok\n" }],
   ["conformance/native/pass/mem-bytes-as-f64.0", "mem-bytes-as-f64", { stdout: "mem bytes as f64 ok\n" }],
   ["conformance/native/pass/mem-bytes-as-f32-mmap.0", "mem-bytes-as-f32-mmap", { stdout: "mem bytes as f32 mmap ok\n" }],
+  ["conformance/native/pass/mem-mut-span-slice.0", "mem-mut-span-slice", { stdout: "mem mut span slice ok\n" }],
   ["conformance/native/pass/checked-bounds-get.0", "checked-bounds-get", { stdout: "checked bounds get ok\n" }],
   ["conformance/native/pass/check-maybe-fallibility.0", "check-maybe-fallibility", { stdout: "check maybe fallibility ok\n" }],
   ["conformance/native/pass/fallibility-error-sets.0", "fallibility-error-sets", { stdout: "fallibility error sets ok\n" }],
@@ -1926,6 +1930,15 @@ await assertBoundsTrap("conformance/native/fail/indexed-mutation-oob.0", "indexe
 await assertBoundsTrap("conformance/native/fail/codec-read-f32-le-bounds.0", "codec-read-f32-le-bounds");
 await assertBoundsTrap("conformance/native/fail/codec-read-i32-le-bounds.0", "codec-read-i32-le-bounds");
 await assertBoundsTrap("conformance/native/fail/mem-bytes-as-f32-bounds.0", "mem-bytes-as-f32-bounds");
+
+// A record-returning call as an argument can't be hoisted into a loop condition
+// (it would build once, not per iteration); the direct backend rejects it instead
+// of miscompiling.
+const aggregateRecordArgWhile = await execFileAsync(zero, ["build", "--json", "--emit", "exe", "--target", "linux-musl-x64", "conformance/native/fail/aggregate-record-arg-while.0", "--out", `${outDir}/aggregate-record-arg-while`]).catch((error) => error);
+assert.ok(aggregateRecordArgWhile.code, "aggregate-record-arg-while should fail to build");
+const aggregateRecordArgWhileBody = JSON.parse(aggregateRecordArgWhile.stdout);
+assert.equal(aggregateRecordArgWhileBody.diagnostics?.[0]?.code, "CGEN004");
+assert.match(aggregateRecordArgWhileBody.diagnostics[0].message, /record argument here must be a record local/);
 
 const failed = await execFileAsync(zero, ["check", "conformance/check/fail/unknown-name.0"]).catch((error) => error);
 assert.notEqual(failed.code, 0);

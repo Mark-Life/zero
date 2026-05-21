@@ -160,6 +160,14 @@ carve a tensor at an offset, e.g. `std.mem.bytesAsF32(weights[off..off + n * 4])
 Offsets are 4-/8-aligned in practice; loads and stores use unaligned
 `MOVSS`/`MOVSD`, so misaligned regions stay correct.
 
+Slicing preserves mutability: `region[a..b]` on a `MutSpan<u8>` is a writable
+`MutSpan<u8>`, so a `pageAlloc`'d region can be sub-sliced and reinterpreted into
+writable tensor views — `std.mem.bytesAsMutF32(region[a..b])` — and a typed view
+can be sub-sliced again — `floats[a..b]` is a `MutSpan<f32>`. Slicing an immutable
+`Span<T>` (an mmap'd `Span<u8>`, or any read-only span) stays a `Span<T>`, so
+`PROT_READ` mappings cannot be reinterpreted into a writable view by accident. The
+slice start scales by the element size (`floats[1..]` advances four bytes, not one).
+
 ## Reporting Contract
 
 `zero mem --json <input>` reports the allocator contract in machine-readable form:

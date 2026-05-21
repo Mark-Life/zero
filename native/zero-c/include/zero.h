@@ -596,6 +596,8 @@ typedef struct {
   char *world_param_name;
   IrTypeKind return_type;
   IrTypeKind value_return_type;
+  unsigned record_return_size;
+  char *record_return_shape;
   IrLocal *locals;
   size_t local_len;
   size_t local_cap;
@@ -610,11 +612,31 @@ typedef struct {
   int column;
 } IrFunction;
 
+// A record value that appears where an addressable record is required (a call
+// argument or a field receiver) but is not itself a named local — a record-returning
+// call or a shape literal. Pre-allocated a temp slot before body lowering so the
+// locals array never reallocs mid-lowering (which would dangle held IrLocal*).
+typedef struct {
+  const Expr *expr;
+  unsigned local_index;
+  bool materialized;
+} IrRecordTemp;
+
 typedef struct {
   Program program;
   IrFunction *functions;
   size_t function_len;
   size_t function_cap;
+  // Record temporaries (see IrRecordTemp), reset per function during lowering.
+  IrRecordTemp *record_temps;
+  size_t record_temp_len;
+  size_t record_temp_cap;
+  // Active instruction sink + function while lowering a statement, so expression
+  // lowering can emit a record temporary's construction in front of its use.
+  IrInstr **lower_sink_items;
+  size_t *lower_sink_len;
+  size_t *lower_sink_cap;
+  IrFunction *lower_sink_fun;
   IrDataSegment *data_segments;
   size_t data_segment_len;
   size_t data_segment_cap;

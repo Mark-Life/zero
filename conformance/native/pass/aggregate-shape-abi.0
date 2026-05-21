@@ -1,0 +1,108 @@
+// Direct-backend aggregate ABI. Records and spans cross function boundaries with
+// value semantics:
+//   - record params (copied in by pointer) and record returns via sret;
+//   - returning a record *local/param* (copied through sret), not just a literal;
+//   - returning a record-returning *call* (callee writes straight through our sret);
+//   - record-to-record copies (`let q = p`);
+//   - record-returning calls and shape literals used as *arguments* (materialized
+//     into a temp and passed by pointer), including several at once and nested;
+//   - field access on a record-returning call / shape literal result;
+//   - span returns and `Span` fields inside records.
+// These are the shape boundaries the llama2 checkpoint loader depends on
+// (Config / TransformerWeights / RunState).
+
+shape Dims {
+    width: i32,
+    height: i32,
+    shared: Bool,
+}
+
+shape Views {
+    head: Span<f32>,
+    tail: Span<f32>,
+}
+
+fun makeDims(w: i32) -> Dims {
+    return Dims { width: w, height: 3, shared: true }
+}
+
+// Returns a record param by value (copied through sret).
+fun passDims(d: Dims) -> Dims {
+    return d
+}
+
+// Returns a record-returning call directly (callee writes through our sret).
+fun remakeDims(w: i32) -> Dims {
+    return makeDims(w + 1)
+}
+
+fun area(d: Dims) -> usize {
+    let w = d.width as usize
+    let h = d.height as usize
+    return w * h
+}
+
+// Two record params combined — exercises multiple record args by pointer.
+fun perimeter(a: Dims, b: Dims) -> i32 {
+    return a.width + b.width
+}
+
+fun viewOf(bytes: Span<u8>) -> Span<f32> {
+    return std.mem.bytesAsF32(bytes)
+}
+
+fun firstFour(bytes: Span<u8>) -> Span<u8> {
+    return bytes[0..4]
+}
+
+fun makeViews(bytes: Span<u8>) -> Views {
+    return Views { head: viewOf(bytes[0..8]), tail: viewOf(bytes[8..16]) }
+}
+
+// Returns a record holding spans by value copy.
+fun copyViews(v: Views) -> Views {
+    return v
+}
+
+pub fun main(world: World) -> Void raises {
+    // Record literal -> record param/return, field reads.
+    let dims = makeDims(7)
+    let total = area(dims)
+
+    // Return a record local/param (value copy through sret).
+    let dims2 = passDims(dims)
+
+    // Record-to-record copy.
+    let dims3 = dims2
+
+    // Return a record-returning call.
+    let dims4 = remakeDims(7)
+
+    // Record-returning call as an argument (materialized into a temp).
+    let area_call = area(makeDims(4))
+
+    // Shape literal as an argument.
+    let area_literal = area(Dims { width: 5, height: 2, shared: false })
+
+    // Two record-call arguments at once.
+    let perim = perimeter(makeDims(10), makeDims(20))
+
+    // Field access on a record-returning call result.
+    let w_of_call = makeDims(9).width
+
+    // Spans + span-field records.
+    let bytes: Span<u8> = std.mem.span("abcdefghijklmnop")
+    let prefix = firstFour(bytes)
+    let views = makeViews(bytes)
+    let views2 = copyViews(views)
+    let head_len = std.mem.len(views.head)
+    let tail_len = std.mem.len(views2.tail)
+
+    let ok_dims = dims.width == 7 && dims.shared && total == 21
+    let ok_value = dims2.width == 7 && dims3.width == 7 && dims4.width == 8
+    let ok_args = area_call == 12 && area_literal == 10 && perim == 30 && w_of_call == 9
+    let ok_spans = std.mem.len(prefix) == 4 && head_len == 2 && tail_len == 2
+    if ok_dims && ok_value && ok_args && ok_spans {
+        check world.out.write("aggregate shape abi ok\n")
+    }
+}

@@ -1,5 +1,6 @@
 #include "zero.h"
 
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -684,7 +685,16 @@ static unsigned elf_base_stack_size(const IrFunction *fun) {
 
 static unsigned elf_total_stack_size(const IrFunction *fun, const ElfEmitContext *ctx) {
   unsigned base = elf_base_stack_size(fun);
-  return base + (elf_function_seeds_process_args(fun, ctx) ? 32u : 0u);
+  unsigned extra = elf_function_seeds_process_args(fun, ctx) ? 32u : 0u;
+  if (fun && fun->return_type == IR_TYPE_RECORD) extra += 16u;
+  return base + extra;
+}
+
+// Frame slot (rbp-relative) holding the caller-provided sret pointer for a
+// record-returning function. Such functions never seed process args, so the slot
+// just past the locals is free.
+static unsigned elf_sret_slot_offset(const IrFunction *fun) {
+  return elf_base_stack_size(fun) + 8u;
 }
 
 static void elf_emit_epilogue(ZBuf *code, const IrFunction *fun, const ElfEmitContext *ctx) {
@@ -959,6 +969,92 @@ static void elf_emit_load_local_slot_reg(ZBuf *code, const IrLocal *local, unsig
   elf_emit_rbp_disp_reg(code, 0x8b, reg, disp, wide);
 }
 
+// lea reg, [rbp - frame_offset(local)] — the base address (field offset 0) of an
+// inline record/array local, into any GPR. Used to pass a record by pointer and to
+// set up source/destination pointers for a record copy.
+static void elf_emit_lea_local_addr_reg(ZBuf *code, const IrFunction *fun, unsigned local_index, unsigned reg) {
+  unsigned off = elf_local_offset(fun, local_index);
+  elf_append_u8(code, (unsigned char)(0x48 | (reg >= 8 ? 0x04 : 0)));
+  elf_append_u8(code, 0x8d);
+  elf_append_u8(code, (unsigned char)(0x80 | ((reg & 7) << 3) | 0x05));
+  elf_append_u32(code, (uint32_t)(-(int32_t)off));
+}
+
+// lea rax, [rbp - frame_offset(local)] — the common case (record argument by pointer).
+static void elf_emit_lea_local_addr_rax(ZBuf *code, const IrFunction *fun, unsigned local_index) {
+  elf_emit_lea_local_addr_reg(code, fun, local_index, 0);
+}
+
+// memcpy a record value between inline frame slots: copy the source local's bytes to
+// a destination — another local's slot, or the caller's sret buffer when
+// dest_index == UINT_MAX. rdi/rsi/rax are scratch; 8-byte chunks then a 4-byte tail
+// (records are 8- or 4-aligned, so the tail is exact). Span fields ride along as raw
+// 16 bytes (ptr then len), preserving the view.
+static void elf_emit_record_copy_to(ZBuf *code, const IrFunction *fun, unsigned dest_index, unsigned src_index) {
+  unsigned size = src_index < fun->local_len ? fun->locals[src_index].byte_size : 0;
+  if (dest_index == UINT_MAX) {
+    elf_emit_rbp_disp_reg(code, 0x8b, 7, elf_sret_slot_offset(fun), true); // mov rdi, [rbp - sret]
+  } else {
+    elf_emit_lea_local_addr_reg(code, fun, dest_index, 7); // lea rdi, [rbp - dest]
+  }
+  elf_emit_lea_local_addr_reg(code, fun, src_index, 6); // lea rsi, [rbp - src]
+  unsigned k = 0;
+  while (k + 8 <= size) {
+    elf_append_u8(code, 0x48); elf_append_u8(code, 0x8b); elf_append_u8(code, 0x86); elf_append_u32(code, k); // mov rax, [rsi+k]
+    elf_append_u8(code, 0x48); elf_append_u8(code, 0x89); elf_append_u8(code, 0x87); elf_append_u32(code, k); // mov [rdi+k], rax
+    k += 8;
+  }
+  if (k + 4 <= size) {
+    elf_append_u8(code, 0x8b); elf_append_u8(code, 0x86); elf_append_u32(code, k); // mov eax, [rsi+k]
+    elf_append_u8(code, 0x89); elf_append_u8(code, 0x87); elf_append_u32(code, k); // mov [rdi+k], eax
+  }
+}
+
+// Copy a record param (passed by pointer in ptr_reg) into its inline frame slot,
+// preserving value semantics. rax is scratch; 8-byte chunks then a 4-byte tail.
+static void elf_emit_copy_record_param(ZBuf *code, const IrFunction *fun, unsigned local_index, unsigned ptr_reg) {
+  unsigned size = local_index < fun->local_len ? fun->locals[local_index].byte_size : 0;
+  unsigned frame_off = elf_local_offset(fun, local_index);
+  unsigned k = 0;
+  while (k + 8 <= size) {
+    elf_append_u8(code, (unsigned char)(0x48 | (ptr_reg >= 8 ? 0x01 : 0)));
+    elf_append_u8(code, 0x8b);
+    elf_append_u8(code, (unsigned char)(0x80 | (ptr_reg & 7)));
+    elf_append_u32(code, k);
+    elf_emit_rbp_disp_reg(code, 0x89, 0, frame_off - k, true);
+    k += 8;
+  }
+  if (k + 4 <= size) {
+    if (ptr_reg >= 8) elf_append_u8(code, 0x41);
+    elf_append_u8(code, 0x8b);
+    elf_append_u8(code, (unsigned char)(0x80 | (ptr_reg & 7)));
+    elf_append_u32(code, k);
+    elf_emit_rbp_disp_reg(code, 0x89, 0, frame_off - k, false);
+  }
+}
+
+// Store a GPR into [rcx + disp32] at the given width (1, 4, or 8 bytes). Used to
+// write record fields through an sret pointer held in rcx.
+static void elf_emit_store_rcx_disp(ZBuf *code, unsigned disp, unsigned reg, unsigned width) {
+  if (width == 1) {
+    elf_append_u8(code, 0x88);
+  } else {
+    if (width == 8) elf_append_u8(code, 0x48);
+    elf_append_u8(code, 0x89);
+  }
+  elf_append_u8(code, (unsigned char)(0x81 | ((reg & 7) << 3)));
+  elf_append_u32(code, disp);
+}
+
+// MOVSS/MOVSD [rcx + disp32], xmm — store a float record field through sret.
+static void elf_emit_store_rcx_disp_xmm(ZBuf *code, unsigned disp, unsigned xmm, bool is64) {
+  elf_append_u8(code, is64 ? 0xf2 : 0xf3);
+  elf_append_u8(code, 0x0f);
+  elf_append_u8(code, 0x11);
+  elf_append_u8(code, (unsigned char)(0x81 | ((xmm & 7) << 3)));
+  elf_append_u32(code, disp);
+}
+
 static bool elf_emit_byte_view_len(ZBuf *code, const IrFunction *fun, const IrValue *view, ElfEmitContext *ctx, ZDiag *diag);
 static bool elf_emit_byte_view_ptr(ZBuf *code, const IrFunction *fun, const IrValue *view, ElfEmitContext *ctx, ZDiag *diag);
 
@@ -1026,6 +1122,11 @@ static bool elf_emit_byte_view_len(ZBuf *code, const IrFunction *fun, const IrVa
     elf_emit_load_local_slot_rax(code, &fun->locals[view->local_index], 8);
     return true;
   }
+  if (view && view->kind == IR_VALUE_FIELD_LOAD && view->type == IR_TYPE_BYTE_VIEW && view->local_index < fun->local_len && fun->locals[view->local_index].is_record) {
+    unsigned disp = elf_record_field_disp(&fun->locals[view->local_index], view->field_offset + 8);
+    elf_emit_rbp_disp_reg(code, 0x8b, 0, disp, true);
+    return true;
+  }
   if (view && view->kind == IR_VALUE_MAYBE_VALUE && view->local_index < fun->local_len && fun->locals[view->local_index].type == IR_TYPE_MAYBE_BYTE_VIEW) {
     elf_emit_load_local_slot_reg(code, &fun->locals[view->local_index], 16, 0, true);
     return true;
@@ -1038,6 +1139,11 @@ static bool elf_emit_byte_view_ptr(ZBuf *code, const IrFunction *fun, const IrVa
   if (!view) return elf_diag(diag, "direct ELF64 byte view is missing", 1, 1, "missing byte view");
   if (view->kind == IR_VALUE_LOCAL && view->local_index < fun->local_len && fun->locals[view->local_index].type == IR_TYPE_BYTE_VIEW) {
     elf_emit_load_local_slot_rax(code, &fun->locals[view->local_index], 0);
+    return true;
+  }
+  if (view->kind == IR_VALUE_FIELD_LOAD && view->type == IR_TYPE_BYTE_VIEW && view->local_index < fun->local_len && fun->locals[view->local_index].is_record) {
+    unsigned disp = elf_record_field_disp(&fun->locals[view->local_index], view->field_offset);
+    elf_emit_rbp_disp_reg(code, 0x8b, 0, disp, true);
     return true;
   }
   if (view->kind == IR_VALUE_MAYBE_VALUE && view->local_index < fun->local_len && fun->locals[view->local_index].type == IR_TYPE_MAYBE_BYTE_VIEW) {
@@ -1067,6 +1173,15 @@ static bool elf_emit_byte_view_ptr(ZBuf *code, const IrFunction *fun, const IrVa
       elf_append_u8(code, 0xb8);
       elf_append_u32(code, 0);
     }
+    // Scale the (element-count) start offset by the slice element size so the
+    // pointer advances by start*sizeof(T). For u8 (size 1) this is a no-op.
+    unsigned elem_size = elf_type_byte_size(view->element_type);
+    if (elem_size == 8 || elem_size == 4) {
+      elf_append_u8(code, 0x48);
+      elf_append_u8(code, 0xc1);
+      elf_append_u8(code, 0xe0);
+      elf_append_u8(code, (unsigned char)(elem_size == 8 ? 3 : 2));
+    }
     elf_append_u8(code, 0x59);
     elf_append_u8(code, 0x48);
     elf_append_u8(code, 0x01);
@@ -1081,7 +1196,9 @@ static bool elf_emit_byte_view_ptr(ZBuf *code, const IrFunction *fun, const IrVa
 
 static bool elf_emit_value(ZBuf *code, const IrFunction *fun, const IrValue *value, ElfEmitContext *ctx, ZDiag *diag) {
   if (!value) return elf_diag(diag, "direct ELF64 expression is missing", 1, 1, "missing expression");
-  if (!elf_type_is_supported_scalar(value->type) && !((value->kind == IR_VALUE_CALL || value->kind == IR_VALUE_CHECK) && value->type == IR_TYPE_VOID) &&
+  if (!elf_type_is_supported_scalar(value->type) &&
+      !(value->kind == IR_VALUE_CALL && (value->type == IR_TYPE_VOID || value->type == IR_TYPE_BYTE_VIEW || value->type == IR_TYPE_RECORD)) &&
+      !(value->kind == IR_VALUE_CHECK && value->type == IR_TYPE_VOID) &&
       value->kind != IR_VALUE_MAYBE_HAS && value->kind != IR_VALUE_VEC_LEN && value->kind != IR_VALUE_VEC_CAPACITY &&
       value->kind != IR_VALUE_VEC_PUSH && value->kind != IR_VALUE_ARGS_LEN &&
       value->type != IR_TYPE_MAYBE_SCALAR && value->kind != IR_VALUE_FS_CLOSE_FILE && value->kind != IR_VALUE_FS_MUNMAP) {
@@ -1294,6 +1411,10 @@ static bool elf_emit_value(ZBuf *code, const IrFunction *fun, const IrValue *val
           if (!elf_emit_byte_view_ptr(code, fun, value->args[i], ctx, diag)) return false;
           elf_emit_push_rax(code);
           if (!elf_emit_byte_view_len(code, fun, value->args[i], ctx, diag)) return false;
+          elf_emit_push_rax(code);
+        } else if (atype == IR_TYPE_RECORD) {
+          if (value->args[i]->kind != IR_VALUE_LOCAL) return elf_diag(diag, "direct ELF64 record argument here must be a record local (a record call/literal argument is only supported in straight-line statements, not loop conditions or short-circuit operands)", value->line, value->column, "non-local record arg");
+          elf_emit_lea_local_addr_rax(code, fun, value->args[i]->local_index);
           elf_emit_push_rax(code);
         } else {
           if (!elf_emit_value(code, fun, value->args[i], ctx, diag)) return false;
@@ -2403,7 +2524,8 @@ static bool elf_emit_value(ZBuf *code, const IrFunction *fun, const IrValue *val
 
 static bool elf_validate_function(const IrFunction *fun, ZDiag *diag) {
   if (fun->param_count > 8) return elf_diag(diag, "direct ELF64 object backend supports at most eight parameters", fun->line, fun->column, fun->name);
-  if (fun->return_type != IR_TYPE_VOID && !elf_type_is_supported_scalar(fun->return_type)) {
+  if (fun->return_type != IR_TYPE_VOID && !elf_type_is_supported_scalar(fun->return_type) &&
+      fun->return_type != IR_TYPE_BYTE_VIEW && fun->return_type != IR_TYPE_RECORD) {
     return elf_diag(diag, "direct ELF64 object backend currently supports only Void and primitive integer returns", fun->line, fun->column, elf_type_name(fun->return_type));
   }
   for (size_t i = 0; i < fun->local_len; i++) {
@@ -2873,11 +2995,123 @@ static bool elf_emit_mmap_or_raise_to_local(ZBuf *text, const IrFunction *fun, c
   return true;
 }
 
+// Store one field of the record being returned, written through the caller's sret
+// pointer (saved in the frame). rcx is reloaded from the slot after each value is
+// materialized so an intervening call cannot strand it.
+static bool elf_emit_sret_field_store(ZBuf *text, const IrFunction *fun, const IrInstr *instr, ElfEmitContext *ctx, ZDiag *diag) {
+  unsigned slot = elf_sret_slot_offset(fun);
+  IrTypeKind vt = instr->value ? instr->value->type : IR_TYPE_I32;
+  unsigned fo = instr->field_offset;
+  if (vt == IR_TYPE_BYTE_VIEW) {
+    if (instr->value->kind == IR_VALUE_CALL) {
+      if (!elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
+      elf_emit_rbp_disp_reg(text, 0x8b, 1, slot, true);
+      elf_emit_store_rcx_disp(text, fo, 0, 8);
+      elf_emit_store_rcx_disp(text, fo + 8, 2, 8);
+    } else {
+      if (!elf_emit_byte_view_ptr(text, fun, instr->value, ctx, diag)) return false;
+      elf_emit_rbp_disp_reg(text, 0x8b, 1, slot, true);
+      elf_emit_store_rcx_disp(text, fo, 0, 8);
+      if (!elf_emit_byte_view_len(text, fun, instr->value, ctx, diag)) return false;
+      elf_emit_rbp_disp_reg(text, 0x8b, 1, slot, true);
+      elf_emit_store_rcx_disp(text, fo + 8, 0, 8);
+    }
+    return true;
+  }
+  if (elf_type_is_float(vt)) {
+    if (!elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
+    elf_emit_rbp_disp_reg(text, 0x8b, 1, slot, true);
+    elf_emit_store_rcx_disp_xmm(text, fo, 0, elf_type_is_f64(vt));
+    return true;
+  }
+  if (!elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
+  unsigned w = (vt == IR_TYPE_U8 || vt == IR_TYPE_BOOL) ? 1u : (elf_type_is_i64(vt) ? 8u : 4u);
+  elf_emit_rbp_disp_reg(text, 0x8b, 1, slot, true);
+  elf_emit_store_rcx_disp(text, fo, 0, w);
+  return true;
+}
+
+// A record-returning call written into a destination buffer: pass the buffer's
+// address as the sret pointer (rdi), with the call's own arguments shifted into
+// param_regs[1..]. `dest_local` >= 0 is a record local's slot (`let x = f()`);
+// `dest_local` < 0 is the current function's own sret buffer (`return f()`), so the
+// callee writes straight through to our caller's storage. The callee returns that
+// same pointer in rax.
+static bool elf_emit_record_call_with_dest(ZBuf *code, const IrFunction *fun, int dest_local, const IrValue *value, ElfEmitContext *ctx, ZDiag *diag) {
+  static const unsigned param_regs[] = {7, 6, 2, 1, 8, 9};
+  size_t int_count = 1;
+  size_t float_count = 0;
+  for (size_t i = 0; i < value->arg_len; i++) {
+    IrTypeKind atype = value->args[i]->type;
+    if (elf_type_is_float(atype)) float_count++;
+    else if (atype == IR_TYPE_BYTE_VIEW) int_count += 2;
+    else int_count++;
+  }
+  if (int_count > 6) return elf_diag(diag, "direct ELF64 record-returning call supports at most five integer arguments", value->line, value->column, "too many integer arguments");
+  if (float_count > 8) return elf_diag(diag, "direct ELF64 call supports at most eight float arguments", value->line, value->column, "too many float arguments");
+  for (size_t i = 0; i < value->arg_len; i++) {
+    IrTypeKind atype = value->args[i]->type;
+    if (atype == IR_TYPE_BYTE_VIEW) {
+      if (!elf_emit_byte_view_ptr(code, fun, value->args[i], ctx, diag)) return false;
+      elf_emit_push_rax(code);
+      if (!elf_emit_byte_view_len(code, fun, value->args[i], ctx, diag)) return false;
+      elf_emit_push_rax(code);
+    } else if (atype == IR_TYPE_RECORD) {
+      if (value->args[i]->kind != IR_VALUE_LOCAL) return elf_diag(diag, "direct ELF64 record argument must be a local", value->line, value->column, "non-local record arg");
+      elf_emit_lea_local_addr_rax(code, fun, value->args[i]->local_index);
+      elf_emit_push_rax(code);
+    } else {
+      if (!elf_emit_value(code, fun, value->args[i], ctx, diag)) return false;
+      if (elf_type_is_float(atype)) elf_emit_xmm0_push(code);
+      else elf_emit_push_rax(code);
+    }
+  }
+  size_t int_remaining = int_count;
+  size_t float_remaining = float_count;
+  for (size_t i = value->arg_len; i > 0; i--) {
+    IrTypeKind atype = value->args[i - 1]->type;
+    if (atype == IR_TYPE_BYTE_VIEW) {
+      int_remaining--;
+      elf_emit_pop_reg64(code, param_regs[int_remaining]);
+      int_remaining--;
+      elf_emit_pop_reg64(code, param_regs[int_remaining]);
+    } else if (elf_type_is_float(atype)) {
+      float_remaining--;
+      elf_emit_xmm_pop(code, (unsigned)float_remaining);
+    } else {
+      int_remaining--;
+      elf_emit_pop_reg64(code, param_regs[int_remaining]);
+    }
+  }
+  if (dest_local >= 0) {
+    elf_emit_lea_local_addr_rax(code, fun, (unsigned)dest_local);
+    elf_append_u8(code, 0x48);
+    elf_append_u8(code, 0x89);
+    elf_append_u8(code, 0xc7); // mov rdi, rax
+  } else {
+    elf_emit_rbp_disp_reg(code, 0x8b, 7, elf_sret_slot_offset(fun), true); // mov rdi, [rbp - sret]
+  }
+  size_t patch = elf_emit_jmp32_placeholder(code, 0xe8);
+  return elf_record_call_patch(ctx, patch, value->callee_index, diag, value);
+}
+
 static bool elf_emit_instr(ZBuf *text, const IrFunction *fun, const IrInstr *instr, ElfEmitContext *ctx, ZDiag *diag) {
   if (instr->kind == IR_INSTR_WORLD_WRITE) {
     return elf_emit_world_write(text, fun, instr, ctx, diag);
   }
  if (instr->kind == IR_INSTR_LOCAL_SET) {
+    if (instr->local_index < fun->local_len && fun->locals[instr->local_index].is_record) {
+      const IrLocal *local = &fun->locals[instr->local_index];
+      if (instr->value && instr->value->kind == IR_VALUE_CALL) {
+        return elf_emit_record_call_with_dest(text, fun, (int)local->index, instr->value, ctx, diag);
+      }
+      // Record-to-record copy (`let q = p` / `q = p`): memcpy the source slot.
+      if (instr->value && instr->value->kind == IR_VALUE_LOCAL) {
+        elf_emit_record_copy_to(text, fun, local->index, instr->value->local_index);
+        return true;
+      }
+      return elf_diag(diag, "direct ELF64 record local assignment requires a record value", instr->line, instr->column, "unsupported record set");
+    }
     if (instr->local_index < fun->local_len && fun->locals[instr->local_index].type == IR_TYPE_BYTE_VIEW) {
       const IrLocal *local = &fun->locals[instr->local_index];
       if (instr->value && instr->value->kind == IR_VALUE_CHECK && instr->value->left && instr->value->left->kind == IR_VALUE_FS_READ_ALL) {
@@ -2885,6 +3119,13 @@ static bool elf_emit_instr(ZBuf *text, const IrFunction *fun, const IrInstr *ins
       }
       if (instr->value && instr->value->kind == IR_VALUE_CHECK && instr->value->left && instr->value->left->kind == IR_VALUE_FS_MMAP) {
         return elf_emit_mmap_or_raise_to_local(text, fun, instr, ctx, diag);
+      }
+      if (instr->value && instr->value->kind == IR_VALUE_CALL) {
+        // Span-returning call: ptr lands in rax, len in rdx.
+        if (!elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
+        elf_emit_store_local_slot_rax(text, local, 0);
+        elf_emit_store_local_slot_reg(text, local, 8, 2, true);
+        return true;
       }
       if (!elf_emit_byte_view_ptr(text, fun, instr->value, ctx, diag)) return false;
       elf_emit_store_local_slot_rax(text, local, 0);
@@ -3196,11 +3437,32 @@ static bool elf_emit_instr(ZBuf *text, const IrFunction *fun, const IrInstr *ins
     return true;
   }
   if (instr->kind == IR_INSTR_FIELD_STORE) {
+    if (instr->local_index == UINT_MAX) {
+      return elf_emit_sret_field_store(text, fun, instr, ctx, diag);
+    }
     if (instr->local_index >= fun->local_len) return elf_diag(diag, "direct ELF64 field store record is out of range", instr->line, instr->column, "invalid record local");
     const IrLocal *local = &fun->locals[instr->local_index];
     if (!local->is_record) return elf_diag(diag, "direct ELF64 field store requires record local", instr->line, instr->column, "non-record local");
-    if (!elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
     IrTypeKind value_type = instr->value ? instr->value->type : IR_TYPE_I32;
+    if (value_type == IR_TYPE_BYTE_VIEW) {
+      // Span field: store ptr at the field offset and len 8 bytes higher. A
+      // span-returning call leaves ptr in rax and len in rdx; any other byte view
+      // is materialized ptr-then-len through rax.
+      unsigned ptr_disp = elf_record_field_disp(local, instr->field_offset);
+      unsigned len_disp = elf_record_field_disp(local, instr->field_offset + 8);
+      if (instr->value->kind == IR_VALUE_CALL) {
+        if (!elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
+        elf_emit_rbp_disp_reg(text, 0x89, 0, ptr_disp, true);
+        elf_emit_rbp_disp_reg(text, 0x89, 2, len_disp, true);
+      } else {
+        if (!elf_emit_byte_view_ptr(text, fun, instr->value, ctx, diag)) return false;
+        elf_emit_rbp_disp_reg(text, 0x89, 0, ptr_disp, true);
+        if (!elf_emit_byte_view_len(text, fun, instr->value, ctx, diag)) return false;
+        elf_emit_rbp_disp_reg(text, 0x89, 0, len_disp, true);
+      }
+      return true;
+    }
+    if (!elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
     if (elf_type_is_float(value_type)) {
       elf_emit_xmm_store_field(text, local, instr->field_offset, value_type, 0);
     } else {
@@ -3219,6 +3481,41 @@ static bool elf_emit_instr(ZBuf *text, const IrFunction *fun, const IrInstr *ins
     return true;
   }
   if (instr->kind == IR_INSTR_RETURN) {
+    if (fun->return_type == IR_TYPE_RECORD) {
+      // `return f()` — the callee writes straight through our sret pointer and hands
+      // it back in rax; nothing more to do.
+      if (instr->value && instr->value->kind == IR_VALUE_CALL) {
+        if (!elf_emit_record_call_with_dest(text, fun, -1, instr->value, ctx, diag)) return false;
+        elf_emit_epilogue(text, fun, ctx);
+        return true;
+      }
+      // `return p` — copy a record local/param through the sret pointer.
+      if (instr->value && instr->value->kind == IR_VALUE_LOCAL) {
+        elf_emit_record_copy_to(text, fun, UINT_MAX, instr->value->local_index);
+      }
+      // For a `return <shape literal>` the fields were already stored through sret.
+      // Either way, hand the sret pointer back in rax.
+      elf_emit_rbp_disp_reg(text, 0x8b, 0, elf_sret_slot_offset(fun), true);
+      elf_emit_epilogue(text, fun, ctx);
+      return true;
+    }
+    if (instr->value && instr->value->type == IR_TYPE_BYTE_VIEW) {
+      // Span return: ptr in rax, len in rdx. A span-returning call already lands
+      // both there; any other byte view is materialized ptr-then-len.
+      if (instr->value->kind == IR_VALUE_CALL) {
+        if (!elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
+      } else {
+        if (!elf_emit_byte_view_ptr(text, fun, instr->value, ctx, diag)) return false;
+        elf_emit_push_rax(text);
+        if (!elf_emit_byte_view_len(text, fun, instr->value, ctx, diag)) return false;
+        elf_append_u8(text, 0x48);
+        elf_append_u8(text, 0x89);
+        elf_append_u8(text, 0xc2);
+        elf_emit_pop_reg64(text, 0);
+      }
+      elf_emit_epilogue(text, fun, ctx);
+      return true;
+    }
     if (instr->value && !elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
     // Fallible/exit-propagating success path: the value already sits in its natural
     // register (rax full-width, or xmm0 for floats); clear the rdx error tag so the
@@ -3312,6 +3609,11 @@ static bool elf_emit_function_text(ZBuf *text, const IrFunction *fun, ElfEmitCon
     size_t int_idx = 0;
     size_t float_idx = 0;
     size_t stack_idx = 0;
+    if (fun->return_type == IR_TYPE_RECORD) {
+      // Save the caller's sret pointer (rdi) and reserve param_regs[0] for it.
+      elf_emit_rbp_disp_reg(text, 0x89, 7, elf_sret_slot_offset(fun), true);
+      int_idx = 1;
+    }
     for (size_t i = 0; i < fun->param_count; i++) {
       IrTypeKind ptype = i < fun->local_len ? fun->locals[i].type : IR_TYPE_VOID;
       if (elf_type_is_float(ptype)) {
@@ -3336,6 +3638,17 @@ static bool elf_emit_function_text(ZBuf *text, const IrFunction *fun, ElfEmitCon
             stack_idx++;
           }
         }
+      } else if (ptype == IR_TYPE_RECORD) {
+        unsigned ptr_reg;
+        if (int_idx < 6) {
+          ptr_reg = param_regs[int_idx];
+          int_idx++;
+        } else {
+          elf_emit_load_rbp_positive_reg(text, 11, 16u + (unsigned)stack_idx * 8u, true);
+          stack_idx++;
+          ptr_reg = 11;
+        }
+        elf_emit_copy_record_param(text, fun, (unsigned)i, ptr_reg);
       } else if (int_idx < 6) {
         elf_emit_store_local_from_reg(text, fun, (unsigned)i, param_regs[int_idx]);
         int_idx++;

@@ -1,0 +1,23 @@
+// A record-returning call as an argument is materialized into a temp and hoisted in
+// front of its statement — which is only sound where the expression is evaluated
+// exactly once. In a loop condition the temp would be built once instead of each
+// iteration, so the direct backend rejects it (CGEN004) rather than miscompile.
+// Hoist it yourself: `let p = mk(i)` inside the loop, then `useP(p)`.
+
+shape P { a: i32, b: i32 }
+
+fun mk(x: i32) -> P {
+    return P { a: x, b: 2 }
+}
+
+fun useP(p: P) -> i32 {
+    return p.a
+}
+
+pub fun main(world: World) -> Void raises {
+    let mut i = 0
+    while useP(mk(i)) < 3 {
+        i = i + 1
+    }
+    check world.out.write("unreachable\n")
+}
