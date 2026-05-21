@@ -685,6 +685,28 @@ await assertAgentSurfaceOwnedDropUnsupported("linux-musl-x64", "obj", "agent-sur
 await assertAgentSurfaceOwnedDropUnsupported("darwin-arm64", "obj", "agent-surface-owned-drop-macho.o", /Mach-O/, "macho", "zero-macho64");
 await assertAgentSurfaceOwnedDropUnsupported("win32-x64.exe", "obj", "agent-surface-owned-drop-coff.obj", /COFF/, "coff", "zero-coff-x64");
 await assertAgentSurfaceOwnedDropUnsupported("darwin-arm64", "obj", "agent-surface-owned-drop-macho-backend-ignored.o", /Mach-O/, "macho", "zero-macho64", { extraArgs: ["--backend", "zero-elf64"] });
+
+// darwin-arm64 declares the heap capability, so std.mem.pageAlloc passes the capability gate and
+// reaches the Mach-O ALLOC handler, which does not implement page allocation (ELF64-only). The
+// diagnostic must name pageAlloc rather than misdirecting to FixedBufAlloc.
+const pageAllocMachOBuild = await execFileAsync(zero, [
+  "build",
+  "--json",
+  "--emit",
+  "obj",
+  "--target",
+  "darwin-arm64",
+  "conformance/native/pass/page-alloc-region.0",
+  "--out",
+  `${outDir}/page-alloc-region-macho.o`,
+]).catch((error) => error);
+assert.notEqual(pageAllocMachOBuild.code, 0);
+const pageAllocMachODiag = JSON.parse(pageAllocMachOBuild.stdout).diagnostics[0];
+assert.equal(pageAllocMachODiag.code, "CGEN004");
+assert.match(pageAllocMachODiag.message, /std\.mem\.pageAlloc/);
+assert.doesNotMatch(pageAllocMachODiag.message, /FixedBufAlloc/);
+assert.equal(pageAllocMachODiag.backendBlocker.backend, "zero-macho64");
+
 const compileTimeJson = await execFileAsync(zero, ["check", "--json", "conformance/native/pass/compile-time-v1.0"]);
 const compileTimeBody = JSON.parse(compileTimeJson.stdout);
 assert.equal(compileTimeBody.ok, true);

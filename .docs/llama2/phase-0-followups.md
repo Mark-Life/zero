@@ -211,12 +211,40 @@ implemented" (pageAlloc is ELF64-only) — the diagnostic should say that.
 capability is ELF64/linux-musl-x64 only); use FixedBufAlloc/Arena over
 caller-owned storage."* Pure DX, no behavior change.
 
-- [ ] Done
+- [x] Done (2026-05-21) — both the Mach-O and COFF ALLOC-local init handlers now
+  special-case `IR_VALUE_PAGE_ALLOC` *before* the `FixedBufAlloc` check, mirroring
+  the ELF64 structure (`emit_elf64.c:2897`). New message:
+  *"direct AArch64 Mach-O backend does not support std.mem.pageAlloc (page
+  allocation is implemented on ELF64/linux-musl-x64 only); use std.mem.fixedBufAlloc
+  over caller-owned storage"* (COFF: same with "direct COFF backend"). The
+  `actual`/`backendBlocker.unsupportedFeature` label is now
+  `"std.mem.pageAlloc unsupported on this backend"` instead of the inherited
+  `"unsupported allocator initializer"`.
+
+  **Reachability finding (refines the issue's "Where").** Only the **Mach-O** path
+  is reachable through the capability gate. No COFF target declares `heap`
+  (`win32-x64.exe`/`win32-arm64.exe` in `targets.manifest` omit it), so `pageAlloc`
+  on a COFF target fails *earlier* with `TAR002 "target does not provide required
+  Heap capability"` — the COFF codegen handler is never hit. `--backend` forcing
+  doesn't change this: object format follows the target (forcing `zero-coff-x64` on
+  darwin-arm64 still emits Mach-O, same as the owned-drop `--backend zero-elf64`
+  precedent). So the **COFF change is consistency/defense-in-depth only** (correct,
+  but not conformance-testable today — kept so the branch exists if a COFF target
+  ever gains `heap`). On the Mach-O side, `darwin-x64` is x86_64 and unsupported by
+  the AArch64 Mach-O backend regardless, leaving **darwin-arm64 as the single
+  reachable Mach-O pageAlloc path** (it declares `heap`).
+
+  Test: no new fixture — the existing `conformance/native/pass/page-alloc-region.0`
+  is built for `darwin-arm64` in `run.mjs` (next to the owned-drop backend-diagnostic
+  cluster) asserting `CGEN004`, message matches `/std\.mem\.pageAlloc/`, message
+  **does not** match `/FixedBufAlloc/` (the regression guard — the whole point of the
+  fix), and `backendBlocker.backend == "zero-macho64"`. Verified ELF64 still builds
+  `page-alloc-region.0` (pageAlloc codegen intact, no regression); clean compile under
+  `-Wall -Wextra -Wpedantic`; full `conformance` run green.
 
 ---
 
 ## Suggested order
 
-1, 2, and 3 are **done** (2026-05-20). Remaining: 4 is a small DX polish (the
-misleading `pageAlloc` diagnostic on the Mach-O/COFF backends). None gate llama2
-Phase 1.
+All four are **done** — 1, 2, 3 on 2026-05-20; 4 (the misleading `pageAlloc`
+diagnostic on the Mach-O/COFF backends) on 2026-05-21. None gated llama2 Phase 1.

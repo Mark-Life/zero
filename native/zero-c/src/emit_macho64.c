@@ -1318,6 +1318,7 @@ static bool macho_emit_instr(ZBuf *text, const IrFunction *fun, const IrInstr *i
       return true;
     }
     if (fun->locals[instr->local_index].type == IR_TYPE_ALLOC) {
+      if (instr->value && instr->value->kind == IR_VALUE_PAGE_ALLOC) return macho_diag_at(diag, "direct AArch64 Mach-O backend does not support std.mem.pageAlloc (page allocation is implemented on ELF64/linux-musl-x64 only); use std.mem.fixedBufAlloc over caller-owned storage", instr->line, instr->column, "std.mem.pageAlloc unsupported on this backend");
       if (!instr->value || instr->value->kind != IR_VALUE_FIXED_BUF_ALLOC) return macho_diag_at(diag, "direct AArch64 Mach-O FixedBufAlloc local requires std.mem.fixedBufAlloc", instr->line, instr->column, "unsupported allocator initializer");
       if (!macho_emit_byte_view_ptr(text, fun, instr->value->left, 8, frame_size, ctx, diag)) return false;
       macho_emit_store_local_x(text, fun, 8, instr->local_index, 0, frame_size);
