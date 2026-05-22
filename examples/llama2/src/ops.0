@@ -1,9 +1,9 @@
-// llama2.zero — v0.1, Phase 3 (math kernels).
+// llama2.zero — forward-pass math kernels.
 //
 // The five forward-pass primitives, ported one-to-one from `llama2.c`: RMSNorm,
 // matmul, softmax, RoPE, and the SwiGLU non-linearity. All are pure functions
 // over `Span<f32>` / `MutSpan<f32>` — dimensions are read from the span lengths,
-// so the caller (transformer.0, Phase 4) slices the right tensor view and the
+// so the caller (transformer.0) slices the right tensor view and the
 // kernel needs no separate size arguments. Weights arrive as the zero-copy
 // `Span<f32>` views built in checkpoint.0.
 //

@@ -1,4 +1,4 @@
-// llama2.zero — v0.1, Phase 7 (generation loop).
+// llama2.zero — generation loop.
 //
 // Loads the checkpoint + tokenizer, BPE-encodes the prompt, then runs the
 // autoregressive generation loop, ported from `llama2.c` `generate`: forward the
@@ -9,7 +9,7 @@
 //
 // Numeric flags are parsed at runtime here — `std.parse` folds only string
 // literals at compile time, so `--tokens` uses a hand-rolled `parseUsize` (the
-// int analog of Phase 6's `parseF32`, which parses `--temperature` in sampler.0).
+// int analog of `parseF32`, which parses `--temperature` in sampler.0).
 
 use checkpoint
 use transformer
@@ -78,14 +78,14 @@ pub fun main(world: World) -> Void raises {
     let mut tokens_arg: String = "256"
     let mut temperature: String = "1.0"
     let mut tokenizer_path: String = "tokenizer.bin"
-    // top-p / top-k default to 0 (disabled) — plain multinomial, preserving v0.1
-    // behavior and the existing temperature-only parity tests.
+    // top-p / top-k default to 0 (disabled) — plain multinomial sampling, the
+    // configuration the temperature-only parity tests cover.
     let mut topp_arg: String = "0"
     let mut topk_arg: String = "0"
 
     // Minimal flag scan: advance one arg at a time, match a known flag, and read
     // the following arg as its value. Values are assumed not to collide with flag
-    // names — sufficient for v0.1.
+    // names.
     let mut i: usize = 2
     while i < argc {
         let flag = std.args.get(i)
@@ -178,7 +178,7 @@ pub fun main(world: World) -> Void raises {
     let mut tm: owned<Mapping> = tok_mapped.value
     let tok_bytes = std.fs.mappingBytes(&tm)
 
-    // Enhancement F: one combined vocab-index region for O(log vocab) tokenizer
+    // One combined vocab-index region for O(log vocab) tokenizer
     // lookup — `2 * vocab` i32s, sliced inside buildTokenizer into an entry-offset
     // table (O(1) random access) and a string-sorted id list (binary search).
     // Allocated once here (anonymous mmap, like RunState) and filled + sorted by

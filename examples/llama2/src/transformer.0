@@ -1,4 +1,4 @@
-// llama2.zero — v0.1, Phase 4 (transformer: RunState + forward pass).
+// llama2.zero — transformer: RunState + forward pass.
 //
 // The activation state and the autoregressive forward pass, ported one-to-one
 // from `llama2.c` (`malloc_run_state` + `forward`). RunState is carved as

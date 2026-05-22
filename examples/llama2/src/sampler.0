@@ -1,4 +1,4 @@
-// llama2.zero — v0.1, Phase 6 (sampler).
+// llama2.zero — sampler.
 //
 // Selects the next token from the forward-pass logits, ported from `llama2.c`
 // `run.c`: greedy argmax when temperature is 0, otherwise temperature-scaled
@@ -17,7 +17,7 @@
 //     loop never matters for throughput.
 //   - `--temperature` text is parsed by a small pure-Zero `parseF32`: `std.parse`
 //     folds only string *literals* at compile time, so a runtime value needs a
-//     hand-rolled scan, mirroring Phase 1's `--tokens` digit check.
+//     hand-rolled scan, like the `--tokens` digit check in main.0.
 
 use ops
 

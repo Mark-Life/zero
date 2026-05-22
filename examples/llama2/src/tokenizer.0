@@ -1,4 +1,4 @@
-// llama2.zero — v0.1, Phase 5 (BPE tokenizer) + enhancement F (sorted-index lookup).
+// llama2.zero — BPE tokenizer.
 //
 // Loads Karpathy's `tokenizer.bin` (already mmap'd into a byte span) and ports
 // `llama2.c` `encode`/`decode`. The file layout is:
@@ -9,17 +9,16 @@
 //
 // `vocab_size` is NOT in the file — it is the length of the caller-supplied index.
 //
-// Enhancement F replaces the v0.1 linear vocab scans with two load-time indices,
-// built into caller-allocated `pageAlloc` regions (sized vocab) by `buildTokenizer`:
+// `buildTokenizer` builds two load-time indices into a caller-allocated `pageAlloc`
+// region (sized vocab), so lookups avoid scanning the whole vocab:
 //   - `entryOff[id]` — byte offset of entry `id`, filled by ONE sequential walk.
-//     Gives O(1) random access for `tokenStr` and score reads (the v0.1 code
-//     re-walked the vocab from the start every time, in `entryStart`).
-//   - `sortedId[]`  — token ids ordered ascending by their string (heapsort, the
-//     `sortDescByProb` skeleton from sampler.0 with a string comparator + max-heap).
+//     Gives O(1) random access for `tokenStr` and score reads.
+//   - `sortedId[]`  — token ids ordered ascending by their string (heapsort with a
+//     string comparator + max-heap, same structure as sampler.0's `sortDescByProb`).
 //     `findStr` and the merge-step lookup binary-search this index — O(log vocab)
 //     instead of O(vocab), mirroring `llama2.c`'s `sorted_vocab` + `str_lookup`.
-// Token ids are unchanged: Karpathy's vocab strings are unique (sentencepiece) and
-// `llama2.c` itself binary-searches, so generation output is byte-for-byte identical.
+// Karpathy's vocab strings are unique (sentencepiece) and `llama2.c` itself
+// binary-searches, so generation output is byte-for-byte identical to the C run.
 //
 // Two adaptations to the direct ELF64 backend:
 //   - the merge candidate is matched against `vocab[a]+vocab[b]` WITHOUT building
@@ -27,8 +26,8 @@
 //     which compares the virtual a++b in place. No mutable byte scratch is needed,
 //     and the binary search stays within the 6-integer-register call cap.
 //   - `encode` takes BOS only (no EOS): the 6-integer-register call ABI can't fit
-//     a 7th argument, and the v0.1 prompt path is `encode(..., bos=1, eos=0)` in
-//     `llama2.c` `run.c` — EOS termination lives in the generation loop, not here.
+//     a 7th argument, and the prompt path needs only `encode(..., bos=1, eos=0)`
+//     (as in `llama2.c` `run.c`) — EOS termination lives in the generation loop.
 
 // A loaded tokenizer: the mapped file bytes, the header-derived sizes, and the two
 // lookup indices (views into caller-owned pageAlloc regions; read-only after build).
@@ -152,8 +151,8 @@ fun strById(bytes: Span<u8>, eo: MutSpan<i32>, id: i32) -> Span<u8> {
     return entryStrAt(bytes, off)
 }
 
-// Sort `so` (token ids) ascending by token string, in place. Heapsort built on the
-// `sampler.0` `sortDescByProb` skeleton — sentinel-bound sift-down, no break, child
+// Sort `so` (token ids) ascending by token string, in place. Heapsort sharing the
+// `sampler.0` `sortDescByProb` structure — sentinel-bound sift-down, no break, child
 // = i*2+1 / i*2+2 — but over a SINGLE id array, keyed by the entry string (via
 // `strById`/`cmpBytes`), and as a MAX-heap: extract-max-to-back fills the tail
 // largest-first, leaving the array ascending (what the binary search consumes).
@@ -287,8 +286,8 @@ fun tokenStr(t: Tokenizer, id: i32) -> Span<u8> {
 }
 
 // Binary search the sorted index for the token whose string equals `s`; returns its
-// id or -1. Replaces the v0.1 linear scan (mirrors `llama2.c` `str_lookup`). Vocab
-// strings are unique, so any match is unambiguous. A hit stores the id and sets
+// id or -1, mirroring `llama2.c` `str_lookup`. Vocab strings are unique, so any
+// match is unambiguous. A hit stores the id and sets
 // `lo = hi` to end the loop (the backend has no `break`).
 fun findStr(t: Tokenizer, s: Span<u8>) -> i32 {
     let bytes = t.bytes
@@ -317,8 +316,8 @@ fun findStr(t: Tokenizer, s: Span<u8>) -> i32 {
 }
 
 // Binary search for the token whose string equals the concatenation a++b; returns
-// its id or -1. The merge step's replacement for the v0.1 whole-vocab scan: same
-// sorted index + sentinel-exit as `findStr`, with `cmpConcatEntry` (which never
+// its id or -1. The merge step's lookup: same sorted index + sentinel-exit as
+// `findStr`, with `cmpConcatEntry` (which never
 // materializes a++b) as the comparator.
 fun findStrConcat(t: Tokenizer, a: Span<u8>, b: Span<u8>) -> i32 {
     let bytes = t.bytes

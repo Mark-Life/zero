@@ -1,4 +1,4 @@
-// llama2.zero — v0.1, Phase 2 (checkpoint parsing).
+// llama2.zero — checkpoint parsing.
 //
 // Parses a Karpathy `llama2.c` checkpoint that has already been mmap'd into a
 // byte span: the 7×int32 header becomes a `Config`, and the weight section is
