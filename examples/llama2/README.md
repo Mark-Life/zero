@@ -4,9 +4,10 @@ A port of Andrej Karpathy's [llama2.c](https://github.com/karpathy/llama2.c) to 
 It loads a Llama 2 checkpoint, runs the forward pass on the CPU, and streams the generated
 tokens to stdout — a single statically-linked binary with no runtime dependencies.
 
-**Status:** v0.1 — runs `stories15M` (f32, single-threaded, argmax + temperature sampling)
-on `linux-musl-x64`. Output matches the upstream `llama2.c` **token-for-token**; see
-[Validation](#validation).
+**Status:** v0.1 — runs Karpathy's TinyLlamas checkpoints (`stories15M`, and the larger
+`stories42M` / `stories110M` with no rebuild) on `linux-musl-x64`: f32, single-threaded,
+argmax + temperature sampling. Output matches the upstream `llama2.c` **token-for-token**;
+see [Validation](#validation).
 
 ## Quickstart
 
@@ -60,7 +61,7 @@ llama2 <model.bin> --prompt <text> --tokens <n> [--temperature <t>] [--tokenizer
 | Flag | Default | Notes |
 | --- | --- | --- |
 | `<model.bin>` | — | Positional; path to the checkpoint (required). |
-| `--prompt` | `""` | Prompt text, BPE-encoded. Max ~1021 bytes (v0.1). |
+| `--prompt` | `""` | Prompt text, BPE-encoded. Must fit the model's context window (`seq_len` tokens). |
 | `--tokens` | `256` | Tokens to generate; clamped to the model's `seq_len` (`0` ⇒ `seq_len`). |
 | `--temperature` | `1.0` | Sampling temperature. `0` ⇒ deterministic greedy argmax. |
 | `--tokenizer` | `tokenizer.bin` | Path to the Karpathy `tokenizer.bin` vocab. |
@@ -75,6 +76,22 @@ report a distinct `error: …` on stderr and exit nonzero.
 $ .zero/out/llama2 stories15M.bin --prompt "Once upon a time" --tokens 64 --temperature 0
 Once upon a time, there was a little girl named Lily. She loved to play outside in the sunshine. One day, she saw a big, red ball in the sky. It was the sun! ...
 ```
+
+## Models
+
+Every dimension is read from the checkpoint header at runtime, and the activation / KV-cache
+buffers are sized from it, so any same-format Karpathy
+[TinyLlamas](https://huggingface.co/karpathy/tinyllamas) checkpoint runs **with no rebuild**:
+
+```sh
+curl -L -O https://huggingface.co/karpathy/tinyllamas/resolve/main/stories110M.bin
+.zero/out/llama2 stories110M.bin --prompt "Once upon a time" --tokens 256
+```
+
+`stories42M` (159 MB) and `stories110M` (418 MB) both generate coherent text and match
+`llama2.c` **token-for-token** (temperature 0 and temperature > 0). Larger models are simply
+slower — single-threaded f32 inference scales ~linearly with parameter count. Quantization
+and real Llama-2 sizes are [backlog](../../.docs/llama2/enhancements.md) items.
 
 ## Validation
 
@@ -92,9 +109,8 @@ bash examples/llama2/validate.sh
 - **Temperature > 0** — also byte-identical once the seed and sampler are matched
   (`llama2.c -s 12345 -p 0`), because the xorshift\* PRNG is reproduced bit-for-bit.
 
-The only difference is cosmetic and documented: v0.1 prints raw-byte `<0xNN>` fallback tokens
-literally instead of emitting the byte — the token *ids* are identical, and the script
-normalizes them before diffing.
+Both sides emit raw-byte fallback tokens as the actual byte, so the token streams are
+compared directly (`cmp`) — no normalization needed.
 
 For CI (no 60 MB download), `conformance/native/pass/generate-argmax.0` runs the full
 forward → argmax → feedback loop on a tiny synthetic model and asserts the exact token
@@ -122,8 +138,11 @@ compiler work this exercised — start with [`overview.md`](../../.docs/llama2/o
 ## Limitations (v0.1)
 
 - **Target:** `linux-musl-x64` only — run via Docker on other hosts.
-- **Model:** tuned for `stories15M`; f32, single-threaded.
+- **Precision / threads:** f32, single-threaded, no quantization — so the practical ceiling
+  is the TinyLlamas family; real Llama-2 sizes need int8 (see the
+  [backlog](../../.docs/llama2/enhancements.md)).
 - **Sampling:** argmax + temperature only — top-p / top-k are post-v0.1.
-- **Prompt length:** capped at ~1021 bytes (tokens land in a fixed stack buffer).
 - **Tokenizer:** linear vocab scan, no hashmap — correct but O(vocab) per lookup.
-- **Decode:** raw-byte `<0xNN>` fallback tokens are printed literally, not expanded.
+
+Post-v0.1 enhancements (bigger models, top-p/top-k, cross-platform, quantization, training)
+are scoped in [`.docs/llama2/enhancements.md`](../../.docs/llama2/enhancements.md).

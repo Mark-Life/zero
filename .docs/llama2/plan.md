@@ -633,6 +633,7 @@ benchmark is a post-v0.1 follow-up (overview #6, ties to SIMD).
 ## Connections
 
 - [`./overview.md`](./overview.md) — mission, roadmap, forcing-function rationale.
+- [`./enhancements.md`](./enhancements.md) — post-v0.1 enhancements backlog (bigger models, top-p/top-k, cross-platform, quantization, training); items A/C/D landed.
 - [`./phase-0-followups.md`](./phase-0-followups.md) — Phase 0 hardening items to close before upstream PR.
 - [`./aggregate-abi.md`](./aggregate-abi.md) — the direct-backend shape/span ABI: born in Phase 2 (record params/returns, span returns, span-in-record locals), generalized after Phase 6 to full record value semantics (return/copy records, calls/literals as args, field-on-call). See "Side effort (after Phase 6)".
 - [`../math/plan.md`](../math/plan.md) — the float/math/codec/span foundation this builds on (F1–F5 landed).
