@@ -373,6 +373,7 @@ typedef enum {
   IR_TYPE_VOID,
   IR_TYPE_BOOL,
   IR_TYPE_U8,
+  IR_TYPE_I8,
   IR_TYPE_U16,
   IR_TYPE_USIZE,
   IR_TYPE_I32,

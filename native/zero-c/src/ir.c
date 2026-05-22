@@ -171,6 +171,7 @@ static IrTypeKind ir_type_kind(const char *type) {
   if (strcmp(type, "Void") == 0) return IR_TYPE_VOID;
   if (strcmp(type, "Bool") == 0 || strcmp(type, "bool") == 0) return IR_TYPE_BOOL;
   if (strcmp(type, "u8") == 0) return IR_TYPE_U8;
+  if (strcmp(type, "i8") == 0) return IR_TYPE_I8;
   if (strcmp(type, "u16") == 0) return IR_TYPE_U16;
   if (strcmp(type, "usize") == 0) return IR_TYPE_USIZE;
   if (strcmp(type, "i32") == 0) return IR_TYPE_I32;
@@ -199,7 +200,7 @@ static IrTypeKind ir_type_kind(const char *type) {
     if (ir_parse_span_inner_type(type, &inner, NULL)) {
       IrTypeKind element = ir_type_kind(inner);
       free(inner);
-      if (element == IR_TYPE_U8 || element == IR_TYPE_I32 || element == IR_TYPE_U32 ||
+      if (element == IR_TYPE_U8 || element == IR_TYPE_I8 || element == IR_TYPE_I32 || element == IR_TYPE_U32 ||
           element == IR_TYPE_I64 || element == IR_TYPE_U64 ||
           element == IR_TYPE_F32 || element == IR_TYPE_F64) {
         return IR_TYPE_BYTE_VIEW;
@@ -229,6 +230,7 @@ static IrTypeKind ir_byte_view_element_type(const char *type) {
   free(inner);
   switch (kind) {
     case IR_TYPE_U8:
+    case IR_TYPE_I8:
     case IR_TYPE_I32:
     case IR_TYPE_U32:
     case IR_TYPE_I64:
@@ -262,7 +264,7 @@ static bool ir_type_is_float(IrTypeKind type) {
 }
 
 static bool ir_type_is_value(IrTypeKind type) {
-  return type == IR_TYPE_U8 || type == IR_TYPE_U16 || type == IR_TYPE_USIZE || type == IR_TYPE_I32 || type == IR_TYPE_U32 || type == IR_TYPE_I64 || type == IR_TYPE_U64 || ir_type_is_float(type);
+  return type == IR_TYPE_U8 || type == IR_TYPE_I8 || type == IR_TYPE_U16 || type == IR_TYPE_USIZE || type == IR_TYPE_I32 || type == IR_TYPE_U32 || type == IR_TYPE_I64 || type == IR_TYPE_U64 || ir_type_is_float(type);
 }
 
 static bool ir_type_is_direct_local(IrTypeKind type) {
@@ -434,7 +436,8 @@ static bool ir_enum_case_value(const EnumDecl *item_enum, const char *case_name,
 static unsigned ir_type_byte_size(IrTypeKind type) {
   switch (type) {
     case IR_TYPE_BOOL:
-    case IR_TYPE_U8: return 1;
+    case IR_TYPE_U8:
+    case IR_TYPE_I8: return 1;
     case IR_TYPE_U16: return 2;
     case IR_TYPE_I32:
     case IR_TYPE_USIZE:
@@ -1173,6 +1176,10 @@ static bool ir_byte_view_reinterpret_element(const char *callee, IrTypeKind *out
   }
   if (strcmp(callee, "std.mem.bytesAsU32") == 0 || strcmp(callee, "std.mem.bytesAsMutU32") == 0) {
     if (out) *out = IR_TYPE_U32;
+    return true;
+  }
+  if (strcmp(callee, "std.mem.bytesAsI8") == 0 || strcmp(callee, "std.mem.bytesAsMutI8") == 0) {
+    if (out) *out = IR_TYPE_I8;
     return true;
   }
   return false;

@@ -1,0 +1,35 @@
+pub fun main(world: World) -> Void raises {
+    // Mutable i8 view over scratch bytes: writes store the low (two's-complement)
+    // byte, reads sign-extend it back. Cross-check the same region through a u8 view
+    // to confirm the stored bytes (-128 -> 0x80, -1 -> 0xFF). 4096 bytes -> 4096 i8.
+    let alloc = std.mem.pageAlloc()
+    let region = std.mem.allocBytes(alloc, 4096)
+    if region.has {
+        let bytes: MutSpan<u8> = region.value
+        let q: MutSpan<i8> = std.mem.bytesAsMutI8(bytes)
+        q[0] = (0 - 128) as i8
+        q[1] = 127 as i8
+        q[2] = (0 - 1) as i8
+        q[3] = 5 as i8
+        q[4095] = (0 - 7) as i8
+        let v0: i32 = q[0] as i32
+        let v1: i32 = q[1] as i32
+        let v2: i32 = q[2] as i32
+        let v3: i32 = q[3] as i32
+        let last: i32 = q[4095] as i32
+        // Same storage seen as raw bytes — two's complement, no sign extension.
+        let b0: i32 = bytes[0] as i32
+        let b2: i32 = bytes[2] as i32
+        let minNeg: i32 = 0 - 128
+        let maxPos: i32 = 127
+        let negOne: i32 = 0 - 1
+        let five: i32 = 5
+        let negSeven: i32 = 0 - 7
+        let byte128: i32 = 128
+        let byte255: i32 = 255
+        if std.mem.len(q) == 4096 && v0 == minNeg && v1 == maxPos && v2 == negOne &&
+            v3 == five && last == negSeven && b0 == byte128 && b2 == byte255 {
+            check world.out.write("mem bytes as mut i8 ok\n")
+        }
+    }
+}

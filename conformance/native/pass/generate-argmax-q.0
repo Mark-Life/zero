@@ -24,8 +24,8 @@
 // ops.0). Each quantized tensor gets its own (a,b): the int8 quant of element i
 // is ((i*a + b) % 7) - 3 (a signed value in -3..3), and `b` is offset by layer so
 // the two layers differ. CRITICAL for parity: where C stores the int8_t value v,
-// the Zero byte image stores the u8 byte v wraps to (v as u8), so decodeI8
-// recovers exactly v. The full v2 byte image (header + f32 rmsnorm groups +
+// the Zero byte image stores the u8 byte v wraps to (v as u8), so the `Span<i8>`
+// view reads back exactly v. The full v2 byte image (header + f32 rmsnorm groups +
 // interleaved quant/scale blocks) is filled by these formulas and then parsed
 // back through the real mapWeightsQ + mallocRunStateQ + forwardQ, so this also
 // re-validates the loader against the forward pass.
@@ -51,9 +51,10 @@ shape Config {
     shared_weights: Bool,
 }
 
-// One matrix's int8 quants (raw bytes, two's complement) plus the f32 group scales.
+// One matrix's int8 quants (a signed-byte view of the mapped bytes) plus the f32
+// group scales.
 shape QWeight {
-    q: Span<u8>,
+    q: Span<i8>,
     s: Span<f32>,
 }
 
@@ -77,9 +78,9 @@ shape QuantizedWeights {
     wclsBase: usize,
 }
 
-// Quantized-activation scratch: signed int8 quants kept as i32 plus f32 scales.
+// Quantized-activation scratch: signed int8 quants (one byte each) plus f32 scales.
 shape QActs {
-    q: MutSpan<i32>,
+    q: MutSpan<i8>,
     s: MutSpan<f32>,
 }
 
@@ -192,15 +193,6 @@ fun swiglu(hb: MutSpan<f32>, hb2: Span<f32>) -> Void {
 
 // ---- int8 kernels (ports of examples/llama2/src/ops.0) ----
 
-// Reconstruct the signed value of an int8 weight byte (two's complement) with
-// arithmetic only: for `uw` in 0..255, `uw / 128` is 1 exactly when the sign bit
-// is set, so subtracting 256 once in that case yields the signed value.
-fun decodeI8(qb: u8) -> i32 {
-    let uw: i32 = qb as i32
-    let sw: i32 = uw - 256 * (uw / 128)
-    return sw
-}
-
 // Round half away from zero, matching C round() (std.math has no roundf).
 fun roundHA(v: f32) -> i32 {
     let half: f32 = 0.5
@@ -234,8 +226,8 @@ fun matmulQ(out: MutSpan<f32>, x: QActs, w: QWeight, gs: usize) -> Void {
             let mut k: usize = 0
             while k < gs {
                 let idx: usize = row + j + k
-                let xqv: i32 = xq[j + k]
-                let wsv: i32 = decodeI8(wq[idx])
+                let xqv: i32 = xq[j + k] as i32
+                let wsv: i32 = wq[idx] as i32
                 ival = ival + xqv * wsv
                 k = k + 1
             }
@@ -274,7 +266,7 @@ fun quantizeActs(dst: QActs, x: Span<f32>, gs: usize) -> Void {
         let mut j: usize = 0
         while j < gs {
             let q: f32 = x[gbase + j] / scale
-            dq[gbase + j] = roundHA(q)
+            dq[gbase + j] = roundHA(q) as i8
             j = j + 1
         }
         g = g + 1
@@ -290,7 +282,7 @@ fun dequantRow(out: MutSpan<f32>, w: QWeight, row: usize, n: usize, gs: usize) -
     let mut i: usize = 0
     while i < n {
         let idx: usize = base + i
-        let qv: i32 = decodeI8(wq[idx])
+        let qv: i32 = wq[idx] as i32
         let qf: f32 = qv as f32
         let scale: f32 = ws[idx / gs]
         o[i] = qf * scale
@@ -441,9 +433,9 @@ fun runStateFloatsQ(cfg: Config, gs: usize) -> usize {
     let dim = cfg.dim as usize
     let hidden = cfg.hidden_dim as usize
     let mut total: usize = runStateFloats(cfg)
-    total = total + dim
+    total = total + (dim + 3) / 4
     total = total + dim / gs
-    total = total + hidden
+    total = total + (hidden + 3) / 4
     total = total + hidden / gs
     return total
 }
@@ -480,11 +472,11 @@ fun mallocRunStateQ(base: MutSpan<u8>, cfg: Config, gs: usize) -> RunState {
     let value_off = off
     off = off + cache
     let xq_off = off
-    off = off + dim
+    off = off + (dim + 3) / 4
     let xqs_off = off
     off = off + dim / gs
     let hq_off = off
-    off = off + hidden
+    off = off + (hidden + 3) / 4
     let hqs_off = off
     off = off + hidden / gs
 
@@ -513,10 +505,10 @@ fun view(base: MutSpan<u8>, off: usize, count: usize) -> MutSpan<f32> {
     return std.mem.bytesAsMutF32(base[start..end])
 }
 
-fun viewI32(base: MutSpan<u8>, off: usize, count: usize) -> MutSpan<i32> {
+fun viewI8(base: MutSpan<u8>, off: usize, count: usize) -> MutSpan<i8> {
     let start = off * 4
-    let end = start + count * 4
-    return std.mem.bytesAsMutI32(base[start..end])
+    let end = start + count
+    return std.mem.bytesAsMutI8(base[start..end])
 }
 
 fun logitsOf(s: RunState, cfg: Config) -> MutSpan<f32> {
@@ -537,9 +529,10 @@ fun layerQWeight(qw: QuantizedWeights, base: usize, se: usize, l: usize) -> QWei
     let send = sstart + n_scales * 4
     let qbytes = bytes[qstart..qend]
     let sbytes = bytes[sstart..send]
+    let qi8 = std.mem.bytesAsI8(qbytes)
     let sf32 = std.mem.bytesAsF32(sbytes)
     return QWeight {
-        q: qbytes,
+        q: qi8,
         s: sf32
     }
 }
@@ -577,13 +570,13 @@ fun forwardQ(cfg: Config, qw: QuantizedWeights, s: RunState, token: i32, pos: i3
     let rms_ffn = qw.rms_ffn
     let rms_final = qw.rms_final
 
-    let xq_q = viewI32(base, s.xq_off, dim)
+    let xq_q = viewI8(base, s.xq_off, dim)
     let xq_s = view(base, s.xqs_off, dim / gs)
     let xq = QActs {
         q: xq_q,
         s: xq_s
     }
-    let hq_q = viewI32(base, s.hq_off, hidden)
+    let hq_q = viewI8(base, s.hq_off, hidden)
     let hq_s = view(base, s.hqs_off, hidden / gs)
     let hq = QActs {
         q: hq_q,

@@ -1,0 +1,24 @@
+pub fun main(world: World) -> Void raises {
+    // Reinterpreting borrowed bytes as i8 must sign-extend on read: 0x80 -> -128,
+    // 0xFF -> -1, 0xC8 (200) -> -56, while 0x00..0x7F stay non-negative. This is the
+    // signed counterpart of bytesAsU32/bytesAsI32 — one byte per element, no copy.
+    let buf: [6]u8 = [0, 1, 127, 128, 255, 200]
+    let span: Span<u8> = buf
+    let view: Span<i8> = std.mem.bytesAsI8(span)
+    let r0: i32 = view[0] as i32
+    let r1: i32 = view[1] as i32
+    let r2: i32 = view[2] as i32
+    let r3: i32 = view[3] as i32
+    let r4: i32 = view[4] as i32
+    let r5: i32 = view[5] as i32
+    let zero: i32 = 0
+    let one: i32 = 1
+    let maxPos: i32 = 127
+    let minNeg: i32 = 0 - 128
+    let negOne: i32 = 0 - 1
+    let negFiftySix: i32 = 0 - 56
+    if std.mem.len(view) == 6 && r0 == zero && r1 == one && r2 == maxPos &&
+        r3 == minNeg && r4 == negOne && r5 == negFiftySix {
+        check world.out.write("mem bytes as i8 ok\n")
+    }
+}

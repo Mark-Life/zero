@@ -1,0 +1,16 @@
+pub fun main(world: World) -> Void raises {
+    // 16 bytes reinterpreted as i8 hold exactly 16 elements (indices 0..15); index
+    // 16 is one past the end and must trap at the bounds check, like every other
+    // typed span view.
+    let alloc = std.mem.pageAlloc()
+    let region = std.mem.allocBytes(alloc, 16)
+    if region.has {
+        let bytes: MutSpan<u8> = region.value
+        let q: MutSpan<i8> = std.mem.bytesAsMutI8(bytes)
+        let oob: i32 = q[16] as i32
+        let zero: i32 = 0
+        if oob == zero {
+            check world.out.write("unreachable\n")
+        }
+    }
+}

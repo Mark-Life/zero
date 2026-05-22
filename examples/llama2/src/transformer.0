@@ -74,18 +74,19 @@ pub fun runStateFloats(cfg: Config) -> usize {
 }
 
 // Total 4-byte elements the quantized RunState needs — `runStateFloats(cfg)` plus
-// the quantized-activation scratch: `dim` int32 quants + `dim / gs` f32 scales for
+// the quantized-activation scratch: `dim` int8 quants + `dim / gs` f32 scales for
 // the `dim`-width activation, and `hidden` + `hidden / gs` for the `hidden`-width
-// activation. (`gs` is the quantization group size, which is not part of `Config`,
-// so it is passed in.) Multiply by 4 for the byte allocation, exactly as the f32
-// path does.
+// activation. The int8 quant buffers hold one byte per quant, rounded up to whole
+// 4-byte slots ((n + 3) / 4) so the f32 scale buffers that follow stay 4-byte
+// aligned. (`gs` is the group size, not part of `Config`, so it is passed in.)
+// Multiply by 4 for the byte allocation, exactly as the f32 path does.
 pub fun runStateFloatsQ(cfg: Config, gs: usize) -> usize {
     let dim = cfg.dim as usize
     let hidden = cfg.hidden_dim as usize
     let mut total: usize = runStateFloats(cfg)
-    total = total + dim
+    total = total + (dim + 3) / 4
     total = total + dim / gs
-    total = total + hidden
+    total = total + (hidden + 3) / 4
     total = total + hidden / gs
     return total
 }
@@ -183,11 +184,11 @@ pub fun mallocRunStateQ(base: MutSpan<u8>, cfg: Config, gs: usize) -> RunState {
     let value_off = off
     off = off + cache
     let xq_off = off
-    off = off + dim
+    off = off + (dim + 3) / 4
     let xqs_off = off
     off = off + dim / gs
     let hq_off = off
-    off = off + hidden
+    off = off + (hidden + 3) / 4
     let hqs_off = off
     off = off + hidden / gs
 
@@ -219,14 +220,14 @@ fun view(base: MutSpan<u8>, off: usize, count: usize) -> MutSpan<f32> {
     return std.mem.bytesAsMutF32(base[start..end])
 }
 
-// i32-element [off, off+count) of the region, as a writable view — the integer
-// analog of `view`, used for the quantized-activation quant buffers. i32 is 4
-// bytes, so the byte arithmetic matches `view` exactly (offsets are in 4-byte
-// units throughout RunState).
-fun viewI32(base: MutSpan<u8>, off: usize, count: usize) -> MutSpan<i32> {
+// `count` signed bytes at [off*4, off*4 + count) of the region, as a writable
+// view — used for the quantized-activation quant buffers, which hold one int8 per
+// quant. `off` is in 4-byte slot units like the rest of RunState (the buffers are
+// slot-aligned), but an i8 element is one byte, so the span length is `count`.
+fun viewI8(base: MutSpan<u8>, off: usize, count: usize) -> MutSpan<i8> {
     let start = off * 4
-    let end = start + count * 4
-    return std.mem.bytesAsMutI32(base[start..end])
+    let end = start + count
+    return std.mem.bytesAsMutI8(base[start..end])
 }
 
 // The logits view (vocab_size f32) after a forward pass — the caller samples it.
@@ -431,9 +432,10 @@ pub fun forward(cfg: Config, w: TransformerWeights, s: RunState, token: i32, pos
 // element count (`size_each`), and `l` the layer index. Each layer's on-disk block
 // is `se` quant bytes followed by `se / gs` f32 scales, so layer `l` starts at
 // `base + l * block`. Mirrors the per-layer arithmetic the loader documents; the
-// quants are returned as raw bytes (the matmul sign-decodes them). `gs` is read
-// from `qw`. Binds `qw.bytes` to a local before slicing, as record span fields
-// require.
+// quants are reinterpreted as a signed-byte `Span<i8>` so the matmul reads each
+// weight directly. `gs` is read from `qw`. Binds `qw.bytes` to a local before
+// slicing, and the reinterpret views to locals before the record literal, as
+// record span fields require.
 fun layerQWeight(qw: QuantizedWeights, base: usize, se: usize, l: usize) -> QWeight {
     let bytes = qw.bytes
     let gs = qw.gs
@@ -445,9 +447,10 @@ fun layerQWeight(qw: QuantizedWeights, base: usize, se: usize, l: usize) -> QWei
     let send = sstart + n_scales * 4
     let qbytes = bytes[qstart..qend]
     let sbytes = bytes[sstart..send]
+    let qi8 = std.mem.bytesAsI8(qbytes)
     let sf32 = std.mem.bytesAsF32(sbytes)
     return QWeight {
-        q: qbytes,
+        q: qi8,
         s: sf32
     }
 }
@@ -499,13 +502,13 @@ pub fun forwardQ(cfg: Config, qw: QuantizedWeights, s: RunState, token: i32, pos
     // activations, `hq` for hidden-width. Built once and reused each layer. The
     // span views are bound to locals first (a call result cannot be nested in a
     // record literal field on the direct backend).
-    let xq_q = viewI32(base, s.xq_off, dim)
+    let xq_q = viewI8(base, s.xq_off, dim)
     let xq_s = view(base, s.xqs_off, dim / gs)
     let xq = QActs {
         q: xq_q,
         s: xq_s
     }
-    let hq_q = viewI32(base, s.hq_off, hidden)
+    let hq_q = viewI8(base, s.hq_off, hidden)
     let hq_s = view(base, s.hqs_off, hidden / gs)
     let hq = QActs {
         q: hq_q,

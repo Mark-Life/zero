@@ -145,25 +145,13 @@ pub fun swiglu(hb: MutSpan<f32>, hb2: Span<f32>) -> Void {
 }
 
 // Quantized-activation scratch, writable. Mirrors `runq.c`'s `QuantizedTensor`
-// for the activation side: `q` holds the signed int8 quants — kept here as i32,
-// one element per value with no byte packing, so the matmul reads them directly —
-// and `s` holds the f32 group scales (one per run of `group_size` quants). Filled
-// by `quantizeActs` and consumed by `matmulQ`. Lives in the run state, so both
-// fields are `MutSpan`.
+// for the activation side: `q` holds the signed int8 quants as a `MutSpan<i8>`
+// (one byte per value, matching runq.c's `int8_t*`), and `s` holds the f32 group
+// scales (one per run of `group_size` quants). Filled by `quantizeActs` and
+// consumed by `matmulQ`. Lives in the run state, so both fields are `MutSpan`.
 pub shape QActs {
-    q: MutSpan<i32>,
+    q: MutSpan<i8>,
     s: MutSpan<f32>,
-}
-
-// Reconstruct the signed value of an int8 weight byte. The quant bytes are stored
-// two's-complement, but there is no signed-8-bit load, so a raw `u8` in 0..255 is
-// mapped to its signed meaning -128..127 with arithmetic only (no bitwise ops):
-// for `uw` in 0..255, `uw / 128` is 1 exactly when the sign bit is set, so
-// subtracting `256` once in that case yields the signed value.
-fun decodeI8(qb: u8) -> i32 {
-    let uw: i32 = qb as i32
-    let sw: i32 = uw - 256 * (uw / 128)
-    return sw
 }
 
 // Round half away from zero, matching C's `round()` — used by the activation
@@ -213,8 +201,8 @@ pub fun matmulQ(out: MutSpan<f32>, x: QActs, w: QWeight, gs: usize) -> Void {
             let mut k: usize = 0
             while k < gs {
                 let idx: usize = row + j + k
-                let xqv: i32 = xq[j + k]
-                let wsv: i32 = decodeI8(wq[idx])
+                let xqv: i32 = xq[j + k] as i32
+                let wsv: i32 = wq[idx] as i32
                 ival = ival + xqv * wsv
                 k = k + 1
             }
@@ -262,19 +250,19 @@ pub fun quantizeActs(dst: QActs, x: Span<f32>, gs: usize) -> Void {
         let mut j: usize = 0
         while j < gs {
             let q: f32 = x[gbase + j] / scale
-            dq[gbase + j] = roundHA(q)
+            dq[gbase + j] = roundHA(q) as i8
             j = j + 1
         }
         g = g + 1
     }
 }
 
-// Dequantize a single weight row: out[i] = decode(w.q[row*n + i]) * w.s[(row*n +
-// i) / gs] for i in 0..n. Used as the token-embedding gather — `runq.c`
-// dequantizes the whole vocab*dim token table to f32 at load, but the only row
-// needed per step is the embedded token's, so dequantizing on gather produces the
-// same numbers without the large f32 buffer. Same int8 sign-decode as the matmul.
-// `out` holds n elements; `gs` must divide `n`.
+// Dequantize a single weight row: out[i] = w.q[row*n + i] * w.s[(row*n + i) / gs]
+// for i in 0..n. Used as the token-embedding gather — `runq.c` dequantizes the
+// whole vocab*dim token table to f32 at load, but the only row needed per step is
+// the embedded token's, so dequantizing on gather produces the same numbers
+// without the large f32 buffer. The int8 quants are read directly from the signed
+// `Span<i8>`. `out` holds n elements; `gs` must divide `n`.
 pub fun dequantRow(out: MutSpan<f32>, w: QWeight, row: usize, n: usize, gs: usize) -> Void {
     let wq = w.q
     let ws = w.s
@@ -283,7 +271,7 @@ pub fun dequantRow(out: MutSpan<f32>, w: QWeight, row: usize, n: usize, gs: usiz
     let mut i: usize = 0
     while i < n {
         let idx: usize = base + i
-        let qv: i32 = decodeI8(wq[idx])
+        let qv: i32 = wq[idx] as i32
         let qf: f32 = qv as f32
         let scale: f32 = ws[idx / gs]
         o[i] = qf * scale

@@ -330,6 +330,8 @@ for (const fixture of [
   "conformance/native/pass/mem-bytes-as-f32-mmap.0",
   "conformance/native/pass/mem-bytes-as-i32.0",
   "conformance/native/pass/mem-bytes-as-mut-i32.0",
+  "conformance/native/pass/mem-bytes-as-i8.0",
+  "conformance/native/pass/mem-bytes-as-mut-i8.0",
   "conformance/native/pass/checkpoint-q-v2.0",
   "conformance/native/pass/ops-q-matmul.0",
   "conformance/native/pass/ops-q-quantize.0",
@@ -1877,6 +1879,8 @@ for (const runtimeFixture of [
   ["conformance/native/pass/mem-bytes-as-f32-mmap.0", "mem-bytes-as-f32-mmap", { stdout: "mem bytes as f32 mmap ok\n" }],
   ["conformance/native/pass/mem-bytes-as-i32.0", "mem-bytes-as-i32", { stdout: "mem bytes as i32 ok\n" }],
   ["conformance/native/pass/mem-bytes-as-mut-i32.0", "mem-bytes-as-mut-i32", { stdout: "mem bytes as mut i32 ok\n" }],
+  ["conformance/native/pass/mem-bytes-as-i8.0", "mem-bytes-as-i8", { stdout: "mem bytes as i8 ok\n" }],
+  ["conformance/native/pass/mem-bytes-as-mut-i8.0", "mem-bytes-as-mut-i8", { stdout: "mem bytes as mut i8 ok\n" }],
   ["conformance/native/pass/checkpoint-q-v2.0", "checkpoint-q-v2", { stdout: "checkpoint q v2 ok\n" }],
   ["conformance/native/pass/ops-q-matmul.0", "ops-q-matmul", { stdout: "ops q matmul ok\n" }],
   ["conformance/native/pass/ops-q-quantize.0", "ops-q-quantize", { stdout: "ops q quantize ok\n", libm: true }],
@@ -1966,6 +1970,7 @@ await assertBoundsTrap("conformance/native/fail/codec-read-f32-le-bounds.0", "co
 await assertBoundsTrap("conformance/native/fail/codec-read-i32-le-bounds.0", "codec-read-i32-le-bounds");
 await assertBoundsTrap("conformance/native/fail/mem-bytes-as-f32-bounds.0", "mem-bytes-as-f32-bounds");
 await assertBoundsTrap("conformance/native/fail/mem-bytes-as-i32-bounds.0", "mem-bytes-as-i32-bounds");
+await assertBoundsTrap("conformance/native/fail/mem-bytes-as-i8-bounds.0", "mem-bytes-as-i8-bounds");
 await assertBoundsTrap("conformance/native/fail/mem-mut-span-u8-store-bounds.0", "mem-mut-span-u8-store-bounds");
 
 // A record-returning call as an argument can't be hoisted into a loop condition

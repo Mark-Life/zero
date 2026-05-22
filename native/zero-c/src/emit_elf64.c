@@ -70,7 +70,7 @@ static bool elf_ir_diag(ZDiag *diag, const IrProgram *ir) {
 }
 
 static bool elf_type_is_scalar(IrTypeKind type) {
-  return type == IR_TYPE_BOOL || type == IR_TYPE_U8 || type == IR_TYPE_U16 || type == IR_TYPE_USIZE || type == IR_TYPE_I32 || type == IR_TYPE_U32;
+  return type == IR_TYPE_BOOL || type == IR_TYPE_U8 || type == IR_TYPE_I8 || type == IR_TYPE_U16 || type == IR_TYPE_USIZE || type == IR_TYPE_I32 || type == IR_TYPE_U32;
 }
 
 static bool elf_type_is_i64(IrTypeKind type) {
@@ -102,6 +102,7 @@ static const char *elf_type_name(IrTypeKind type) {
     case IR_TYPE_VOID: return "Void";
     case IR_TYPE_BOOL: return "Bool";
     case IR_TYPE_U8: return "u8";
+    case IR_TYPE_I8: return "i8";
     case IR_TYPE_U16: return "u16";
     case IR_TYPE_USIZE: return "usize";
     case IR_TYPE_I32: return "i32";
@@ -174,6 +175,10 @@ static void elf_emit_load_field_rax(ZBuf *code, const IrLocal *local, unsigned f
   if (type == IR_TYPE_U8 || type == IR_TYPE_BOOL) {
     elf_append_u8(code, 0x0f);
     elf_emit_rbp_disp_reg(code, 0xb6, 0, disp, false);
+  } else if (type == IR_TYPE_I8) {
+    // movsbl: sign-extend the signed byte field into eax (vs movzbl for u8).
+    elf_append_u8(code, 0x0f);
+    elf_emit_rbp_disp_reg(code, 0xbe, 0, disp, false);
   } else if (elf_type_is_i64(type)) {
     elf_emit_rbp_disp_reg(code, 0x8b, 0, disp, true);
   } else {
@@ -183,7 +188,7 @@ static void elf_emit_load_field_rax(ZBuf *code, const IrLocal *local, unsigned f
 
 static void elf_emit_store_field_from_rax(ZBuf *code, const IrLocal *local, unsigned field_offset, IrTypeKind type) {
   unsigned disp = elf_record_field_disp(local, field_offset);
-  if (type == IR_TYPE_U8 || type == IR_TYPE_BOOL) {
+  if (type == IR_TYPE_U8 || type == IR_TYPE_I8 || type == IR_TYPE_BOOL) {
     elf_emit_rbp_disp_reg(code, 0x88, 0, disp, false);
   } else if (elf_type_is_i64(type)) {
     elf_emit_rbp_disp_reg(code, 0x89, 0, disp, true);
@@ -193,7 +198,7 @@ static void elf_emit_store_field_from_rax(ZBuf *code, const IrLocal *local, unsi
 }
 
 static unsigned elf_type_byte_size(IrTypeKind type) {
-  if (type == IR_TYPE_U8 || type == IR_TYPE_BOOL) return 1;
+  if (type == IR_TYPE_U8 || type == IR_TYPE_I8 || type == IR_TYPE_BOOL) return 1;
   if (elf_type_is_i64(type) || elf_type_is_f64(type)) return 8;
   return 4;
 }
@@ -1111,11 +1116,15 @@ static bool elf_emit_byte_view_len(ZBuf *code, const IrFunction *fun, const IrVa
   if (view && view->kind == IR_VALUE_BYTE_VIEW_REINTERPRET && view->left) {
     if (!elf_emit_byte_view_len(code, fun, view->left, ctx, diag)) return false;
     unsigned size = elf_type_byte_size(view->element_type);
-    unsigned shift = size == 8 ? 3 : 2;
-    elf_append_u8(code, 0x48);
-    elf_append_u8(code, 0xc1);
-    elf_append_u8(code, 0xe8);
-    elf_append_u8(code, (unsigned char)shift);
+    // Element count = underlying byte length / element size, via shr by log2(size).
+    // A 1-byte element (i8) needs no shift: byte length already is the count.
+    if (size > 1) {
+      unsigned shift = size == 8 ? 3 : 2;
+      elf_append_u8(code, 0x48);
+      elf_append_u8(code, 0xc1);
+      elf_append_u8(code, 0xe8);
+      elf_append_u8(code, (unsigned char)shift);
+    }
     return true;
   }
   if (view && view->kind == IR_VALUE_LOCAL && view->local_index < fun->local_len && fun->locals[view->local_index].type == IR_TYPE_BYTE_VIEW) {
@@ -2220,6 +2229,12 @@ static bool elf_emit_value(ZBuf *code, const IrFunction *fun, const IrValue *val
         elf_append_u8(code, 0x0f);
         elf_append_u8(code, 0xb6);
         elf_append_u8(code, 0x00);
+      } else if (local->element_type == IR_TYPE_I8) {
+        // movsbl (rax), eax — sign-extend a signed-byte span element to 32 bits
+        // (the i8 counterpart of u8's zero-extending movzbl above).
+        elf_append_u8(code, 0x0f);
+        elf_append_u8(code, 0xbe);
+        elf_append_u8(code, 0x00);
       } else if (elf_type_is_i64(local->element_type)) {
         elf_append_u8(code, 0x48);
         elf_append_u8(code, 0x8b);
@@ -2539,7 +2554,7 @@ static bool elf_validate_function(const IrFunction *fun, ZDiag *diag) {
     if (fun->locals[i].type == IR_TYPE_BYTE_VIEW) {
       if (fun->locals[i].is_param) {
         IrTypeKind elem = fun->locals[i].element_type;
-        bool ok = elem == IR_TYPE_U8 || elem == IR_TYPE_I32 || elem == IR_TYPE_U32 ||
+        bool ok = elem == IR_TYPE_U8 || elem == IR_TYPE_I8 || elem == IR_TYPE_I32 || elem == IR_TYPE_U32 ||
                   elem == IR_TYPE_I64 || elem == IR_TYPE_U64 ||
                   elem == IR_TYPE_F32 || elem == IR_TYPE_F64;
         if (!ok) {
@@ -3025,7 +3040,7 @@ static bool elf_emit_sret_field_store(ZBuf *text, const IrFunction *fun, const I
     return true;
   }
   if (!elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
-  unsigned w = (vt == IR_TYPE_U8 || vt == IR_TYPE_BOOL) ? 1u : (elf_type_is_i64(vt) ? 8u : 4u);
+  unsigned w = (vt == IR_TYPE_U8 || vt == IR_TYPE_I8 || vt == IR_TYPE_BOOL) ? 1u : (elf_type_is_i64(vt) ? 8u : 4u);
   elf_emit_rbp_disp_reg(text, 0x8b, 1, slot, true);
   elf_emit_store_rcx_disp(text, fo, 0, w);
   return true;
@@ -3418,7 +3433,9 @@ static bool elf_emit_instr(ZBuf *text, const IrFunction *fun, const IrInstr *ins
     elf_append_u8(text, 0x50);
     if (!elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
     elf_append_u8(text, 0x59);
-    if (local->element_type == IR_TYPE_U8) {
+    if (local->element_type == IR_TYPE_U8 || local->element_type == IR_TYPE_I8) {
+      // Store the low byte (mov [rcx], al); the in-register value is a sign- or
+      // zero-extended 32-bit quantity whose low byte is the two's-complement element.
       elf_append_u8(text, 0x88);
       elf_append_u8(text, 0x01);
     } else if (elf_type_is_i64(local->element_type)) {

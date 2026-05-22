@@ -226,12 +226,12 @@ pub fun expectedFileFloats(cfg: Config) -> usize {
 // the per-layer stride is a byte stride, not an f32-element stride.
 
 // A single matrix's quantized weights, sliced zero-copy out of the mapped file:
-// the raw int8 quants kept as bytes (each byte holds a signed value in two's
-// complement; callers reconstruct the signed weight when they read it) and the
-// f32 group scales (one per run of `group_size` quants). Mirrors `runq.c`
+// the int8 quants as a `Span<i8>` (a signed-byte view of the mapped bytes — each
+// element reads back directly as its two's-complement value -128..127) and the f32
+// group scales (one per run of `group_size` quants). Mirrors `runq.c`
 // `QuantizedTensor`.
 pub shape QWeight {
-    q: Span<u8>,
+    q: Span<i8>,
     s: Span<f32>,
 }
 

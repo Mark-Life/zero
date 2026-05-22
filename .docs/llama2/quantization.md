@@ -308,11 +308,28 @@ offsets, splitting quantize into two calls).
   RAM bar. Document `export.py` for `--meta-llama` / `--hf`. Coherence check under Docker.
 - README: quantized download/export/run section; results line in `validate.sh`.
 
-### Q-opt — `bytesAsI8` + `i8` scalar (compiler, **optional, deferred**) — Small/Medium
+### Q-opt — `bytesAsI8` + `i8` scalar (compiler) — **DONE**
 Swap the arithmetic sign-decode for a hardware sign-extending load and let activation quants
-pack into `i8` (smaller scratch). A clean reusable primitive for the upstream PR; **not
-required** for parity. Trivial mirror of item C plus one genuinely new bit — a signed 8-bit
-load (`movsbl 0F BE`) vs `u8`'s zero-extend (`movzbl 0F B6`). Touch points (mapped, exact):
+pack into `i8` (smaller scratch). A clean reusable primitive for the upstream PR. Trivial
+mirror of item C plus one genuinely new bit — a signed 8-bit load (`movsbl 0F BE`) vs `u8`'s
+zero-extend (`movzbl 0F B6`).
+
+**Landed:** `IR_TYPE_I8` + `std.mem.bytesAsI8`/`bytesAsMutI8` (`Span<i8>`/`MutSpan<i8>`), pure
+ELF64 direct backend. A bound `Span<i8>` local indexes via `IR_VALUE_INDEX_LOAD` (since
+`i8 != u8`), so the load arm there emits `movsbl`; int→int casts are already elided to a type
+relabel, so `wq[idx] as i32` is a single sign-extending byte load (no extra cast op). The
+`[N]i8` *fixed-array* element type is intentionally **not** added — i8 is a span-reinterpret /
+scalar / record-field type only, keeping it exactly parallel to the existing `bytesAsI32`
+family (which the other backends — macho64/coff/aarch64 — also reject for byte-view spans, so
+i8 behaves identically there: clean diagnostic, never a silent miscompile). `examples/llama2`
+now stores `QWeight.q` as `Span<i8>` and `QActs.q` as `MutSpan<i8>`, dropping `decodeI8`;
+the swap is value-preserving (byte-identical output to the committed-G binary). Touch points
+(as built):
+
+**Known open bug (pre-existing in G, surfaced by the first real-model q-run, NOT a Q-opt
+regression):** the int8 **temp>0** path diverges from `runq.c` on real models (temp 0/argmax
+mostly matches; the f32 path is perfect). Full handoff for whoever fixes it:
+[`quant-temp-parity-divergence.md`](./quant-temp-parity-divergence.md).
 - `zero.h`: add `IR_TYPE_I8` to `IrTypeKind`.
 - `checker.c`: `bytesAsI8`→`Span<i8>` / `bytesAsMutI8`→`MutSpan<i8>` in the three tables
   (~990, ~1161, ~1324); `main.c` builtins table (~867) + helpers JSON (~8218).
@@ -341,8 +358,8 @@ load (`movsbl 0F BE`) vs `u8`'s zero-extend (`movzbl 0F B6`). Touch points (mapp
 | `conformance/native/pass/ops-q-quantize.0` | Q2 | quantizeActs round-trip (libm) |
 | `conformance/native/pass/generate-argmax-q.0` | Q4 | end-to-end quantized token seq (libm) |
 | `conformance/run.mjs` | Q1/Q2/Q4 | fixture entries |
-| `native/zero-c/src/{checker,ir,emit_elf64,main}.c`, `include/zero.h` | Q-opt | `bytesAsI8`/`i8` (optional) |
-| `native/zero-c/conformance/native/{pass,fail}/mem-bytes-as-i8*.0` | Q-opt | i8 fixtures (optional) |
+| `native/zero-c/src/{checker,ir,emit_elf64,main}.c`, `include/zero.h` | Q-opt (done) | `bytesAsI8`/`i8` |
+| `conformance/native/{pass,fail}/mem-bytes-as-i8*.0` | Q-opt (done) | i8 primitive fixtures (2 pass + 1 bounds-fail) |
 
 ## Risks
 
@@ -374,9 +391,11 @@ load (`movsbl 0F BE`) vs `u8`'s zero-extend (`movzbl 0F B6`). Touch points (mapp
 2. **Token table: dequant-on-gather (proposed) vs runq's full-table dequant?** *Recommend
    on-gather* — identical numbers, no `vocab*dim` f32 buffer (37 MB → 524 MB saved), and the
    shared classifier still uses the quantized `q_tokens` for its matmul.
-3. **Q-opt now or later?** *Recommend later* — land correctness in pure Zero (Q1–Q5), then
-   add `bytesAsI8`/`i8` as a standalone primitive PR with its own fixtures. Decouples backend
-   risk from the model bring-up.
+3. **Q-opt now or later?** *Resolved — done.* Q1–Q5 landed first (pure-Zero correctness), then
+   `bytesAsI8`/`i8` landed on top with its own `mem-bytes-as-i8` fixtures, the `generate-argmax-q`
+   parity gate switched to it, and the example's weights+activations moved to `Span<i8>`/
+   `MutSpan<i8>`. Backend risk stayed decoupled: the f32 core and the pure-Zero quantized core
+   were never touched, and parity was re-confirmed after the swap.
 4. **First real model — TinyLlama-1.1B or 7B?** *Recommend TinyLlama-1.1B first*: it's the
    smallest real GQA model, so it both fits comfortably and is the first true `kv_mul > 1`
    test; 7B follows for the headline.
