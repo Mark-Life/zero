@@ -56,7 +56,7 @@ a clean error. From v0.1 phases:
 | D | Raw-byte `<0xNN>` decode (u8 span store) | Low* | Low-Med | Compiler | ✅ Done |
 | B | top-p / top-k sampling | Med-High | Medium | Pure Zero | ✅ Done |
 | F | Faster tokenizer lookup (no linear scan) | Low | Medium | Pure Zero | ✅ Done |
-| G | Real Llama-2 + int8 quantization | High | Large | Both | Backlog |
+| G | Real Llama-2 + int8 quantization | High | Large | Pure Zero | ✅ Done |
 | E | Cross-platform (macOS / Windows / ARM) | High | Med-Large | Compiler | Backlog |
 | H | SIMD / multi-threaded matmul (perf) | Medium | Large | Compiler | Backlog |
 | T | **Training** | High (risky) | **Very Large** | Both | Backlog (see deep-dive) |
@@ -241,6 +241,16 @@ string and asserts the token sequence; optionally a timing note in `validate.sh`
 ---
 
 # G. Real Llama-2 models + int8 quantization
+
+**✅ DONE 2026-05-22 (`feat/std-math-llama2`, commit `9f375db`) — pure Zero, no compiler
+change.** The int8 `runq.c` "version 2" path landed token-for-token vs `runq.c`, validated by
+the CI fixture `generate-argmax-q.0` against an independent `runq.c`-derived oracle on a tiny
+model that exercises GQA (`kv_mul=2`), multi-group quant (GS=2), and multi-layer striding; the
+f32 path is untouched and the format is auto-detected by magic number. Real-model *runs*
+(TinyLlama-1.1B, Llama-2-7B) are a documented one-time `export.py --version 2` step
+(`validate.sh` self-skips the int8 matrix when the exported model is absent). The optional
+`bytesAsI8` / `i8` compiler track (Q-opt) is **deferred** — a perf/cleanliness follow-up, not
+needed for parity. The sketch below is the original pre-implementation framing, kept for context.
 
 **Plan: [`quantization.md`](./quantization.md)** — full phased implementation plan. It
 supersedes this section's "Both / needs `bytesAsI8`" framing: the int8 path lands in **pure
