@@ -271,7 +271,7 @@ in CI.
 
 ### Q2 — quantized kernels (pure Zero, `ops.0`) — Medium
 `matmulQ`, `quantizeActs`, `dequantRow` + `QActs`/`QWeight`. **Acceptance:** split fixtures —
-`sampler-q-matmul.0` (matmulQ + sign-decode on a fixed tiny `(q,s)` weight and `i32`
+`ops-q-matmul.0` (matmulQ + sign-decode on a fixed tiny `(q,s)` weight and `i32`
 activation, hand-computed `ival`/`val`, **libm-free → CI**); `ops-q-quantize.0` (quantizeActs
 round-trip: quantize a known f32 vector, assert quants/scales, dequant within tolerance;
 `libm: true` for `floorf`/`absf`). Verify the round-half-away path against C `round()` on a
@@ -337,7 +337,7 @@ load (`movsbl 0F BE`) vs `u8`'s zero-extend (`movzbl 0F B6`). Touch points (mapp
 | `examples/llama2/validate.sh` | Q4 | fetch+build `runq.c`; quantized parity branch (self-skip if no q-model) |
 | `examples/llama2/README.md` | Q4/Q5 | export.py + quantized download/run/parity |
 | `conformance/native/pass/checkpoint-q-v2.0` | Q1 | loader fixture (CI) |
-| `conformance/native/pass/sampler-q-matmul.0` | Q2 | matmulQ + sign-decode (CI, libm-free) |
+| `conformance/native/pass/ops-q-matmul.0` | Q2 | matmulQ + sign-decode (CI, libm-free) |
 | `conformance/native/pass/ops-q-quantize.0` | Q2 | quantizeActs round-trip (libm) |
 | `conformance/native/pass/generate-argmax-q.0` | Q4 | end-to-end quantized token seq (libm) |
 | `conformance/run.mjs` | Q1/Q2/Q4 | fixture entries |

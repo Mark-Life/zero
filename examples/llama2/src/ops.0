@@ -1,14 +1,25 @@
 // llama2.zero — forward-pass math kernels.
 //
-// The five forward-pass primitives, ported one-to-one from `llama2.c`: RMSNorm,
-// matmul, softmax, RoPE, and the SwiGLU non-linearity. All are pure functions
-// over `Span<f32>` / `MutSpan<f32>` — dimensions are read from the span lengths,
-// so the caller (transformer.0) slices the right tensor view and the
+// The five f32 forward-pass primitives, ported one-to-one from `llama2.c`:
+// RMSNorm, matmul, softmax, RoPE, and the SwiGLU non-linearity. All are pure
+// functions over `Span<f32>` / `MutSpan<f32>` — dimensions are read from the span
+// lengths, so the caller (transformer.0) slices the right tensor view and the
 // kernel needs no separate size arguments. Weights arrive as the zero-copy
 // `Span<f32>` views built in checkpoint.0.
 //
-// Numerics track `llama2.c` exactly (same operation order, libm via std.math),
-// so a temperature-0 run reproduces the C token stream within libm ULPs.
+// Alongside them are three int8-quantized kernels (`matmulQ`, `quantizeActs`,
+// `dequantRow`), ported one-to-one from `runq.c`, used by the quantized forward
+// pass: a quantized matmul over int8 weights and int8 activations, a per-group
+// symmetric activation quantizer, and a single-row weight dequantizer (the token
+// embedding gather). They take an explicit group size `gs` because the
+// quantization groups span the matmul inner dimension. The int8 math is integer
+// up to a per-group f32 rescale, so it must reproduce `runq.c`'s operation order
+// bit-for-bit (see the notes on each).
+//
+// Numerics track `llama2.c` / `runq.c` exactly (same operation order, libm via
+// std.math), so a temperature-0 run reproduces the C token stream.
+
+use checkpoint
 
 // RMSNorm: output[j] = weights[j] * input[j] / sqrt(mean(input^2) + eps).
 // Mirrors `rmsnorm(o, x, weight, size)` with `size` taken from `input`. `eps`
@@ -129,6 +140,153 @@ pub fun swiglu(hb: MutSpan<f32>, hb2: Span<f32>) -> Void {
         let silu: f32 = v * sig
         let g: f32 = hb2[i]
         hb[i] = silu * g
+        i = i + 1
+    }
+}
+
+// Quantized-activation scratch, writable. Mirrors `runq.c`'s `QuantizedTensor`
+// for the activation side: `q` holds the signed int8 quants — kept here as i32,
+// one element per value with no byte packing, so the matmul reads them directly —
+// and `s` holds the f32 group scales (one per run of `group_size` quants). Filled
+// by `quantizeActs` and consumed by `matmulQ`. Lives in the run state, so both
+// fields are `MutSpan`.
+pub shape QActs {
+    q: MutSpan<i32>,
+    s: MutSpan<f32>,
+}
+
+// Reconstruct the signed value of an int8 weight byte. The quant bytes are stored
+// two's-complement, but there is no signed-8-bit load, so a raw `u8` in 0..255 is
+// mapped to its signed meaning -128..127 with arithmetic only (no bitwise ops):
+// for `uw` in 0..255, `uw / 128` is 1 exactly when the sign bit is set, so
+// subtracting `256` once in that case yields the signed value.
+fun decodeI8(qb: u8) -> i32 {
+    let uw: i32 = qb as i32
+    let sw: i32 = uw - 256 * (uw / 128)
+    return sw
+}
+
+// Round half away from zero, matching C's `round()` — used by the activation
+// quantizer because std.math has no `roundf`. For the quantizer's operating range
+// this is exact: the argument is `x / scale` with `scale = max(|x|) / 127`, so its
+// magnitude is at most 127, and a float at that magnitude has well over one
+// fractional mantissa bit, making `v + 0.5` (0.5 = 2^-1) exact and `floorf(v +
+// 0.5)` equal to `round((double) v)`. Negatives mirror through zero so the .5
+// boundary rounds away from zero (e.g. 2.5 -> 3, -2.5 -> -3), not toward even.
+fun roundHA(v: f32) -> i32 {
+    let half: f32 = 0.5
+    let zero: f32 = 0.0
+    if v >= zero {
+        let r: f32 = std.math.floorf(v + half)
+        return r as i32
+    }
+    let neg: f32 = zero - v
+    let r2: f32 = std.math.floorf(neg + half)
+    let ri: i32 = r2 as i32
+    return 0 - ri
+}
+
+// Quantized matmul: W (d, n) @ x (n,) -> out (d,), with both operands int8 and a
+// shared group size `gs`. `d = len(out)`, `n = len(x.q)`; weights hold d*n quants
+// (`w.q`) plus d*n/gs scales (`w.s`), activations hold n quants (`x.q`) plus n/gs
+// scales (`x.s`). Each output is a dot product accumulated as an exact int32 sum
+// of int8 products within a group, rescaled to f32 by that group's weight and
+// activation scales, summed over groups — the byte-for-byte port of `runq.c`'s
+// `matmul`. The per-group accumulate-then-rescale and the left-to-right float
+// multiply order (`(ival * w_scale) * x_scale`) are load-bearing for parity, as
+// is resetting the integer accumulator each group. `gs` must divide `n`.
+pub fun matmulQ(out: MutSpan<f32>, x: QActs, w: QWeight, gs: usize) -> Void {
+    let d: usize = std.mem.len(out)
+    let n: usize = std.mem.len(x.q)
+    let wq = w.q
+    let ws = w.s
+    let xq = x.q
+    let xs = x.s
+    let o = out
+    let mut i: usize = 0
+    while i < d {
+        let row: usize = i * n
+        let mut val: f32 = 0.0
+        let mut j: usize = 0
+        while j < n {
+            let mut ival: i32 = 0
+            let mut k: usize = 0
+            while k < gs {
+                let idx: usize = row + j + k
+                let xqv: i32 = xq[j + k]
+                let wsv: i32 = decodeI8(wq[idx])
+                ival = ival + xqv * wsv
+                k = k + 1
+            }
+            let wscale: f32 = ws[(row + j) / gs]
+            let xscale: f32 = xs[j / gs]
+            let ivalf: f32 = ival as f32
+            val = val + (ivalf * wscale) * xscale
+            j = j + gs
+        }
+        o[i] = val
+        i = i + 1
+    }
+}
+
+// Per-group symmetric activation quantizer (Q_MAX = 127), the port of `runq.c`'s
+// `quantize`. `n = len(x)`; `dst.q` receives n int8 quants (as i32), `dst.s`
+// receives n/gs f32 group scales. For each group the scale is `max(|x|) / 127`
+// over the group, and each value is quantized to `round(x / scale)` (round half
+// away from zero — see `roundHA`). No clamp is applied: `|x / scale| <= 127` by
+// construction, matching `runq.c`, which casts to int8 without clamping. `gs` must
+// divide `n`.
+pub fun quantizeActs(dst: QActs, x: Span<f32>, gs: usize) -> Void {
+    let n: usize = std.mem.len(x)
+    let dq = dst.q
+    let ds = dst.s
+    let q_max: f32 = 127.0
+    let num_groups: usize = n / gs
+    let mut g: usize = 0
+    while g < num_groups {
+        let gbase: usize = g * gs
+        let mut wmax: f32 = 0.0
+        let mut i: usize = 0
+        while i < gs {
+            let v: f32 = std.math.absf(x[gbase + i])
+            if v > wmax {
+                wmax = v
+            }
+            i = i + 1
+        }
+        // Matches runq.c exactly: a wmax==0 group yields scale 0 and a div-by-zero
+        // (inf/NaN quants). Real activation groups never have an all-zero run, so
+        // this path is unreachable in practice; left unguarded to preserve parity.
+        let scale: f32 = wmax / q_max
+        ds[g] = scale
+        let mut j: usize = 0
+        while j < gs {
+            let q: f32 = x[gbase + j] / scale
+            dq[gbase + j] = roundHA(q)
+            j = j + 1
+        }
+        g = g + 1
+    }
+}
+
+// Dequantize a single weight row: out[i] = decode(w.q[row*n + i]) * w.s[(row*n +
+// i) / gs] for i in 0..n. Used as the token-embedding gather — `runq.c`
+// dequantizes the whole vocab*dim token table to f32 at load, but the only row
+// needed per step is the embedded token's, so dequantizing on gather produces the
+// same numbers without the large f32 buffer. Same int8 sign-decode as the matmul.
+// `out` holds n elements; `gs` must divide `n`.
+pub fun dequantRow(out: MutSpan<f32>, w: QWeight, row: usize, n: usize, gs: usize) -> Void {
+    let wq = w.q
+    let ws = w.s
+    let o = out
+    let base: usize = row * n
+    let mut i: usize = 0
+    while i < n {
+        let idx: usize = base + i
+        let qv: i32 = decodeI8(wq[idx])
+        let qf: f32 = qv as f32
+        let scale: f32 = ws[idx / gs]
+        o[i] = qf * scale
         i = i + 1
     }
 }

@@ -185,3 +185,252 @@ pub fun expectedFileFloats(cfg: Config) -> usize {
     }
     return total
 }
+
+// ---------------------------------------------------------------------------
+// Quantized (int8) checkpoint format — the `runq.c` "version 2" layout.
+//
+// A second on-disk format that stores the matmul weights as int8 with per-group
+// f32 scales (a 4x size cut over f32), while keeping the 1-D rmsnorm weights in
+// f32. It is self-describing: a fixed 256-byte header carries a magic number, a
+// version, the same seven hyperparameters as the legacy header, an explicit
+// shared-classifier flag, and the quantization group size. The two formats are
+// told apart by the magic number, so a single reader can dispatch on it; the
+// legacy f32 path above is untouched.
+//
+// Header (256 bytes):
+//   off 0   u32  magic = 0x616b3432  ("ak42", little-endian on disk)
+//   off 4   i32  version = 2
+//   off 8   i32  dim
+//   off 12  i32  hidden_dim
+//   off 16  i32  n_layers
+//   off 20  i32  n_heads
+//   off 24  i32  n_kv_heads
+//   off 28  i32  vocab_size      (always positive; no sign trick)
+//   off 32  i32  seq_len
+//   off 36  u8   shared_classifier (1 => wcls aliases the token table)
+//   off 37  i32  group_size      (GS; quants are scaled per contiguous run of GS)
+//   off 41  ..   zero padding to 256
+//   off 256 ..   weight section
+//
+// Weight section: first the f32 rmsnorm groups (rms_att, rms_ffn, rms_final, in
+// that order — note this differs from the legacy file, which interleaves them),
+// then the quantized matmul tensors. Each logical weight is stored as one
+// QuantizedTensor per layer (a single tensor for the token table / classifier).
+// A QuantizedTensor of `size_each` elements is laid out quants-then-scales:
+//
+//   int8 q[size_each]              size_each bytes
+//   f32  s[size_each / GS]         (size_each / GS) * 4 bytes
+//   per-layer block bytes = size_each + (size_each / GS) * 4
+//
+// and a group's layers are stored back to back (`[L0.q L0.s][L1.q L1.s]...`), so
+// the per-layer stride is a byte stride, not an f32-element stride.
+
+// A single matrix's quantized weights, sliced zero-copy out of the mapped file:
+// the raw int8 quants kept as bytes (each byte holds a signed value in two's
+// complement; callers reconstruct the signed weight when they read it) and the
+// f32 group scales (one per run of `group_size` quants). Mirrors `runq.c`
+// `QuantizedTensor`.
+pub shape QWeight {
+    q: Span<u8>,
+    s: Span<f32>,
+}
+
+// Zero-copy description of a mapped v2 checkpoint's weight section. The f32
+// rmsnorm groups are exposed directly as `Span<f32>` views (sliced exactly like
+// the f32 path, but from byte 256 in the new front-loaded order). The quantized
+// matmul tensors are described by the byte offset of each group's first layer;
+// per-layer slicing into a `QWeight` happens at use time, recomputing the block
+// stride from the config and `gs` (every group's `size_each` is fully derivable,
+// so only the base offset needs storing). `bytes` and `gs` are retained so a
+// consumer can perform that slicing. `wclsBase` equals `qTokensBase` when the
+// classifier is shared, matching the f32 path's `wcls` aliasing.
+pub shape QuantizedWeights {
+    bytes: Span<u8>,
+    gs: usize,
+    rms_att: Span<f32>,
+    rms_ffn: Span<f32>,
+    rms_final: Span<f32>,
+    qTokensBase: usize,
+    wqBase: usize,
+    wkBase: usize,
+    wvBase: usize,
+    woBase: usize,
+    w1Base: usize,
+    w2Base: usize,
+    w3Base: usize,
+    wclsBase: usize,
+}
+
+// True iff the mapped file begins with the v2 quantized magic number
+// (`0x616b3432`, "ak42"). Lets a reader auto-detect the format and pick the
+// quantized path; a legacy f32 checkpoint starts with a small `dim` value and so
+// never collides. Assumes `bytes` holds at least 4 bytes.
+pub fun isQuantizedV2(bytes: Span<u8>) -> Bool {
+    let magic: u32 = 0x616b3432
+    let head: u32 = std.codec.readU32Le(bytes, 0)
+    return head == magic
+}
+
+// Read the seven hyperparameters from a v2 header and the explicit
+// shared-classifier flag. Unlike the legacy header, `vocab_size` is stored as a
+// plain positive integer and the shared flag is its own byte at offset 36 (the
+// reference's negative-`vocab_size` trick is gone). Reuses the shared `Config`
+// shape. Assumes `bytes` holds at least 37 bytes.
+pub fun readConfigV2(bytes: Span<u8>) -> Config {
+    let dim = std.codec.readI32Le(bytes, 8)
+    let hidden_dim = std.codec.readI32Le(bytes, 12)
+    let n_layers = std.codec.readI32Le(bytes, 16)
+    let n_heads = std.codec.readI32Le(bytes, 20)
+    let n_kv_heads = std.codec.readI32Le(bytes, 24)
+    let vocab = std.codec.readI32Le(bytes, 28)
+    let seq_len = std.codec.readI32Le(bytes, 32)
+
+    let shared_byte = bytes[36]
+    let mut shared = false
+    if shared_byte == 1 {
+        shared = true
+    }
+
+    return Config {
+        dim: dim,
+        hidden_dim: hidden_dim,
+        n_layers: n_layers,
+        n_heads: n_heads,
+        n_kv_heads: n_kv_heads,
+        vocab_size: vocab,
+        seq_len: seq_len,
+        shared_weights: shared
+    }
+}
+
+// The quantization group size (GS) from the header, as a `usize`. Weights are
+// scaled per contiguous run of GS quants, so the matmul walks its inner
+// dimension in steps of GS and indexes the scale array at `.../GS`. GS is chosen
+// at export so it divides every matmul inner dimension; read it, never hardcode
+// it. Assumes `bytes` holds at least 41 bytes.
+pub fun groupSize(bytes: Span<u8>) -> usize {
+    let gs = std.codec.readI32Le(bytes, 37)
+    return gs as usize
+}
+
+// Per-layer block size in bytes for a quantized group whose tensors each hold
+// `se` elements: `se` int8 quants followed by `se / gs` f32 scales. Used to step
+// from one layer's block to the next within a group.
+fun qBlockBytes(se: usize, gs: usize) -> usize {
+    return se + (se / gs) * 4
+}
+
+// Build the weight description from a mapped v2 checkpoint, walking the weight
+// section in the exact order of the format: the three f32 rmsnorm groups from
+// byte 256 (rms_att, rms_ffn, rms_final), then the quantized matmul tensors. The
+// rmsnorm groups are sliced into `Span<f32>` views; for each quantized group we
+// record the byte offset of its first layer's block and advance the cursor by
+// `count * per-layer-block`. When the classifier is shared, `wcls` reuses the
+// token table's base.
+pub fun mapWeightsQ(bytes: Span<u8>, cfg: Config, gs: usize) -> QuantizedWeights {
+    let dim = cfg.dim as usize
+    let hidden = cfg.hidden_dim as usize
+    let n_layers = cfg.n_layers as usize
+    let n_heads = cfg.n_heads as usize
+    let n_kv_heads = cfg.n_kv_heads as usize
+    let vocab = cfg.vocab_size as usize
+    let kv_dim = dim * n_kv_heads / n_heads
+
+    // f32 rmsnorm groups, contiguous from byte 256 in the v2 order.
+    let rms_count = n_layers * dim
+    let att_start: usize = 256
+    let att_end = att_start + rms_count * 4
+    let ffn_start = att_end
+    let ffn_end = ffn_start + rms_count * 4
+    let final_start = ffn_end
+    let final_end = final_start + dim * 4
+    let rms_att = std.mem.bytesAsF32(bytes[att_start..att_end])
+    let rms_ffn = std.mem.bytesAsF32(bytes[ffn_start..ffn_end])
+    let rms_final = std.mem.bytesAsF32(bytes[final_start..final_end])
+
+    // Per-group element counts (size_each) for the quantized tensors.
+    let q_tokens_se = vocab * dim
+    let wq_se = dim * dim
+    let wkv_se = dim * kv_dim
+    let wo_se = dim * dim
+    let w13_se = dim * hidden
+    let w2_se = hidden * dim
+
+    // Quantized section starts right after the rmsnorm groups; record each
+    // group's byte base, then advance by all of its layers.
+    let mut off = final_end
+
+    let q_tokens_base = off
+    off = off + qBlockBytes(q_tokens_se, gs)
+    let wq_base = off
+    off = off + n_layers * qBlockBytes(wq_se, gs)
+    let wk_base = off
+    off = off + n_layers * qBlockBytes(wkv_se, gs)
+    let wv_base = off
+    off = off + n_layers * qBlockBytes(wkv_se, gs)
+    let wo_base = off
+    off = off + n_layers * qBlockBytes(wo_se, gs)
+    let w1_base = off
+    off = off + n_layers * qBlockBytes(w13_se, gs)
+    let w2_base = off
+    off = off + n_layers * qBlockBytes(w2_se, gs)
+    let w3_base = off
+    off = off + n_layers * qBlockBytes(w13_se, gs)
+
+    let mut wcls_base = off
+    if cfg.shared_weights {
+        wcls_base = q_tokens_base
+    }
+
+    return QuantizedWeights {
+        bytes: bytes,
+        gs: gs,
+        rms_att: rms_att,
+        rms_ffn: rms_ffn,
+        rms_final: rms_final,
+        qTokensBase: q_tokens_base,
+        wqBase: wq_base,
+        wkBase: wk_base,
+        wvBase: wv_base,
+        woBase: wo_base,
+        w1Base: w1_base,
+        w2Base: w2_base,
+        w3Base: w3_base,
+        wclsBase: wcls_base
+    }
+}
+
+// Total byte length of a well-formed v2 checkpoint: the 256-byte header, the
+// three f32 rmsnorm groups, and every quantized group's blocks (each group's
+// per-layer block is `se + (se / gs) * 4`, summed over its layers), with the
+// classifier block present only when it is not shared. Mirrors
+// `expectedFileFloats`; used to validate a mapping's byte length against the
+// parsed header.
+pub fun expectedFileBytesQ(cfg: Config, gs: usize) -> usize {
+    let dim = cfg.dim as usize
+    let hidden = cfg.hidden_dim as usize
+    let n_layers = cfg.n_layers as usize
+    let n_heads = cfg.n_heads as usize
+    let n_kv_heads = cfg.n_kv_heads as usize
+    let vocab = cfg.vocab_size as usize
+    let kv_dim = dim * n_kv_heads / n_heads
+
+    let mut total: usize = 256
+    // f32 rmsnorm groups: rms_att, rms_ffn, rms_final.
+    total = total + n_layers * dim * 4
+    total = total + n_layers * dim * 4
+    total = total + dim * 4
+    // Quantized matmul groups.
+    total = total + qBlockBytes(vocab * dim, gs)
+    total = total + n_layers * qBlockBytes(dim * dim, gs)
+    total = total + n_layers * qBlockBytes(dim * kv_dim, gs)
+    total = total + n_layers * qBlockBytes(dim * kv_dim, gs)
+    total = total + n_layers * qBlockBytes(dim * dim, gs)
+    total = total + n_layers * qBlockBytes(dim * hidden, gs)
+    total = total + n_layers * qBlockBytes(hidden * dim, gs)
+    total = total + n_layers * qBlockBytes(dim * hidden, gs)
+    if cfg.shared_weights == false {
+        total = total + qBlockBytes(dim * vocab, gs)
+    }
+    return total
+}

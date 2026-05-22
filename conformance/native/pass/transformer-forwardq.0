@@ -1,0 +1,933 @@
+// llama2 int8 quantized forward pass — end-to-end runtime smoke.
+//
+// Self-contained sibling of transformer-forward.0 proving `forwardQ` runs to
+// completion at runtime over a complete, hand-authored "version 2" (runq.c) int8
+// checkpoint. Mirrors examples/llama2 (the checkpoint + ops shapes, the f32
+// kernels, the three int8 kernels, the v2 loaders, the quantized run state, and
+// `forwardQ`), shrunk to dim=4 / hidden=8 / 2 layers / 2 heads / 2 kv_heads /
+// vocab=4 / seq_len=8 / GS=2 (unshared classifier) — Q1's dims.
+//
+// Numeric parity vs a runq.c reference is a separate, heavier check; this is a
+// smoke. It runs two decoder steps (token 2 at pos 0, then token 1 at pos 1 —
+// exercising the KV cache across positions) and asserts the resulting logits are
+// (1) all finite, (2) nonzero in aggregate, and (3) deterministic — a fresh run
+// state fed the same (token, pos) yields identical logits. Needs libm (the
+// kernels call sqrtf/expf/cosf/sinf/powf/floorf/absf), so it is registered with
+// `libm: true`.
+
+// ---- shapes (ports of examples/llama2/src/checkpoint.0 + ops.0 + transformer.0) ----
+
+// Hyperparameters from the v2 header.
+shape Config {
+    dim: i32,
+    hidden_dim: i32,
+    n_layers: i32,
+    n_heads: i32,
+    n_kv_heads: i32,
+    vocab_size: i32,
+    seq_len: i32,
+    shared_weights: Bool,
+}
+
+// One matrix's int8 quants (raw bytes, two's complement) plus the f32 group scales.
+shape QWeight {
+    q: Span<u8>,
+    s: Span<f32>,
+}
+
+// Zero-copy description of a mapped v2 weight section: the f32 rmsnorm views plus
+// each quantized group's byte base (per-layer slicing recomputes the block stride
+// from the config + gs).
+shape QuantizedWeights {
+    bytes: Span<u8>,
+    gs: usize,
+    rms_att: Span<f32>,
+    rms_ffn: Span<f32>,
+    rms_final: Span<f32>,
+    qTokensBase: usize,
+    wqBase: usize,
+    wkBase: usize,
+    wvBase: usize,
+    woBase: usize,
+    w1Base: usize,
+    w2Base: usize,
+    w3Base: usize,
+    wclsBase: usize,
+}
+
+// Quantized-activation scratch: signed int8 quants kept as i32 plus f32 scales.
+shape QActs {
+    q: MutSpan<i32>,
+    s: MutSpan<f32>,
+}
+
+// Forward-pass activations + KV cache + quantized-activation scratch, as 4-byte
+// element offsets into one zeroed byte region.
+shape RunState {
+    base: MutSpan<u8>,
+    x_off: usize,
+    xb_off: usize,
+    xb2_off: usize,
+    hb_off: usize,
+    hb2_off: usize,
+    q_off: usize,
+    att_off: usize,
+    logits_off: usize,
+    key_off: usize,
+    value_off: usize,
+    xq_off: usize,
+    xqs_off: usize,
+    hq_off: usize,
+    hqs_off: usize,
+}
+
+// ---- f32 kernels (ports of examples/llama2/src/ops.0) ----
+
+fun rmsnorm(output: MutSpan<f32>, input: Span<f32>, weights: Span<f32>, eps: f32) -> Void {
+    let n: usize = std.mem.len(input)
+    let mut ss: f32 = 0.0
+    let mut i: usize = 0
+    while i < n {
+        let v: f32 = input[i]
+        ss = ss + v * v
+        i = i + 1
+    }
+    let nf: f32 = (n as i32) as f32
+    ss = ss / nf
+    ss = ss + eps
+    let inv: f32 = 1.0 / std.math.sqrtf(ss)
+    let mut j: usize = 0
+    while j < n {
+        output[j] = weights[j] * (inv * input[j])
+        j = j + 1
+    }
+}
+
+fun softmax(x: MutSpan<f32>) -> Void {
+    let n: usize = std.mem.len(x)
+    let mut maxv: f32 = x[0]
+    let mut i: usize = 1
+    while i < n {
+        if x[i] > maxv {
+            maxv = x[i]
+        }
+        i = i + 1
+    }
+    let mut sum: f32 = 0.0
+    let mut j: usize = 0
+    while j < n {
+        let e: f32 = std.math.expf(x[j] - maxv)
+        x[j] = e
+        sum = sum + e
+        j = j + 1
+    }
+    let mut k: usize = 0
+    while k < n {
+        x[k] = x[k] / sum
+        k = k + 1
+    }
+}
+
+fun rope(vec: MutSpan<f32>, pos: i32, head_size: usize) -> Void {
+    let n: usize = std.mem.len(vec)
+    let posf: f32 = pos as f32
+    let hsf: f32 = (head_size as i32) as f32
+    let base: f32 = 10000.0
+    let mut i: usize = 0
+    while i < n {
+        let head_dim: usize = i % head_size
+        let hd: f32 = (head_dim as i32) as f32
+        let exponent: f32 = hd / hsf
+        let denom: f32 = std.math.powf(base, exponent)
+        let freq: f32 = 1.0 / denom
+        let val: f32 = posf * freq
+        let fcr: f32 = std.math.cosf(val)
+        let fci: f32 = std.math.sinf(val)
+        let i1: usize = i + 1
+        let v0: f32 = vec[i]
+        let v1: f32 = vec[i1]
+        vec[i] = v0 * fcr - v1 * fci
+        vec[i1] = v0 * fci + v1 * fcr
+        i = i + 2
+    }
+}
+
+fun swiglu(hb: MutSpan<f32>, hb2: Span<f32>) -> Void {
+    let n: usize = std.mem.len(hb)
+    let mut i: usize = 0
+    while i < n {
+        let v: f32 = hb[i]
+        let negv: f32 = 0.0 - v
+        let e: f32 = std.math.expf(negv)
+        let denom: f32 = 1.0 + e
+        let sig: f32 = 1.0 / denom
+        let silu: f32 = v * sig
+        let g: f32 = hb2[i]
+        hb[i] = silu * g
+        i = i + 1
+    }
+}
+
+// ---- int8 kernels (ports of examples/llama2/src/ops.0) ----
+
+// Reconstruct the signed value of an int8 weight byte (two's complement) with
+// arithmetic only: for `uw` in 0..255, `uw / 128` is 1 exactly when the sign bit
+// is set, so subtracting 256 once in that case yields the signed value.
+fun decodeI8(qb: u8) -> i32 {
+    let uw: i32 = qb as i32
+    let sw: i32 = uw - 256 * (uw / 128)
+    return sw
+}
+
+// Round half away from zero, matching C round() (std.math has no roundf).
+fun roundHA(v: f32) -> i32 {
+    let half: f32 = 0.5
+    let zero: f32 = 0.0
+    if v >= zero {
+        let r: f32 = std.math.floorf(v + half)
+        return r as i32
+    }
+    let neg: f32 = zero - v
+    let r2: f32 = std.math.floorf(neg + half)
+    let ri: i32 = r2 as i32
+    return 0 - ri
+}
+
+// Quantized matmul: W (d, n) @ x (n,) -> out (d,), both operands int8, group gs.
+fun matmulQ(out: MutSpan<f32>, x: QActs, w: QWeight, gs: usize) -> Void {
+    let d: usize = std.mem.len(out)
+    let n: usize = std.mem.len(x.q)
+    let wq = w.q
+    let ws = w.s
+    let xq = x.q
+    let xs = x.s
+    let o = out
+    let mut i: usize = 0
+    while i < d {
+        let row: usize = i * n
+        let mut val: f32 = 0.0
+        let mut j: usize = 0
+        while j < n {
+            let mut ival: i32 = 0
+            let mut k: usize = 0
+            while k < gs {
+                let idx: usize = row + j + k
+                let xqv: i32 = xq[j + k]
+                let wsv: i32 = decodeI8(wq[idx])
+                ival = ival + xqv * wsv
+                k = k + 1
+            }
+            let wscale: f32 = ws[(row + j) / gs]
+            let xscale: f32 = xs[j / gs]
+            let ivalf: f32 = ival as f32
+            val = val + (ivalf * wscale) * xscale
+            j = j + gs
+        }
+        o[i] = val
+        i = i + 1
+    }
+}
+
+// Per-group symmetric activation quantizer (Q_MAX = 127), port of runq.c quantize.
+fun quantizeActs(dst: QActs, x: Span<f32>, gs: usize) -> Void {
+    let n: usize = std.mem.len(x)
+    let dq = dst.q
+    let ds = dst.s
+    let q_max: f32 = 127.0
+    let num_groups: usize = n / gs
+    let mut g: usize = 0
+    while g < num_groups {
+        let gbase: usize = g * gs
+        let mut wmax: f32 = 0.0
+        let mut i: usize = 0
+        while i < gs {
+            let v: f32 = std.math.absf(x[gbase + i])
+            if v > wmax {
+                wmax = v
+            }
+            i = i + 1
+        }
+        let scale: f32 = wmax / q_max
+        ds[g] = scale
+        let mut j: usize = 0
+        while j < gs {
+            let q: f32 = x[gbase + j] / scale
+            dq[gbase + j] = roundHA(q)
+            j = j + 1
+        }
+        g = g + 1
+    }
+}
+
+// Dequantize a single weight row (the token-embedding gather).
+fun dequantRow(out: MutSpan<f32>, w: QWeight, row: usize, n: usize, gs: usize) -> Void {
+    let wq = w.q
+    let ws = w.s
+    let o = out
+    let base: usize = row * n
+    let mut i: usize = 0
+    while i < n {
+        let idx: usize = base + i
+        let qv: i32 = decodeI8(wq[idx])
+        let qf: f32 = qv as f32
+        let scale: f32 = ws[idx / gs]
+        o[i] = qf * scale
+        i = i + 1
+    }
+}
+
+// ---- v2 loaders (ports of examples/llama2/src/checkpoint.0) ----
+
+fun readConfigV2(bytes: Span<u8>) -> Config {
+    let dim = std.codec.readI32Le(bytes, 8)
+    let hidden_dim = std.codec.readI32Le(bytes, 12)
+    let n_layers = std.codec.readI32Le(bytes, 16)
+    let n_heads = std.codec.readI32Le(bytes, 20)
+    let n_kv_heads = std.codec.readI32Le(bytes, 24)
+    let vocab = std.codec.readI32Le(bytes, 28)
+    let seq_len = std.codec.readI32Le(bytes, 32)
+
+    let shared_byte = bytes[36]
+    let mut shared = false
+    if shared_byte == 1 {
+        shared = true
+    }
+
+    return Config {
+        dim: dim,
+        hidden_dim: hidden_dim,
+        n_layers: n_layers,
+        n_heads: n_heads,
+        n_kv_heads: n_kv_heads,
+        vocab_size: vocab,
+        seq_len: seq_len,
+        shared_weights: shared
+    }
+}
+
+fun groupSize(bytes: Span<u8>) -> usize {
+    let gs = std.codec.readI32Le(bytes, 37)
+    return gs as usize
+}
+
+fun qBlockBytes(se: usize, gs: usize) -> usize {
+    return se + (se / gs) * 4
+}
+
+fun mapWeightsQ(bytes: Span<u8>, cfg: Config, gs: usize) -> QuantizedWeights {
+    let dim = cfg.dim as usize
+    let hidden = cfg.hidden_dim as usize
+    let n_layers = cfg.n_layers as usize
+    let n_heads = cfg.n_heads as usize
+    let n_kv_heads = cfg.n_kv_heads as usize
+    let vocab = cfg.vocab_size as usize
+    let kv_dim = dim * n_kv_heads / n_heads
+
+    let rms_count = n_layers * dim
+    let att_start: usize = 256
+    let att_end = att_start + rms_count * 4
+    let ffn_start = att_end
+    let ffn_end = ffn_start + rms_count * 4
+    let final_start = ffn_end
+    let final_end = final_start + dim * 4
+    let rms_att = std.mem.bytesAsF32(bytes[att_start..att_end])
+    let rms_ffn = std.mem.bytesAsF32(bytes[ffn_start..ffn_end])
+    let rms_final = std.mem.bytesAsF32(bytes[final_start..final_end])
+
+    let q_tokens_se = vocab * dim
+    let wq_se = dim * dim
+    let wkv_se = dim * kv_dim
+    let wo_se = dim * dim
+    let w13_se = dim * hidden
+    let w2_se = hidden * dim
+
+    let mut off = final_end
+
+    let q_tokens_base = off
+    off = off + qBlockBytes(q_tokens_se, gs)
+    let wq_base = off
+    off = off + n_layers * qBlockBytes(wq_se, gs)
+    let wk_base = off
+    off = off + n_layers * qBlockBytes(wkv_se, gs)
+    let wv_base = off
+    off = off + n_layers * qBlockBytes(wkv_se, gs)
+    let wo_base = off
+    off = off + n_layers * qBlockBytes(wo_se, gs)
+    let w1_base = off
+    off = off + n_layers * qBlockBytes(w13_se, gs)
+    let w2_base = off
+    off = off + n_layers * qBlockBytes(w2_se, gs)
+    let w3_base = off
+    off = off + n_layers * qBlockBytes(w13_se, gs)
+
+    let mut wcls_base = off
+    if cfg.shared_weights {
+        wcls_base = q_tokens_base
+    }
+
+    return QuantizedWeights {
+        bytes: bytes,
+        gs: gs,
+        rms_att: rms_att,
+        rms_ffn: rms_ffn,
+        rms_final: rms_final,
+        qTokensBase: q_tokens_base,
+        wqBase: wq_base,
+        wkBase: wk_base,
+        wvBase: wv_base,
+        woBase: wo_base,
+        w1Base: w1_base,
+        w2Base: w2_base,
+        w3Base: w3_base,
+        wclsBase: wcls_base
+    }
+}
+
+// ---- quantized run state + forwardQ (ports of examples/llama2/src/transformer.0) ----
+
+fun kvDim(cfg: Config) -> usize {
+    let dim = cfg.dim as usize
+    let n_heads = cfg.n_heads as usize
+    let n_kv_heads = cfg.n_kv_heads as usize
+    return dim * n_kv_heads / n_heads
+}
+
+fun runStateFloats(cfg: Config) -> usize {
+    let dim = cfg.dim as usize
+    let hidden = cfg.hidden_dim as usize
+    let n_layers = cfg.n_layers as usize
+    let n_heads = cfg.n_heads as usize
+    let vocab = cfg.vocab_size as usize
+    let seq_len = cfg.seq_len as usize
+    let kv_dim = kvDim(cfg)
+    let cache = n_layers * seq_len * kv_dim
+    let mut total: usize = 0
+    total = total + dim
+    total = total + dim
+    total = total + dim
+    total = total + hidden
+    total = total + hidden
+    total = total + dim
+    total = total + n_heads * seq_len
+    total = total + vocab
+    total = total + cache
+    total = total + cache
+    return total
+}
+
+fun runStateFloatsQ(cfg: Config, gs: usize) -> usize {
+    let dim = cfg.dim as usize
+    let hidden = cfg.hidden_dim as usize
+    let mut total: usize = runStateFloats(cfg)
+    total = total + dim
+    total = total + dim / gs
+    total = total + hidden
+    total = total + hidden / gs
+    return total
+}
+
+fun mallocRunStateQ(base: MutSpan<u8>, cfg: Config, gs: usize) -> RunState {
+    let dim = cfg.dim as usize
+    let hidden = cfg.hidden_dim as usize
+    let n_layers = cfg.n_layers as usize
+    let n_heads = cfg.n_heads as usize
+    let vocab = cfg.vocab_size as usize
+    let seq_len = cfg.seq_len as usize
+    let kv_dim = kvDim(cfg)
+    let cache = n_layers * seq_len * kv_dim
+
+    let mut off: usize = 0
+    let x_off = off
+    off = off + dim
+    let xb_off = off
+    off = off + dim
+    let xb2_off = off
+    off = off + dim
+    let hb_off = off
+    off = off + hidden
+    let hb2_off = off
+    off = off + hidden
+    let q_off = off
+    off = off + dim
+    let att_off = off
+    off = off + n_heads * seq_len
+    let logits_off = off
+    off = off + vocab
+    let key_off = off
+    off = off + cache
+    let value_off = off
+    off = off + cache
+    let xq_off = off
+    off = off + dim
+    let xqs_off = off
+    off = off + dim / gs
+    let hq_off = off
+    off = off + hidden
+    let hqs_off = off
+    off = off + hidden / gs
+
+    return RunState {
+        base: base,
+        x_off: x_off,
+        xb_off: xb_off,
+        xb2_off: xb2_off,
+        hb_off: hb_off,
+        hb2_off: hb2_off,
+        q_off: q_off,
+        att_off: att_off,
+        logits_off: logits_off,
+        key_off: key_off,
+        value_off: value_off,
+        xq_off: xq_off,
+        xqs_off: xqs_off,
+        hq_off: hq_off,
+        hqs_off: hqs_off
+    }
+}
+
+fun view(base: MutSpan<u8>, off: usize, count: usize) -> MutSpan<f32> {
+    let start = off * 4
+    let end = start + count * 4
+    return std.mem.bytesAsMutF32(base[start..end])
+}
+
+fun viewI32(base: MutSpan<u8>, off: usize, count: usize) -> MutSpan<i32> {
+    let start = off * 4
+    let end = start + count * 4
+    return std.mem.bytesAsMutI32(base[start..end])
+}
+
+fun logitsOf(s: RunState, cfg: Config) -> MutSpan<f32> {
+    let base = s.base
+    let vocab = cfg.vocab_size as usize
+    return view(base, s.logits_off, vocab)
+}
+
+// Slice one layer's int8 weights out of a quantized group into a QWeight.
+fun layerQWeight(qw: QuantizedWeights, base: usize, se: usize, l: usize) -> QWeight {
+    let bytes = qw.bytes
+    let gs = qw.gs
+    let n_scales = se / gs
+    let block = se + n_scales * 4
+    let qstart = base + l * block
+    let qend = qstart + se
+    let sstart = qend
+    let send = sstart + n_scales * 4
+    let qbytes = bytes[qstart..qend]
+    let sbytes = bytes[sstart..send]
+    let sf32 = std.mem.bytesAsF32(sbytes)
+    return QWeight {
+        q: qbytes,
+        s: sf32
+    }
+}
+
+// int8 quantized forward — mirror of forward with quantize-then-matmulQ at each
+// matmul site; everything else is f32 and identical to the f32 forward.
+fun forwardQ(cfg: Config, qw: QuantizedWeights, s: RunState, token: i32, pos: i32) -> Void {
+    let dim = cfg.dim as usize
+    let hidden = cfg.hidden_dim as usize
+    let n_layers = cfg.n_layers as usize
+    let n_heads = cfg.n_heads as usize
+    let n_kv_heads = cfg.n_kv_heads as usize
+    let vocab = cfg.vocab_size as usize
+    let seq_len = cfg.seq_len as usize
+    let kv_dim = kvDim(cfg)
+    let kv_mul = n_heads / n_kv_heads
+    let head_size = dim / n_heads
+    let eps: f32 = 0.00001
+    let posu = pos as usize
+    let cache = n_layers * seq_len * kv_dim
+
+    let gs = qw.gs
+    let bytes = qw.bytes
+    let base = s.base
+
+    let q_tokens_se = vocab * dim
+    let wq_se = dim * dim
+    let wkv_se = dim * kv_dim
+    let wo_se = dim * dim
+    let w13_se = dim * hidden
+    let w2_se = hidden * dim
+    let wcls_se = dim * vocab
+
+    let rms_att = qw.rms_att
+    let rms_ffn = qw.rms_ffn
+    let rms_final = qw.rms_final
+
+    let xq_q = viewI32(base, s.xq_off, dim)
+    let xq_s = view(base, s.xqs_off, dim / gs)
+    let xq = QActs {
+        q: xq_q,
+        s: xq_s
+    }
+    let hq_q = viewI32(base, s.hq_off, hidden)
+    let hq_s = view(base, s.hqs_off, hidden / gs)
+    let hq = QActs {
+        q: hq_q,
+        s: hq_s
+    }
+
+    let x = view(base, s.x_off, dim)
+    let tokW = layerQWeight(qw, qw.qTokensBase, q_tokens_se, 0)
+    dequantRow(x, tokW, token as usize, dim, gs)
+
+    let sqrt_hs = std.math.sqrtf((head_size as i32) as f32)
+
+    let mut l: usize = 0
+    while l < n_layers {
+        let loff = l * seq_len * kv_dim
+
+        let xb = view(base, s.xb_off, dim)
+        let xb2 = view(base, s.xb2_off, dim)
+        let q = view(base, s.q_off, dim)
+        let hb = view(base, s.hb_off, hidden)
+        let hb2 = view(base, s.hb2_off, hidden)
+        let att = view(base, s.att_off, n_heads * seq_len)
+        let kc = view(base, s.key_off, cache)
+        let vc = view(base, s.value_off, cache)
+        let k_off = s.key_off + loff + posu * kv_dim
+        let v_off = s.value_off + loff + posu * kv_dim
+        let k = view(base, k_off, kv_dim)
+        let v = view(base, v_off, kv_dim)
+
+        let ra_lo = l * dim
+        let ra_hi = ra_lo + dim
+        let ra = rms_att[ra_lo..ra_hi]
+        rmsnorm(xb, x, ra, eps)
+
+        quantizeActs(xq, xb, gs)
+        let wqL = layerQWeight(qw, qw.wqBase, wq_se, l)
+        matmulQ(q, xq, wqL, gs)
+
+        let wkL = layerQWeight(qw, qw.wkBase, wkv_se, l)
+        matmulQ(k, xq, wkL, gs)
+
+        let wvL = layerQWeight(qw, qw.wvBase, wkv_se, l)
+        matmulQ(v, xq, wvL, gs)
+
+        rope(q, pos, head_size)
+        rope(k, pos, head_size)
+
+        let mut h: usize = 0
+        while h < n_heads {
+            let qoff = h * head_size
+            let aoff = h * seq_len
+            let kvh = (h / kv_mul) * head_size
+
+            let mut t: usize = 0
+            while t <= posu {
+                let kbase = loff + t * kv_dim + kvh
+                let mut score: f32 = 0.0
+                let mut i: usize = 0
+                while i < head_size {
+                    let qi = qoff + i
+                    let ki = kbase + i
+                    score = score + q[qi] * kc[ki]
+                    i = i + 1
+                }
+                score = score / sqrt_hs
+                att[aoff + t] = score
+                t = t + 1
+            }
+
+            let sm_lo = aoff
+            let sm_hi = aoff + posu + 1
+            let att_h = att[sm_lo..sm_hi]
+            softmax(att_h)
+
+            let mut z: usize = 0
+            while z < head_size {
+                xb[qoff + z] = 0.0
+                z = z + 1
+            }
+            let mut t2: usize = 0
+            while t2 <= posu {
+                let vbase = loff + t2 * kv_dim + kvh
+                let a = att[aoff + t2]
+                let mut i2: usize = 0
+                while i2 < head_size {
+                    let xi = qoff + i2
+                    let vi = vbase + i2
+                    xb[xi] = xb[xi] + a * vc[vi]
+                    i2 = i2 + 1
+                }
+                t2 = t2 + 1
+            }
+            h = h + 1
+        }
+
+        quantizeActs(xq, xb, gs)
+        let woL = layerQWeight(qw, qw.woBase, wo_se, l)
+        matmulQ(xb2, xq, woL, gs)
+        let mut r1: usize = 0
+        while r1 < dim {
+            x[r1] = x[r1] + xb2[r1]
+            r1 = r1 + 1
+        }
+
+        let rf_lo = l * dim
+        let rf_hi = rf_lo + dim
+        let rf = rms_ffn[rf_lo..rf_hi]
+        rmsnorm(xb, x, rf, eps)
+
+        quantizeActs(xq, xb, gs)
+        let w1L = layerQWeight(qw, qw.w1Base, w13_se, l)
+        matmulQ(hb, xq, w1L, gs)
+        let w3L = layerQWeight(qw, qw.w3Base, w13_se, l)
+        matmulQ(hb2, xq, w3L, gs)
+        swiglu(hb, hb2)
+        quantizeActs(hq, hb, gs)
+        let w2L = layerQWeight(qw, qw.w2Base, w2_se, l)
+        matmulQ(xb, hq, w2L, gs)
+
+        let mut r2: usize = 0
+        while r2 < dim {
+            x[r2] = x[r2] + xb[r2]
+            r2 = r2 + 1
+        }
+
+        l = l + 1
+    }
+
+    rmsnorm(x, x, rms_final, eps)
+    let logits = view(base, s.logits_off, vocab)
+    quantizeActs(xq, x, gs)
+    let wclsL = layerQWeight(qw, qw.wclsBase, wcls_se, 0)
+    matmulQ(logits, xq, wclsL, gs)
+}
+
+// ---- hand-authored tiny v2 model ----
+
+// Deterministic nonzero int8 quant byte (signed value cycles through -3..3 so no
+// group degenerates to all-zero and the per-group scale is well-defined).
+fun quantByte(i: usize) -> u8 {
+    let m: usize = i % 7
+    let mi: i32 = m as i32
+    let sv: i32 = mi - 3
+    let uv: i32 = sv + 256 * (sv / 128)
+    return uv as u8
+}
+
+// Deterministic positive nonzero scale in [0.02, 0.09].
+fun scaleVal(i: usize) -> f32 {
+    let m: usize = i % 8
+    let mf: f32 = (m as i32) as f32
+    let bias: f32 = 0.02
+    let step: f32 = 0.01
+    return bias + mf * step
+}
+
+// Deterministic rmsnorm weight near 1.0 (so rmsnorm neither zeroes nor explodes).
+fun rmsVal(i: usize) -> f32 {
+    let m: usize = i % 3
+    let mf: f32 = (m as i32) as f32
+    let one: f32 = 1.0
+    let step: f32 = 0.05
+    return one + mf * step
+}
+
+// Fill `count` quant bytes from `off` with quantByte.
+fun fillQuants(buf: MutSpan<u8>, off: usize, count: usize) -> Void {
+    let mut i: usize = 0
+    while i < count {
+        buf[off + i] = quantByte(i)
+        i = i + 1
+    }
+}
+
+// Fill `count` f32 scales starting at byte offset `boff` with scaleVal.
+fun fillScales(buf: MutSpan<u8>, boff: usize, count: usize) -> Void {
+    let bend = boff + count * 4
+    let view32 = std.mem.bytesAsMutF32(buf[boff..bend])
+    let mut i: usize = 0
+    while i < count {
+        view32[i] = scaleVal(i)
+        i = i + 1
+    }
+}
+
+// Fill one quantized group (count layers, se elements each) at byte base `base`.
+fun fillGroup(buf: MutSpan<u8>, base: usize, se: usize, gs: usize, layers: usize) -> Void {
+    let n_scales = se / gs
+    let block = se + n_scales * 4
+    let mut l: usize = 0
+    while l < layers {
+        let qoff = base + l * block
+        fillQuants(buf, qoff, se)
+        let soff = qoff + se
+        fillScales(buf, soff, n_scales)
+        l = l + 1
+    }
+}
+
+// Fill `count` f32 rmsnorm weights starting at byte offset `boff` with rmsVal.
+fun fillRms(buf: MutSpan<u8>, boff: usize, count: usize) -> Void {
+    let bend = boff + count * 4
+    let view32 = std.mem.bytesAsMutF32(buf[boff..bend])
+    let mut i: usize = 0
+    while i < count {
+        view32[i] = rmsVal(i)
+        i = i + 1
+    }
+}
+
+// Compare two logit spans for exact equality (determinism check).
+fun sameLogits(a: Span<f32>, b: Span<f32>, n: usize) -> Bool {
+    let mut ok = true
+    let mut i: usize = 0
+    while i < n {
+        if a[i] != b[i] {
+            ok = false
+        }
+        i = i + 1
+    }
+    return ok
+}
+
+pub fun main(world: World) -> Void raises {
+    // Tiny v2 config: dim=4, hidden=8, 2 layers, 2 heads, 2 kv_heads, vocab=4,
+    // seq_len=8, GS=2, unshared. kv_dim = 4, head_size = 2; total file = 1392 bytes.
+    let dim: usize = 4
+    let hidden: usize = 8
+    let n_layers: usize = 2
+    let vocab: usize = 4
+    let gs: usize = 2
+    let file_bytes: usize = 1392
+
+    let alloc = std.mem.pageAlloc()
+    let region = std.mem.allocBytes(alloc, file_bytes)
+    if region.has == false {
+        return
+    }
+    let buf: MutSpan<u8> = region.value
+
+    // Header: nine 4-byte-aligned i32 slots (bytes 0..36) — magic, version, dim,
+    // hidden, layers, heads, kv_heads, vocab, seq_len — then the shared byte (36)
+    // and the group_size i32 at unaligned byte 37 (GS=2 fits in the low byte).
+    let hdr = std.mem.bytesAsMutI32(buf[0..36])
+    hdr[0] = 0x616b3432
+    hdr[1] = 2
+    hdr[2] = 4
+    hdr[3] = 8
+    hdr[4] = 2
+    hdr[5] = 2
+    hdr[6] = 2
+    hdr[7] = 4
+    hdr[8] = 8
+    buf[36] = 0
+    buf[37] = 2
+    buf[38] = 0
+    buf[39] = 0
+    buf[40] = 0
+
+    // f32 rmsnorm groups from byte 256: rms_att (n_layers*dim=8), rms_ffn (8),
+    // rms_final (dim=4).
+    let rms_count = n_layers * dim
+    let att_boff: usize = 256
+    fillRms(buf, att_boff, rms_count)
+    let ffn_boff = att_boff + rms_count * 4
+    fillRms(buf, ffn_boff, rms_count)
+    let final_boff = ffn_boff + rms_count * 4
+    fillRms(buf, final_boff, dim)
+
+    // Quantized groups, walked in format order from right after the rmsnorm block.
+    let kv_dim: usize = 4
+    let q_tokens_se = vocab * dim
+    let wq_se = dim * dim
+    let wkv_se = dim * kv_dim
+    let wo_se = dim * dim
+    let w13_se = dim * hidden
+    let w2_se = hidden * dim
+
+    let mut off = final_boff + dim * 4
+    fillGroup(buf, off, q_tokens_se, gs, 1)
+    off = off + qBlockBytes(q_tokens_se, gs)
+    fillGroup(buf, off, wq_se, gs, n_layers)
+    off = off + n_layers * qBlockBytes(wq_se, gs)
+    fillGroup(buf, off, wkv_se, gs, n_layers)
+    off = off + n_layers * qBlockBytes(wkv_se, gs)
+    fillGroup(buf, off, wkv_se, gs, n_layers)
+    off = off + n_layers * qBlockBytes(wkv_se, gs)
+    fillGroup(buf, off, wo_se, gs, n_layers)
+    off = off + n_layers * qBlockBytes(wo_se, gs)
+    fillGroup(buf, off, w13_se, gs, n_layers)
+    off = off + n_layers * qBlockBytes(w13_se, gs)
+    fillGroup(buf, off, w2_se, gs, n_layers)
+    off = off + n_layers * qBlockBytes(w2_se, gs)
+    fillGroup(buf, off, w13_se, gs, n_layers)
+    off = off + n_layers * qBlockBytes(w13_se, gs)
+    // wcls (unshared): one tensor of se = dim*vocab.
+    let wcls_se = dim * vocab
+    fillGroup(buf, off, wcls_se, gs, 1)
+
+    // Parse it back through the real loaders.
+    let bytes: Span<u8> = buf
+    let cfg = readConfigV2(bytes)
+    let gs_read = groupSize(bytes)
+    let qw = mapWeightsQ(bytes, cfg, gs_read)
+
+    // First run state: two decoder steps across positions to exercise the KV cache.
+    let rs_floats = runStateFloatsQ(cfg, gs_read)
+    let rs_byte_need = rs_floats * 4
+    let rs_region = std.mem.allocBytes(alloc, rs_byte_need)
+    if rs_region.has == false {
+        return
+    }
+    let rs_base: MutSpan<u8> = rs_region.value
+    let state = mallocRunStateQ(rs_base, cfg, gs_read)
+
+    forwardQ(cfg, qw, state, 2, 0)
+    forwardQ(cfg, qw, state, 1, 1)
+    let logits = logitsOf(state, cfg)
+
+    // All logits finite (not NaN, within a large finite bound) and nonzero in
+    // aggregate (at least one differs from 0).
+    let bound: f32 = 1000000.0
+    let mut allFinite = true
+    let mut anyNonzero = false
+    let mut i: usize = 0
+    while i < vocab {
+        let v: f32 = logits[i]
+        let isNan: Bool = std.math.isNaNf(v)
+        let tooBig: Bool = v > bound || v < (0.0 - bound)
+        if isNan {
+            allFinite = false
+        }
+        if tooBig {
+            allFinite = false
+        }
+        if v != 0.0 {
+            anyNonzero = true
+        }
+        i = i + 1
+    }
+
+    // Determinism: two fresh, zeroed run states fed the same first step (token 2 at
+    // pos 0) must produce identical logits.
+    let rs_region2 = std.mem.allocBytes(alloc, rs_byte_need)
+    if rs_region2.has == false {
+        return
+    }
+    let rs_base2: MutSpan<u8> = rs_region2.value
+    let state2 = mallocRunStateQ(rs_base2, cfg, gs_read)
+    forwardQ(cfg, qw, state2, 2, 0)
+    let logits2 = logitsOf(state2, cfg)
+
+    let rs_region3 = std.mem.allocBytes(alloc, rs_byte_need)
+    if rs_region3.has == false {
+        return
+    }
+    let rs_base3: MutSpan<u8> = rs_region3.value
+    let state3 = mallocRunStateQ(rs_base3, cfg, gs_read)
+    forwardQ(cfg, qw, state3, 2, 0)
+    let logits3 = logitsOf(state3, cfg)
+    let l2: Span<f32> = logits2
+    let l3: Span<f32> = logits3
+    let okDet = sameLogits(l2, l3, vocab)
+
+    if allFinite && anyNonzero && okDet {
+        check world.out.write("transformer forwardq ok\n")
+    }
+    return
+}

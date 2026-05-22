@@ -155,16 +155,19 @@ pub fun main(world: World) -> Void raises {
         return
     }
 
-    let cfg = readConfig(bytes)
-    let expected = expectedFileFloats(cfg)
-    let actual = std.mem.len(bytes) / 4
-    let size_ok = expected == actual
-    if size_ok == false {
-        check world.err.write("error: checkpoint size does not match its header\n")
-        std.fs.munmap(&mut m)
-        return
+    // Auto-detect the on-disk format by magic number: a v2 quantized ("ak42")
+    // checkpoint takes the int8 path, anything else the legacy f32 path. The
+    // header parse differs, but both yield the same `Config` shape, so the
+    // tokenizer / sampler setup below (which needs only `cfg`) is shared; the
+    // weights, run state, and forward call are format-specific and branch later.
+    // `gs` (the quantization group size) is only meaningful on the quantized path.
+    let quantized = isQuantizedV2(bytes)
+    let mut cfg = readConfig(bytes)
+    let mut gs: usize = 0
+    if quantized {
+        cfg = readConfigV2(bytes)
+        gs = groupSize(bytes)
     }
-    let weights = mapWeights(bytes, cfg)
 
     // mmap the tokenizer and BPE-encode the prompt. The mapping stays live for
     // the whole run because `decode` returns views into it — it is unmapped after
@@ -226,21 +229,6 @@ pub fun main(world: World) -> Void raises {
         std.fs.munmap(&mut m)
         return
     }
-
-    // Allocate the zeroed RunState region (anonymous mmap, sized from Config) once
-    // — the KV cache persists across positions for the whole generation.
-    let rs_floats = runStateFloats(cfg)
-    let rs_bytes = rs_floats * 4
-    let heap = std.mem.pageAlloc()
-    let rs_region = std.mem.allocBytes(heap, rs_bytes)
-    if rs_region.has == false {
-        check world.err.write("error: cannot allocate run state\n")
-        std.fs.munmap(&mut tm)
-        std.fs.munmap(&mut m)
-        return
-    }
-    let rs_base: MutSpan<u8> = rs_region.value
-    let state = mallocRunState(rs_base, cfg)
 
     // Parse the numeric flags. `--tokens` 0 (or over seq_len) clamps to seq_len,
     // matching `llama2.c`'s `steps` clamp.
@@ -311,6 +299,104 @@ pub fun main(world: World) -> Void raises {
         topp: topp,
         topk: topk
     }
+
+    // Weights, run state, and the generation loop are format-specific (different
+    // weight type + `forward` vs `forwardQ`), so they branch on the detected
+    // format. Everything above — tokenizer, prompt encoding, flags, sampler — is
+    // shared. The two loops below are identical apart from the single forward call;
+    // the quantized one mirrors the f32 one with `forwardQ`.
+    if quantized {
+        // Quantized (int8) path. Validate the file byte length against the v2
+        // header, build the quantized weight description, and size the run state
+        // with the extra quantized-activation scratch.
+        let expected_q = expectedFileBytesQ(cfg, gs)
+        let actual_q = std.mem.len(bytes)
+        if expected_q != actual_q {
+            check world.err.write("error: checkpoint size does not match its header\n")
+            std.fs.munmap(&mut tm)
+            std.fs.munmap(&mut m)
+            return
+        }
+        let qw = mapWeightsQ(bytes, cfg, gs)
+
+        let rs_floats_q = runStateFloatsQ(cfg, gs)
+        let rs_bytes_q = rs_floats_q * 4
+        let heap_q = std.mem.pageAlloc()
+        let rs_region_q = std.mem.allocBytes(heap_q, rs_bytes_q)
+        if rs_region_q.has == false {
+            check world.err.write("error: cannot allocate run state\n")
+            std.fs.munmap(&mut tm)
+            std.fs.munmap(&mut m)
+            return
+        }
+        let rs_base_q: MutSpan<u8> = rs_region_q.value
+        let state_q = mallocRunStateQ(rs_base_q, cfg, gs)
+
+        // Autoregressive generation loop — mirrors the f32 loop below exactly,
+        // calling `forwardQ` (int8 matmuls) in place of `forward`.
+        let mut rng_q: u64 = 12345
+        let mut token_q: i32 = pt[0]
+        let mut pos_q: usize = 0
+        while pos_q < steps {
+            forwardQ(cfg, qw, state_q, token_q, pos_q as i32)
+            let step_logits_q = logitsOf(state_q, cfg)
+
+            let mut next_q: i32 = 0
+            let in_prompt_q = pos_q + 1 < n_prompt
+            if in_prompt_q {
+                next_q = pt[pos_q + 1]
+            }
+            if in_prompt_q == false {
+                rng_q = rngNext(rng_q)
+                let coin_q = randomF32(rng_q)
+                next_q = sample(sampler, step_logits_q, coin_q)
+            }
+            pos_q = pos_q + 1
+
+            let stop_q = next_q == 1
+            if stop_q {
+                pos_q = steps
+            }
+            if stop_q == false {
+                let piece_q = decode(tk, token_q, next_q, dec_scratch)
+                check world.out.write(piece_q)
+                token_q = next_q
+            }
+        }
+        check world.out.write("\n")
+
+        std.fs.munmap(&mut tm)
+        std.fs.munmap(&mut m)
+        return
+    }
+
+    // Legacy f32 path. Validate the file length against the header and build the
+    // zero-copy weight views.
+    let expected = expectedFileFloats(cfg)
+    let actual = std.mem.len(bytes) / 4
+    let size_ok = expected == actual
+    if size_ok == false {
+        check world.err.write("error: checkpoint size does not match its header\n")
+        std.fs.munmap(&mut tm)
+        std.fs.munmap(&mut m)
+        return
+    }
+    let weights = mapWeights(bytes, cfg)
+
+    // Allocate the zeroed RunState region (anonymous mmap, sized from Config) once
+    // — the KV cache persists across positions for the whole generation.
+    let rs_floats = runStateFloats(cfg)
+    let rs_bytes = rs_floats * 4
+    let heap = std.mem.pageAlloc()
+    let rs_region = std.mem.allocBytes(heap, rs_bytes)
+    if rs_region.has == false {
+        check world.err.write("error: cannot allocate run state\n")
+        std.fs.munmap(&mut tm)
+        std.fs.munmap(&mut m)
+        return
+    }
+    let rs_base: MutSpan<u8> = rs_region.value
+    let state = mallocRunState(rs_base, cfg)
 
     // Autoregressive generation loop (llama2.c `generate`). A fixed PRNG seed
     // keeps temperature>0 runs reproducible; temperature 0 (argmax) ignores it.

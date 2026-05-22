@@ -28,6 +28,13 @@ plat="linux/amd64"
 model_url="https://huggingface.co/karpathy/tinyllamas/resolve/main/stories15M.bin"
 tok_url="https://github.com/karpathy/llama2.c/raw/master/tokenizer.bin"
 runc_url="https://github.com/karpathy/llama2.c/raw/master/run.c"
+runqc_url="https://github.com/karpathy/llama2.c/raw/master/runq.c"
+
+# Quantized ("version 2", runq.c) checkpoint. Unlike stories15M.bin it is not a
+# plain download: it is produced by a one-time `export.py --version 2` step that
+# needs PyTorch + the stories15M.pt weights (see below). When it is absent the
+# quantized parity matrix self-skips so the dependency-free f32 matrix still runs.
+model_q="stories15M_q80.bin"
 
 command -v docker >/dev/null 2>&1 || { echo "error: docker is required (runs the linux-musl-x64 binaries + builds the musl reference)." >&2; exit 1; }
 [ -x "$zero" ] || { echo "error: $zero not built. Run: make -C native/zero-c" >&2; exit 1; }
@@ -92,6 +99,40 @@ parity_topp() {
   fi
 }
 
+# parity_one_q / parity_topp_q — the quantized (runq.c "version 2") analogues of
+# parity_one / parity_topp. Identical machinery, but the Zero exe is pointed at
+# the quantized checkpoint (it auto-detects the v2 magic — no flag) and the C
+# reference is `runq_ref` (built from runq.c). runq.c takes the exact same CLI
+# flags as run.c, so the seed (12345), prompt set and normalization carry over.
+parity_one_q() {
+  t="$1"; n="$2"; p="$3"
+  if [ "$t" = "0" ]; then ref_extra=""; else ref_extra="-p 0 -s 12345"; fi
+  docker run --rm --platform "$plat" -v "$data":/work -w /work "$img" sh -c "
+    ./llama2 $model_q --prompt '$p' --tokens $n --temperature $t 2>/dev/null > zq.txt
+    ./runq_ref $model_q -z tokenizer.bin -t $t $ref_extra -n $n -i '$p' 2>/dev/null > rq.txt
+  "
+  if norm_and_diff "$data/zq.txt" "$data/rq.txt"; then
+    echo "  OK   [q, t=$t, $n tok] \"$p\""
+  else
+    echo "  FAIL [q, t=$t, $n tok] \"$p\""
+    return 1
+  fi
+}
+
+parity_topp_q() {
+  t="$1"; n="$2"; pp="$3"; p="$4"
+  docker run --rm --platform "$plat" -v "$data":/work -w /work "$img" sh -c "
+    ./llama2 $model_q --prompt '$p' --tokens $n --temperature $t --topp $pp 2>/dev/null > zq.txt
+    ./runq_ref $model_q -z tokenizer.bin -t $t -p $pp -s 12345 -n $n -i '$p' 2>/dev/null > rq.txt
+  "
+  if norm_and_diff "$data/zq.txt" "$data/rq.txt"; then
+    echo "  OK   [q, t=$t, p=$pp, $n tok] \"$p\""
+  else
+    echo "  FAIL [q, t=$t, p=$pp, $n tok] \"$p\""
+    return 1
+  fi
+}
+
 fail=0
 echo "==> temperature 0 (deterministic argmax) parity"
 parity_one 0 100 "Once upon a time" || fail=1
@@ -109,6 +150,45 @@ echo "==> temperature > 0 with top-p (nucleus) parity"
 parity_topp 0.8 100 0.9  "Once upon a time" || fail=1
 parity_topp 1.0 100 0.95 "The dragon" || fail=1
 parity_topp 0.9 80  0.9  "" || fail=1
+
+# Quantized (int8, runq.c "version 2") parity. Same engine, no flag — the v2
+# magic is auto-detected. The quantized checkpoint is a one-time export, so this
+# matrix self-skips (never failing the run) when $model_q is absent, keeping the
+# f32 matrix above dependency-free. To enable it, produce the checkpoint once:
+#   pip install torch numpy
+#   curl -fSL -o stories15M.pt \
+#     https://huggingface.co/karpathy/tinyllamas/resolve/main/stories15M.pt
+#   curl -fSL -o export.py https://github.com/karpathy/llama2.c/raw/master/export.py
+#   python export.py "$LLAMA2_DATA/stories15M_q80.bin" --version 2 --checkpoint stories15M.pt
+quant_ran=0
+if [ -f "$data/$model_q" ]; then
+  echo "==> fetching + building runq.c reference (int8)"
+  [ -f "$data/runq.c" ] || curl -fSL -o "$data/runq.c" "$runqc_url"
+  # runq.c already #includes <stdint.h> (run.c does not), so no -include is needed.
+  docker run --rm --platform "$plat" -v "$data":/work -w /work "$img" sh -c \
+    "apk add --no-cache gcc musl-dev >/dev/null 2>&1 && gcc -O3 -o runq_ref runq.c -lm"
+
+  echo "==> [quantized] temperature 0 (deterministic argmax) parity"
+  parity_one_q 0 100 "Once upon a time" || fail=1
+  parity_one_q 0 120 "Lily and Tom went to the park" || fail=1
+  parity_one_q 0 80  "The little robot" || fail=1
+  parity_one_q 0 60  "" || fail=1
+
+  echo "==> [quantized] temperature > 0 (multinomial) parity"
+  parity_one_q 0.8 100 "Once upon a time" || fail=1
+  parity_one_q 1.0 100 "The dragon" || fail=1
+
+  echo "==> [quantized] temperature > 0 with top-p (nucleus) parity"
+  parity_topp_q 0.8 100 0.9  "Once upon a time" || fail=1
+  parity_topp_q 0.9 80  0.9  "" || fail=1
+  quant_ran=1
+else
+  echo "==> [quantized] SKIP: $model_q not found in $data."
+  echo "    The int8 parity matrix needs a one-time 'python export.py $model_q"
+  echo "    --version 2 --checkpoint stories15M.pt' step (requires PyTorch +"
+  echo "    stories15M.pt); see the comment above this block. The f32 matrix"
+  echo "    above is unaffected. This is a skip, not a failure."
+fi
 
 # Informational throughput note (enhancement F: sorted-index tokenizer lookup).
 # The tokenizer is no longer an O(vocab) linear scan, but end-to-end tok/s is
@@ -128,7 +208,12 @@ else
 fi
 
 if [ "$fail" -eq 0 ]; then
-  echo "==> PASS: llama2.zero matches llama2.c token-for-token on stories15M."
+  echo "==> PASS: llama2.zero matches llama2.c token-for-token on stories15M (f32)."
+  if [ "$quant_ran" -eq 1 ]; then
+    echo "==> PASS: llama2.zero matches runq.c token-for-token on $model_q (int8)."
+  else
+    echo "==> NOTE: int8 (runq.c) parity skipped — $model_q absent (see SKIP note above)."
+  fi
 else
   echo "==> FAIL: divergence found (see diffs above)." >&2
   exit 1

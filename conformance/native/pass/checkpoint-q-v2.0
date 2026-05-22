@@ -1,0 +1,335 @@
+// Quantized (int8) "version 2" checkpoint loader — header + offset arithmetic.
+//
+// Self-contained mirror of the v2 loader in examples/llama2/src/checkpoint.0
+// (isQuantizedV2 / readConfigV2 / groupSize / mapWeightsQ / expectedFileBytesQ
+// and the QWeight / QuantizedWeights shapes), exercised over a hand-authored
+// byte array so it needs no filesystem and runs in CI (libm-free).
+//
+// The array encodes a tiny model with hand-computable offsets:
+//   dim=4, hidden_dim=8, n_layers=2, n_heads=2, n_kv_heads=2, vocab=4, seq_len=8,
+//   shared_classifier=0 (unshared), group_size (GS)=2
+// so kv_dim = dim*n_kv_heads/n_heads = 4 and head_size = dim/n_heads = 2.
+//
+// Weight section (starts at byte 256):
+//   rms_att   : n_layers*dim = 8 f32  -> bytes 256..288
+//   rms_ffn   : n_layers*dim = 8 f32  -> bytes 288..320
+//   rms_final : dim          = 4 f32  -> bytes 320..336
+// then the quantized groups, each per-layer block = se + (se/GS)*4 bytes:
+//   q_tokens (count 1, se=vocab*dim=16, block=16+8*4=48)  base 336
+//   wq       (count 2, se=dim*dim=16,   block=48)         base 384
+//   wk,wv    (count 2, se=dim*kv_dim=16, block=48)        base 480, 576
+//   wo       (count 2, se=dim*dim=16,   block=48)         base 672
+//   w1,w3    (count 2, se=dim*hidden=32, block=32+16*4=96) base 768, 1152
+//   w2       (count 2, se=hidden*dim=32, block=96)        base 960
+//   wcls     (count 1, se=dim*vocab=16, block=48)         base 1344
+// total file bytes = 1392. The array below is truncated to 480 bytes — enough to
+// cover the rmsnorm slices and the first two quantized groups' boundaries that
+// the assertions probe; the loader records the remaining group bases purely by
+// arithmetic, so they need no backing bytes.
+//
+// The array carries sentinels at known positions: rms_att[0]=1.5 (byte 256),
+// the wq layer-0 quant byte 122 (byte 384) and layer-0 scale 0.5 (byte 400; this
+// fixture writes 0.5 there to confirm the slice lands where expected), and the
+// wq layer-1 quant byte 91 (byte 432). The assertions re-derive these offsets
+// from the stored base and the per-layer block and confirm they hit the
+// sentinels.
+
+// Hyperparameters from the checkpoint header (mirrors the example's `Config`).
+shape Config {
+    dim: i32,
+    hidden_dim: i32,
+    n_layers: i32,
+    n_heads: i32,
+    n_kv_heads: i32,
+    vocab_size: i32,
+    seq_len: i32,
+    shared_weights: Bool,
+}
+
+// One matrix's int8 quants (raw bytes, signed values in two's complement) plus
+// the f32 group scales.
+shape QWeight {
+    q: Span<u8>,
+    s: Span<f32>,
+}
+
+// Zero-copy description of a mapped v2 weight section: the f32 rmsnorm views and
+// the byte base offset of each quantized group (per-layer slicing recomputes the
+// block stride from the config + gs).
+shape QuantizedWeights {
+    bytes: Span<u8>,
+    gs: usize,
+    rms_att: Span<f32>,
+    rms_ffn: Span<f32>,
+    rms_final: Span<f32>,
+    qTokensBase: usize,
+    wqBase: usize,
+    wkBase: usize,
+    wvBase: usize,
+    woBase: usize,
+    w1Base: usize,
+    w2Base: usize,
+    w3Base: usize,
+    wclsBase: usize,
+}
+
+// True iff the file begins with the v2 quantized magic number (0x616b3432).
+fun isQuantizedV2(bytes: Span<u8>) -> Bool {
+    let magic: u32 = 0x616b3432
+    let head: u32 = std.codec.readU32Le(bytes, 0)
+    return head == magic
+}
+
+// Read the seven hyperparameters and the explicit shared-classifier byte.
+fun readConfigV2(bytes: Span<u8>) -> Config {
+    let dim = std.codec.readI32Le(bytes, 8)
+    let hidden_dim = std.codec.readI32Le(bytes, 12)
+    let n_layers = std.codec.readI32Le(bytes, 16)
+    let n_heads = std.codec.readI32Le(bytes, 20)
+    let n_kv_heads = std.codec.readI32Le(bytes, 24)
+    let vocab = std.codec.readI32Le(bytes, 28)
+    let seq_len = std.codec.readI32Le(bytes, 32)
+
+    let shared_byte = bytes[36]
+    let mut shared = false
+    if shared_byte == 1 {
+        shared = true
+    }
+
+    return Config {
+        dim: dim,
+        hidden_dim: hidden_dim,
+        n_layers: n_layers,
+        n_heads: n_heads,
+        n_kv_heads: n_kv_heads,
+        vocab_size: vocab,
+        seq_len: seq_len,
+        shared_weights: shared
+    }
+}
+
+// The quantization group size (GS), from the header i32 at offset 37.
+fun groupSize(bytes: Span<u8>) -> usize {
+    let gs = std.codec.readI32Le(bytes, 37)
+    return gs as usize
+}
+
+// Per-layer block size in bytes for a group of `se`-element tensors.
+fun qBlockBytes(se: usize, gs: usize) -> usize {
+    return se + (se / gs) * 4
+}
+
+// Build the weight description: slice the three f32 rmsnorm groups from byte 256,
+// then record each quantized group's byte base and advance past its layers.
+fun mapWeightsQ(bytes: Span<u8>, cfg: Config, gs: usize) -> QuantizedWeights {
+    let dim = cfg.dim as usize
+    let hidden = cfg.hidden_dim as usize
+    let n_layers = cfg.n_layers as usize
+    let n_heads = cfg.n_heads as usize
+    let n_kv_heads = cfg.n_kv_heads as usize
+    let vocab = cfg.vocab_size as usize
+    let kv_dim = dim * n_kv_heads / n_heads
+
+    let rms_count = n_layers * dim
+    let att_start: usize = 256
+    let att_end = att_start + rms_count * 4
+    let ffn_start = att_end
+    let ffn_end = ffn_start + rms_count * 4
+    let final_start = ffn_end
+    let final_end = final_start + dim * 4
+    let rms_att = std.mem.bytesAsF32(bytes[att_start..att_end])
+    let rms_ffn = std.mem.bytesAsF32(bytes[ffn_start..ffn_end])
+    let rms_final = std.mem.bytesAsF32(bytes[final_start..final_end])
+
+    let q_tokens_se = vocab * dim
+    let wq_se = dim * dim
+    let wkv_se = dim * kv_dim
+    let wo_se = dim * dim
+    let w13_se = dim * hidden
+    let w2_se = hidden * dim
+
+    let mut off = final_end
+
+    let q_tokens_base = off
+    off = off + qBlockBytes(q_tokens_se, gs)
+    let wq_base = off
+    off = off + n_layers * qBlockBytes(wq_se, gs)
+    let wk_base = off
+    off = off + n_layers * qBlockBytes(wkv_se, gs)
+    let wv_base = off
+    off = off + n_layers * qBlockBytes(wkv_se, gs)
+    let wo_base = off
+    off = off + n_layers * qBlockBytes(wo_se, gs)
+    let w1_base = off
+    off = off + n_layers * qBlockBytes(w13_se, gs)
+    let w2_base = off
+    off = off + n_layers * qBlockBytes(w2_se, gs)
+    let w3_base = off
+    off = off + n_layers * qBlockBytes(w13_se, gs)
+
+    let mut wcls_base = off
+    if cfg.shared_weights {
+        wcls_base = q_tokens_base
+    }
+
+    return QuantizedWeights {
+        bytes: bytes,
+        gs: gs,
+        rms_att: rms_att,
+        rms_ffn: rms_ffn,
+        rms_final: rms_final,
+        qTokensBase: q_tokens_base,
+        wqBase: wq_base,
+        wkBase: wk_base,
+        wvBase: wv_base,
+        woBase: wo_base,
+        w1Base: w1_base,
+        w2Base: w2_base,
+        w3Base: w3_base,
+        wclsBase: wcls_base
+    }
+}
+
+// Total byte length of a well-formed v2 checkpoint.
+fun expectedFileBytesQ(cfg: Config, gs: usize) -> usize {
+    let dim = cfg.dim as usize
+    let hidden = cfg.hidden_dim as usize
+    let n_layers = cfg.n_layers as usize
+    let n_heads = cfg.n_heads as usize
+    let n_kv_heads = cfg.n_kv_heads as usize
+    let vocab = cfg.vocab_size as usize
+    let kv_dim = dim * n_kv_heads / n_heads
+
+    let mut total: usize = 256
+    total = total + n_layers * dim * 4
+    total = total + n_layers * dim * 4
+    total = total + dim * 4
+    total = total + qBlockBytes(vocab * dim, gs)
+    total = total + n_layers * qBlockBytes(dim * dim, gs)
+    total = total + n_layers * qBlockBytes(dim * kv_dim, gs)
+    total = total + n_layers * qBlockBytes(dim * kv_dim, gs)
+    total = total + n_layers * qBlockBytes(dim * dim, gs)
+    total = total + n_layers * qBlockBytes(dim * hidden, gs)
+    total = total + n_layers * qBlockBytes(hidden * dim, gs)
+    total = total + n_layers * qBlockBytes(dim * hidden, gs)
+    if cfg.shared_weights == false {
+        total = total + qBlockBytes(dim * vocab, gs)
+    }
+    return total
+}
+
+pub fun main(world: World) -> Void raises {
+    // 480-byte v2 image (header + rmsnorm groups + first two quantized groups).
+    let buf: [480]u8 = [
+        50, 52, 107, 97, 2, 0, 0, 0, 4, 0, 0, 0, 8, 0, 0, 0,
+        2, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 4, 0, 0, 0,
+        8, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 192, 63, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 32, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 96, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        122, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 63, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        91, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+    ]
+    let bytes: Span<u8> = buf
+
+    // Magic detection: positive on the v2 image, negative on a non-magic prefix.
+    let okMagic: Bool = isQuantizedV2(bytes)
+    let other: [4]u8 = [1, 0, 0, 0]
+    let otherSpan: Span<u8> = other
+    let okNotMagic: Bool = isQuantizedV2(otherSpan) == false
+
+    // Header decode.
+    let cfg = readConfigV2(bytes)
+    let okDim: Bool = cfg.dim == 4
+    let okHidden: Bool = cfg.hidden_dim == 8
+    let okLayers: Bool = cfg.n_layers == 2
+    let okHeads: Bool = cfg.n_heads == 2
+    let okKvHeads: Bool = cfg.n_kv_heads == 2
+    let okVocab: Bool = cfg.vocab_size == 4
+    let okSeq: Bool = cfg.seq_len == 8
+    let okShared: Bool = cfg.shared_weights == false
+    let okConfig: Bool = okDim && okHidden && okLayers && okHeads && okKvHeads && okVocab && okSeq && okShared
+
+    let gs = groupSize(bytes)
+    let okGs: Bool = gs == 2
+
+    let qw = mapWeightsQ(bytes, cfg, gs)
+
+    // rmsnorm view lengths and the first rms_att value (1.5 at byte 256).
+    let ra = qw.rms_att
+    let rf = qw.rms_ffn
+    let rfin = qw.rms_final
+    let okRaLen: Bool = std.mem.len(ra) == 8
+    let okRfLen: Bool = std.mem.len(rf) == 8
+    let okRfinLen: Bool = std.mem.len(rfin) == 4
+    let ra0: f32 = ra[0]
+    let want15: f32 = 1.5
+    let okRa0: Bool = ra0 == want15
+    let okRms: Bool = okRaLen && okRfLen && okRfinLen && okRa0
+
+    // Quantized group bases land where hand-computed.
+    let okQTokBase: Bool = qw.qTokensBase == 336
+    let okWqBase: Bool = qw.wqBase == 384
+    let okWkBase: Bool = qw.wkBase == 480
+    let okWclsBase: Bool = qw.wclsBase == 1344
+    let okBases: Bool = okQTokBase && okWqBase && okWkBase && okWclsBase
+
+    // Re-derive the wq per-layer (qstart, sstart) boundaries from the stored base
+    // and the block stride, and confirm they hit the written sentinels.
+    let wqBase = qw.wqBase
+    let wq_se: usize = 16
+    let block = qBlockBytes(wq_se, gs)
+    let okBlock: Bool = block == 48
+
+    let l0_qstart = wqBase
+    let l0_sstart = l0_qstart + wq_se
+    let l1_qstart = wqBase + block
+    let l1_sstart = l1_qstart + wq_se
+    let okL0Q: Bool = l0_qstart == 384
+    let okL0S: Bool = l0_sstart == 400
+    let okL1Q: Bool = l1_qstart == 432
+    let okL1S: Bool = l1_sstart == 448
+
+    // The sentinels at those byte positions (read back through the span).
+    let s0 = bytes[l0_qstart]
+    let s1 = bytes[l1_qstart]
+    let okSent0: Bool = s0 == 122
+    let okSent1: Bool = s1 == 91
+    // Layer-0 scale: a single f32 view over its 4-byte slice (0.5 at byte 400).
+    let scale_end = l0_sstart + 4
+    let scale_view = std.mem.bytesAsF32(bytes[l0_sstart..scale_end])
+    let scale0: f32 = scale_view[0]
+    let wantHalf: f32 = 0.5
+    let okScale0: Bool = scale0 == wantHalf
+    let okBoundaries: Bool = okBlock && okL0Q && okL0S && okL1Q && okL1S && okSent0 && okSent1 && okScale0
+
+    // Total file byte count for this tiny config.
+    let total = expectedFileBytesQ(cfg, gs)
+    let okTotal: Bool = total == 1392
+
+    if okMagic && okNotMagic && okConfig && okGs && okRms && okBases && okBoundaries && okTotal {
+        check world.out.write("checkpoint q v2 ok\n")
+    }
+}
