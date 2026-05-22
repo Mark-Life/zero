@@ -54,8 +54,8 @@ a clean error. From v0.1 phases:
 | A | Bigger TinyStories models (42M / 110M) | High | ~Free | Validation | ✅ Done |
 | C | Lift prompt-length cap (`bytesAsMutI32`) | Low-Med | Small | Compiler | ✅ Done |
 | D | Raw-byte `<0xNN>` decode (u8 span store) | Low* | Low-Med | Compiler | ✅ Done |
-| B | top-p / top-k sampling | Med-High | Medium | Pure Zero | Backlog |
-| F | Faster tokenizer lookup (no linear scan) | Low | Medium | Pure Zero | Backlog |
+| B | top-p / top-k sampling | Med-High | Medium | Pure Zero | ✅ Done |
+| F | Faster tokenizer lookup (no linear scan) | Low | Medium | Pure Zero | ✅ Done |
 | G | Real Llama-2 + int8 quantization | High | Large | Both | Backlog |
 | E | Cross-platform (macOS / Windows / ARM) | High | Med-Large | Compiler | Backlog |
 | H | SIMD / multi-threaded matmul (perf) | Medium | Large | Compiler | Backlog |
@@ -92,9 +92,63 @@ in bare Alpine/qemu (`direct-rescue-basic` exits 1 vs expected 9 — an emulatio
 targets native-Linux / Vercel-Sandbox CI). `conformance` (also runnable under Docker amd64
 with zig) is the reliable gate here and is green.
 
+## Landed next (B)
+
+**B — top-p / top-k sampling.** Pure Zero, no compiler change. `sampler.0` gains a `Sampler`
+record (vocab-sized `prob`/`index` scratch + temperature/topp/topk, passed by pointer = one
+int reg), an in-place descending **heapsort** over the parallel `(prob, index)` arrays
+(`sortDescByProb`; MIN-heap so extract-min-to-back yields descending; index arithmetic only,
+no `break`, no parent-index underflow), `sampleTopp` (byte-for-byte port of `run.c`
+`sample_topp`), and `sampleTopk` (renormalized top-k prefix draw — no `run.c` reference).
+`sample` now takes the `Sampler` record and dispatches argmax → top-k → top-p → multinomial;
+with `--topk 0` the top-p branch is identical to `sample_topp`, so parity holds. `main.0`
+parses `--topp`/`--topk` (default 0 = off, preserving v0.1 behavior), allocates the two
+scratch regions once (`pageAlloc`), and builds the `Sampler` before the loop. Validated by a
+new libm-free `conformance/native/pass/sampler-topk-topp.0` (Docker-amd64 green, hand-computed
+sort/top-p/top-k asserts) and by `validate.sh`'s new `parity_topp` cases (real `-t`/`-p` vs
+`llama2.c`, seed 12345). The shared sort is the prerequisite primitive for item F.
+
+**Gotchas confirmed:** a sampler helper taking both scratch spans + the logits span + a
+scalar (top-k's `usize`) is 3 spans + 1 int = 7 int regs → `CGEN004` (the arg cap is 6; 3
+spans alone = 6 is fine, cf. `rmsnorm(out,in,w,eps)`). Bundling the scratch into the
+`Sampler` record (1 reg) keeps every helper well under the cap — and is needed for `sample`
+regardless, since it carries scratch + temp/topp/topk. A bare float literal in an
+un-annotated `let` defaults to f64: `let c = (1.0 - topp) / d` is `TYP002` (f64 vs f32) even
+though `d - 1.0` is fine (the f32 left operand coerces the literal); bind `let one: f32 =
+1.0` first. And the top-p fixture must avoid landing `cumulative` exactly on `topp`
+(`0.4f + 0.3f` rounds just *above* `0.7f`), so cases use `topp 0.75` with ≥0.04 margins.
+
+## Landed next (F)
+
+**F — sorted-index tokenizer lookup.** Pure Zero, no compiler change. `buildTokenizer` now takes
+one combined `pageAlloc`'d i32 region of `2 * vocab` elements (allocated in `main.0`) and slices
+it into `entryOff` (entry byte-offset table, O(1) random access for `tokenStr`/score reads —
+killing the v0.1 O(id) `entryStart` walk) and `sortedId` (token ids ordered ascending by string).
+A new `sortIdByStr` heapsort (the `sortDescByProb` skeleton from `sampler.0`, but a **max-heap**
+over a single id array, keyed by `cmpBytes` over the entry strings) sorts `sortedId` once at load.
+`findStr` becomes a binary search; the merge step's whole-vocab `concatMatch` scan becomes
+`findStrConcat`, a binary search whose `cmpConcatEntry` comparator compares the virtual `a++b`
+**without materializing** it (so no mutable byte scratch is needed and the call stays within the
+register cap). `entryStart`/`concatMatch` are deleted. Token ids are unchanged — `validate.sh`
+still matches `llama2.c` token-for-token across all argmax/multinomial/top-p cases — and the
+rewritten `conformance/native/pass/tokenizer-encode.0` asserts the sorted order plus the same
+encode/decode results (Docker-amd64 green). `validate.sh` gained an informational tok/s line.
+
+**Gotchas confirmed:** a **record-returning** call caps at *five* integer arguments, not six —
+the hidden return-struct (sret) pointer takes one register — so `buildTokenizer(bytes, eo, so)`
+(3 spans = 6) is `CGEN004`; bundling the two indices into one sliced region drops it to two span
+args. And **indexing a sliced-span record field directly** (`t.entryOff[i]` where the field is a
+sub-slice like `idx[0..vocab]`) mis-resolves the slice base in the direct backend and silently
+reads wrong data; bind a local first (`let eo = t.entryOff; eo[i]`), the same shape `findStr`/
+`strById` already use. Passing the field as a call argument is fine — only direct indexing breaks.
+The string compare/sort needed a new `cmpBytes` (no lexicographic compare exists in `std.mem`).
+
 ---
 
 # B. top-p / top-k sampling
+
+**Status: ✅ Landed** (see "Landed next (B)" above for what shipped). The spec below is the
+original plan, kept for context.
 
 **Goal.** Match `llama2.c`'s full sampler: argmax (have), temperature multinomial
 (have), **top-k** (sample from the k highest-probability tokens), **top-p / nucleus**
@@ -149,6 +203,10 @@ bar — the PRNG is already bit-exact, so a matched top-p path should reproduce 
 ---
 
 # F. Faster tokenizer lookup (kill the linear scan)
+
+**Status: ✅ Landed** (see "Landed next (F)" above for what shipped — option 1, sort + binary
+search, with the merge step also converted via an in-place virtual-concat comparator). The spec
+below is the original plan, kept for context.
 
 **Goal.** Replace the O(vocab) linear vocab scan with O(log vocab) or O(1). Closes README
 limitation #5.

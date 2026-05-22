@@ -6,8 +6,8 @@ tokens to stdout — a single statically-linked binary with no runtime dependenc
 
 **Status:** v0.1 — runs Karpathy's TinyLlamas checkpoints (`stories15M`, and the larger
 `stories42M` / `stories110M` with no rebuild) on `linux-musl-x64`: f32, single-threaded,
-argmax + temperature sampling. Output matches the upstream `llama2.c` **token-for-token**;
-see [Validation](#validation).
+argmax / temperature / top-p / top-k sampling. Output matches the upstream `llama2.c`
+**token-for-token**; see [Validation](#validation).
 
 ## Quickstart
 
@@ -55,7 +55,7 @@ bin/zero build --backend zero-elf64 --emit exe --target linux-musl-x64 examples/
 ## Run
 
 ```
-llama2 <model.bin> --prompt <text> --tokens <n> [--temperature <t>] [--tokenizer <path>]
+llama2 <model.bin> --prompt <text> --tokens <n> [--temperature <t>] [--topp <p>] [--topk <k>] [--tokenizer <path>]
 ```
 
 | Flag | Default | Notes |
@@ -64,6 +64,8 @@ llama2 <model.bin> --prompt <text> --tokens <n> [--temperature <t>] [--tokenizer
 | `--prompt` | `""` | Prompt text, BPE-encoded. Must fit the model's context window (`seq_len` tokens). |
 | `--tokens` | `256` | Tokens to generate; clamped to the model's `seq_len` (`0` ⇒ `seq_len`). |
 | `--temperature` | `1.0` | Sampling temperature. `0` ⇒ deterministic greedy argmax. |
+| `--topp` | `0` | Top-p (nucleus) threshold in `(0, 1)`; `0` (or `≥1`) disables it. Matches `llama2.c -p`. |
+| `--topk` | `0` | Top-k: sample from the `k` highest-probability tokens; `0` disables it. Takes precedence over `--topp`. |
 | `--tokenizer` | `tokenizer.bin` | Path to the Karpathy `tokenizer.bin` vocab. |
 
 The prompt is re-emitted from its tokens (the leading sentencepiece space after BOS is
@@ -127,7 +129,7 @@ The pipeline mirrors `llama2.c`, split across one flat package:
 | `src/transformer.0` | `RunState` (activations + KV cache) and the `forward()` pass |
 | `src/ops.0` | Kernels: `rmsnorm`, `matmul`, `softmax`, `rope`, `swiglu` |
 | `src/tokenizer.0` | Karpathy `tokenizer.bin` BPE `encode` / `decode` |
-| `src/sampler.0` | `argmax`, temperature sampling, xorshift\* PRNG |
+| `src/sampler.0` | `argmax`, temperature / top-p / top-k sampling, the sort they share, xorshift\* PRNG |
 
 Weights are `mmap`'d read-only and sliced into typed `Span<f32>` views with no copy; the
 mutable `RunState` is one zeroed anonymous-`mmap` region (sized at runtime from the header).
@@ -141,8 +143,12 @@ compiler work this exercised — start with [`overview.md`](../../.docs/llama2/o
 - **Precision / threads:** f32, single-threaded, no quantization — so the practical ceiling
   is the TinyLlamas family; real Llama-2 sizes need int8 (see the
   [backlog](../../.docs/llama2/enhancements.md)).
-- **Sampling:** argmax + temperature only — top-p / top-k are post-v0.1.
-- **Tokenizer:** linear vocab scan, no hashmap — correct but O(vocab) per lookup.
+- **Sampling:** argmax, temperature, top-p (nucleus), and top-k — the full sampler. top-p
+  is parity-checked against `llama2.c`; top-k has no upstream reference (fixture-validated).
+- **Tokenizer:** sorted-index lookup — an entry-offset table (O(1) random access) plus a
+  string-sorted id list binary-searched on `encode` (O(log vocab)), replacing the v0.1 linear
+  scan. Token ids are identical (parity-checked against `llama2.c`).
 
-Post-v0.1 enhancements (bigger models, top-p/top-k, cross-platform, quantization, training)
-are scoped in [`.docs/llama2/enhancements.md`](../../.docs/llama2/enhancements.md).
+Post-v0.1 enhancements (cross-platform, quantization, training) are scoped
+in [`.docs/llama2/enhancements.md`](../../.docs/llama2/enhancements.md); bigger models and
+top-p/top-k have since landed.

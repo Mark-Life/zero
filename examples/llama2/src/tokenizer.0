@@ -1,4 +1,4 @@
-// llama2.zero — v0.1, Phase 5 (BPE tokenizer).
+// llama2.zero — v0.1, Phase 5 (BPE tokenizer) + enhancement F (sorted-index lookup).
 //
 // Loads Karpathy's `tokenizer.bin` (already mmap'd into a byte span) and ports
 // `llama2.c` `encode`/`decode`. The file layout is:
@@ -7,103 +7,343 @@
 //   per token (vocab_size of them):
 //     [score: f32] [len: i32] [bytes: len]
 //
-// `vocab_size` is NOT in the file — it comes from the checkpoint header (Config).
+// `vocab_size` is NOT in the file — it is the length of the caller-supplied index.
 //
-// Tokens are variable-length, so random access by id walks the vocab from the
-// start (`entryStart`). There is no offset index and no hashmap: `findStr` is a
-// linear scan and each merge step rescans the vocab — O(vocab) per lookup, slow
-// but correct for v0.1 (plan risk #4; overview "What This Forces" #7). For a
-// short prompt over the 32000-entry vocab this is a few ×10^7 ops (<1s).
+// Enhancement F replaces the v0.1 linear vocab scans with two load-time indices,
+// built into caller-allocated `pageAlloc` regions (sized vocab) by `buildTokenizer`:
+//   - `entryOff[id]` — byte offset of entry `id`, filled by ONE sequential walk.
+//     Gives O(1) random access for `tokenStr` and score reads (the v0.1 code
+//     re-walked the vocab from the start every time, in `entryStart`).
+//   - `sortedId[]`  — token ids ordered ascending by their string (heapsort, the
+//     `sortDescByProb` skeleton from sampler.0 with a string comparator + max-heap).
+//     `findStr` and the merge-step lookup binary-search this index — O(log vocab)
+//     instead of O(vocab), mirroring `llama2.c`'s `sorted_vocab` + `str_lookup`.
+// Token ids are unchanged: Karpathy's vocab strings are unique (sentencepiece) and
+// `llama2.c` itself binary-searches, so generation output is byte-for-byte identical.
 //
 // Two adaptations to the direct ELF64 backend:
 //   - the merge candidate is matched against `vocab[a]+vocab[b]` WITHOUT building
-//     the concatenation (`concatMatch` compares the two halves in place), so no
-//     mutable byte scratch buffer is needed (`MutSpan<u8>` stores are unemitted);
+//     the concatenation: `findStrConcat` binary-searches with `cmpConcatEntry`,
+//     which compares the virtual a++b in place. No mutable byte scratch is needed,
+//     and the binary search stays within the 6-integer-register call cap.
 //   - `encode` takes BOS only (no EOS): the 6-integer-register call ABI can't fit
 //     a 7th argument, and the v0.1 prompt path is `encode(..., bos=1, eos=0)` in
 //     `llama2.c` `run.c` — EOS termination lives in the generation loop, not here.
 
-// A loaded tokenizer: the mapped file bytes plus the two header-derived sizes.
-// `max_token_length` is kept for fidelity to the format (it sizes `llama2.c`'s
-// merge buffer, which `concatMatch` makes unnecessary here).
+// A loaded tokenizer: the mapped file bytes, the header-derived sizes, and the two
+// lookup indices (views into caller-owned pageAlloc regions; read-only after build).
+// `max_token_length` is kept for fidelity to the format (it sizes `llama2.c`'s merge
+// buffer, which the in-place `cmpConcatEntry` makes unnecessary here).
 pub shape Tokenizer {
     bytes: Span<u8>,
     vocab_size: i32,
     max_token_length: i32,
+    entryOff: MutSpan<i32>,
+    sortedId: MutSpan<i32>,
 }
 
-// Wrap an mmap'd `tokenizer.bin` byte span. Reads the leading `max_token_length`;
-// `vocab_size` is supplied by the caller from the checkpoint Config.
-pub fun buildTokenizer(bytes: Span<u8>, vocab_size: i32) -> Tokenizer {
-    let mtl = std.codec.readI32Le(bytes, 0)
-    return Tokenizer { bytes: bytes, vocab_size: vocab_size, max_token_length: mtl }
-}
-
-// Byte offset of token `id`'s entry (its `score` field), found by walking past
-// the `id` preceding variable-length entries from the first one at offset 4.
-fun entryStart(bytes: Span<u8>, id: usize) -> usize {
-    let mut cur: usize = 4
-    let mut i: usize = 0
-    while i < id {
-        let raw = std.codec.readI32Le(bytes, cur + 4)
-        let len = raw as usize
-        cur = cur + 8 + len
-        i = i + 1
+// Lexicographic byte comparison: -1 if a < b, 1 if a > b, 0 if equal. The first
+// differing byte decides; on a shared prefix the shorter span is smaller. Pure byte
+// loop with a sentinel (`done` + `i = lim`) since the backend has no `break`.
+fun cmpBytes(a: Span<u8>, b: Span<u8>) -> i32 {
+    let la = std.mem.len(a)
+    let lb = std.mem.len(b)
+    let mut lim = la
+    if lb < la {
+        lim = lb
     }
-    return cur
+    let mut res: i32 = 0
+    let mut done = false
+    let mut i: usize = 0
+    while i < lim {
+        if done == false {
+            let ca = a[i]
+            let cb = b[i]
+            if ca < cb {
+                res = 0 - 1
+                done = true
+                i = lim
+            }
+            if ca > cb {
+                res = 1
+                done = true
+                i = lim
+            }
+        }
+        if done == false {
+            i = i + 1
+        }
+    }
+    if done == false {
+        if la < lb {
+            res = 0 - 1
+        }
+        if la > lb {
+            res = 1
+        }
+    }
+    return res
 }
 
-// The token string for `id`, as a zero-copy view into the mapped file.
-fun tokenStr(t: Tokenizer, id: i32) -> Span<u8> {
-    let bytes = t.bytes
-    let idu = id as usize
-    let cur = entryStart(bytes, idu)
-    let raw = std.codec.readI32Le(bytes, cur + 4)
+// Lexicographic comparison of the concatenation a++b against `v`, WITHOUT building
+// a++b: -1 if a++b < v, 1 if greater, 0 if equal. One index walks the virtual
+// a-then-b sequence (length la+lb) against v; same sentinel-bound shape as cmpBytes.
+fun cmpConcatEntry(a: Span<u8>, b: Span<u8>, v: Span<u8>) -> i32 {
+    let la = std.mem.len(a)
+    let lb = std.mem.len(b)
+    let lab = la + lb
+    let lv = std.mem.len(v)
+    let mut lim = lab
+    if lv < lab {
+        lim = lv
+    }
+    let mut res: i32 = 0
+    let mut done = false
+    let mut i: usize = 0
+    while i < lim {
+        if done == false {
+            let mut ce: u8 = 0
+            if i < la {
+                ce = a[i]
+            }
+            if i >= la {
+                ce = b[i - la]
+            }
+            let cv = v[i]
+            if ce < cv {
+                res = 0 - 1
+                done = true
+                i = lim
+            }
+            if ce > cv {
+                res = 1
+                done = true
+                i = lim
+            }
+        }
+        if done == false {
+            i = i + 1
+        }
+    }
+    if done == false {
+        if lab < lv {
+            res = 0 - 1
+        }
+        if lab > lv {
+            res = 1
+        }
+    }
+    return res
+}
+
+// Zero-copy view of the token string for the entry that starts at byte `off`
+// (its `len` is at off+4, the bytes at off+8).
+fun entryStrAt(bytes: Span<u8>, off: usize) -> Span<u8> {
+    let raw = std.codec.readI32Le(bytes, off + 4)
     let len = raw as usize
-    let s = cur + 8
+    let s = off + 8
     let e = s + len
     return bytes[s..e]
 }
 
-// Linear scan for the token whose string equals `s`; returns its id or -1.
-// Mirrors `llama2.c` `str_lookup` but without the sorted vocab + binary search
-// (post-v0.1, per overview #7). Walks every entry once.
-fun findStr(t: Tokenizer, s: Span<u8>) -> i32 {
-    let bytes = t.bytes
-    let vocab = t.vocab_size as usize
+// Zero-copy view of token `id`'s string via the O(1) offset index.
+fun strById(bytes: Span<u8>, eo: MutSpan<i32>, id: i32) -> Span<u8> {
+    let off = eo[id as usize] as usize
+    return entryStrAt(bytes, off)
+}
+
+// Sort `so` (token ids) ascending by token string, in place. Heapsort built on the
+// `sampler.0` `sortDescByProb` skeleton — sentinel-bound sift-down, no break, child
+// = i*2+1 / i*2+2 — but over a SINGLE id array, keyed by the entry string (via
+// `strById`/`cmpBytes`), and as a MAX-heap: extract-max-to-back fills the tail
+// largest-first, leaving the array ascending (what the binary search consumes).
+// `count` = len(so). The +1-shifted counters (`bp`, `ep`) keep usize from underflow.
+fun sortIdByStr(bytes: Span<u8>, eo: MutSpan<i32>, so: MutSpan<i32>) -> Void {
+    let count = std.mem.len(so)
+    if count < 2 {
+        return
+    }
+    let mut bp: usize = count / 2
+    while bp > 0 {
+        let startNode = bp - 1
+        let mut pos: usize = startNode
+        let mut sifting = true
+        while sifting {
+            let left = pos * 2 + 1
+            let right = pos * 2 + 2
+            let mut largest = pos
+            if left < count {
+                let sl = strById(bytes, eo, so[left])
+                let sb = strById(bytes, eo, so[largest])
+                let c = cmpBytes(sl, sb)
+                if c > 0 {
+                    largest = left
+                }
+            }
+            if right < count {
+                let sr = strById(bytes, eo, so[right])
+                let sb2 = strById(bytes, eo, so[largest])
+                let c2 = cmpBytes(sr, sb2)
+                if c2 > 0 {
+                    largest = right
+                }
+            }
+            let moved = largest != pos
+            if moved {
+                let ti = so[pos]
+                so[pos] = so[largest]
+                so[largest] = ti
+                pos = largest
+            }
+            if moved == false {
+                sifting = false
+            }
+        }
+        bp = bp - 1
+    }
+    let mut ep: usize = count
+    while ep > 1 {
+        let end = ep - 1
+        let ti2 = so[0]
+        so[0] = so[end]
+        so[end] = ti2
+        let bound = end
+        let mut pos2: usize = 0
+        let mut sift2 = true
+        while sift2 {
+            let left2 = pos2 * 2 + 1
+            let right2 = pos2 * 2 + 2
+            let mut large2 = pos2
+            if left2 < bound {
+                let sl2 = strById(bytes, eo, so[left2])
+                let sa = strById(bytes, eo, so[large2])
+                let d = cmpBytes(sl2, sa)
+                if d > 0 {
+                    large2 = left2
+                }
+            }
+            if right2 < bound {
+                let sr2 = strById(bytes, eo, so[right2])
+                let sa2 = strById(bytes, eo, so[large2])
+                let d2 = cmpBytes(sr2, sa2)
+                if d2 > 0 {
+                    large2 = right2
+                }
+            }
+            let moved2 = large2 != pos2
+            if moved2 {
+                let si = so[pos2]
+                so[pos2] = so[large2]
+                so[large2] = si
+                pos2 = large2
+            }
+            if moved2 == false {
+                sift2 = false
+            }
+        }
+        ep = ep - 1
+    }
+}
+
+// Wrap an mmap'd `tokenizer.bin` byte span and build the lookup indices into one
+// caller-allocated i32 region of `2 * vocab` elements — sliced into `entryOff`
+// (first half) and `sortedId` (second half), so `vocab = len(idx) / 2`. A single
+// combined region (rather than two) keeps this record-returning call at four
+// integer arguments: the direct ELF64 backend reserves one register for the hidden
+// return-struct pointer, capping such calls at five. One pass fills `entryOff[id]`
+// and seeds `sortedId[id] = id`; `sortedId` is then heapsorted by token string.
+pub fun buildTokenizer(bytes: Span<u8>, idx: MutSpan<i32>) -> Tokenizer {
+    let mtl = std.codec.readI32Le(bytes, 0)
+    let total = std.mem.len(idx)
+    let vocab = total / 2
+    let entryOff: MutSpan<i32> = idx[0..vocab]
+    let sortedId: MutSpan<i32> = idx[vocab..total]
+
     let mut cur: usize = 4
     let mut id: usize = 0
     while id < vocab {
+        entryOff[id] = cur as i32
+        sortedId[id] = id as i32
         let raw = std.codec.readI32Le(bytes, cur + 4)
         let len = raw as usize
-        let cs = cur + 8
-        let ce = cs + len
-        let cand = bytes[cs..ce]
-        let eq = std.mem.eqlBytes(cand, s)
-        if eq {
-            return id as i32
-        }
         cur = cur + 8 + len
         id = id + 1
     }
-    return 0 - 1
+
+    sortIdByStr(bytes, entryOff, sortedId)
+
+    return Tokenizer {
+        bytes: bytes,
+        vocab_size: vocab as i32,
+        max_token_length: mtl,
+        entryOff: entryOff,
+        sortedId: sortedId
+    }
 }
 
-// True when `cand` equals `a` followed by `b`, compared in place (no allocation).
-// Lets the merge loop test `vocab[i] == vocab[a]+vocab[b]` without materializing
-// the concatenation that `llama2.c` builds in `str_buffer`.
-fun concatMatch(cand: Span<u8>, a: Span<u8>, b: Span<u8>) -> Bool {
-    let la = std.mem.len(a)
-    let lb = std.mem.len(b)
-    let lc = std.mem.len(cand)
-    if lc != la + lb {
-        return false
+// The token string for `id`, as a zero-copy view into the mapped file (O(1)).
+fun tokenStr(t: Tokenizer, id: i32) -> Span<u8> {
+    return strById(t.bytes, t.entryOff, id)
+}
+
+// Binary search the sorted index for the token whose string equals `s`; returns its
+// id or -1. Replaces the v0.1 linear scan (mirrors `llama2.c` `str_lookup`). Vocab
+// strings are unique, so any match is unambiguous. A hit stores the id and sets
+// `lo = hi` to end the loop (the backend has no `break`).
+fun findStr(t: Tokenizer, s: Span<u8>) -> i32 {
+    let bytes = t.bytes
+    let eo = t.entryOff
+    let so = t.sortedId
+    let mut lo: usize = 0
+    let mut hi: usize = t.vocab_size as usize
+    let mut res: i32 = 0 - 1
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        let id = so[mid]
+        let cand = strById(bytes, eo, id)
+        let c = cmpBytes(s, cand)
+        if c == 0 {
+            res = id
+            lo = hi
+        }
+        if c < 0 {
+            hi = mid
+        }
+        if c > 0 {
+            lo = mid + 1
+        }
     }
-    let head = cand[0..la]
-    let tail = cand[la..lc]
-    let okh = std.mem.eqlBytes(head, a)
-    let okt = std.mem.eqlBytes(tail, b)
-    return okh && okt
+    return res
+}
+
+// Binary search for the token whose string equals the concatenation a++b; returns
+// its id or -1. The merge step's replacement for the v0.1 whole-vocab scan: same
+// sorted index + sentinel-exit as `findStr`, with `cmpConcatEntry` (which never
+// materializes a++b) as the comparator.
+fun findStrConcat(t: Tokenizer, a: Span<u8>, b: Span<u8>) -> i32 {
+    let bytes = t.bytes
+    let eo = t.entryOff
+    let so = t.sortedId
+    let mut lo: usize = 0
+    let mut hi: usize = t.vocab_size as usize
+    let mut res: i32 = 0 - 1
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        let id = so[mid]
+        let cand = strById(bytes, eo, id)
+        let c = cmpConcatEntry(a, b, cand)
+        if c == 0 {
+            res = id
+            lo = hi
+        }
+        if c < 0 {
+            hi = mid
+        }
+        if c > 0 {
+            lo = mid + 1
+        }
+    }
+    return res
 }
 
 // Exclusive end of the UTF-8 codepoint that starts at `start`: extend over up to
@@ -207,28 +447,21 @@ pub fun encode(t: Tokenizer, text: Span<u8>, out: MutSpan<i32>, bos: Bool) -> us
             let a = tokenStr(t, aId)
             let b = tokenStr(t, bId)
 
-            // scan the vocab once for an entry equal to a+b; keep the best score
-            let bytes = t.bytes
-            let vocab = t.vocab_size as usize
-            let mut vcur: usize = 4
-            let mut vid: usize = 0
-            while vid < vocab {
-                let raw = std.codec.readI32Le(bytes, vcur + 4)
-                let len = raw as usize
-                let cs = vcur + 8
-                let ce = cs + len
-                let cand = bytes[cs..ce]
-                let m = concatMatch(cand, a, b)
-                if m {
-                    let sc = std.codec.readF32Le(bytes, vcur)
-                    if sc > bestScore {
-                        bestScore = sc
-                        bestId = vid as i32
-                        bestIdx = p as i32
-                    }
+            // O(log vocab) lookup of the merged token a+b (no concatenation built);
+            // keep the highest-scoring mergeable pair, exactly as `llama2.c`. The
+            // offset index is copied to a local before indexing: indexing the sliced
+            // span record field directly (`t.entryOff[i]`) mis-resolves its base in
+            // the direct backend, the same reason findStr/strById bind a local first.
+            let mergeId = findStrConcat(t, a, b)
+            if mergeId >= 0 {
+                let eo = t.entryOff
+                let off = eo[mergeId as usize] as usize
+                let sc = std.codec.readF32Le(t.bytes, off)
+                if sc > bestScore {
+                    bestScore = sc
+                    bestId = mergeId
+                    bestIdx = p as i32
                 }
-                vcur = vcur + 8 + len
-                vid = vid + 1
             }
             p = p + 1
         }

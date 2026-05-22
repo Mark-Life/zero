@@ -1,0 +1,266 @@
+// llama2 enhancement B: self-contained top-p / top-k sampler.
+//
+// libm-free mirror of the top-p / top-k additions to examples/llama2/src/sampler.0
+// (no softmax, no std.math) — so this runs in CI like sampler-sample.0. It exercises
+// the three new pieces over a fixed, already-normalized probability array:
+//   - sortDescByProb: in-place descending heapsort over parallel (prob, index)
+//     arrays (MIN-heap; index arithmetic only; no break — sift-down ends via a flag),
+//   - sampleTopp: nucleus prefix walk, byte-for-byte port of llama2.c sample_topp,
+//   - sampleTopk: renormalized top-k prefix draw (no llama2.c reference).
+// The scratch is bundled in a Sampler record (passed by pointer = one int reg) so the
+// helpers stay within the six-integer-register call cap, exactly as in the example.
+// (sampleTopk takes topk as a param here rather than from the record, so two k values
+// can be checked against one record; the example reads sampler.topk.) The example's
+// full softmax->dispatch path is exercised end-to-end under Docker (validate.sh).
+//
+// Fixed distribution (sum = 1, all distinct so the sort order is unambiguous):
+//   probs = [0.1, 0.4, 0.05, 0.3, 0.15]
+//   sorted desc -> prob [0.40, 0.30, 0.15, 0.10, 0.05], index [1, 3, 4, 0, 2]
+//   cumulative over the sorted prefix: 0.40, 0.70, 0.85, 0.95, 1.00
+// Cases pick topp/topk and coin so every comparison clears f32 rounding by >= 0.04.
+
+shape Sampler {
+    prob: MutSpan<f32>,
+    index: MutSpan<i32>,
+    temperature: f32,
+    topp: f32,
+    topk: i32,
+}
+
+fun sortDescByProb(prob: MutSpan<f32>, index: MutSpan<i32>, count: usize) -> Void {
+    if count < 2 {
+        return
+    }
+    let mut bp: usize = count / 2
+    while bp > 0 {
+        let startNode = bp - 1
+        let mut pos: usize = startNode
+        let mut sifting = true
+        while sifting {
+            let left = pos * 2 + 1
+            let right = pos * 2 + 2
+            let mut smallest = pos
+            if left < count {
+                let pl = prob[left]
+                let ps = prob[smallest]
+                if pl < ps {
+                    smallest = left
+                }
+            }
+            if right < count {
+                let pr = prob[right]
+                let ps2 = prob[smallest]
+                if pr < ps2 {
+                    smallest = right
+                }
+            }
+            let moved = smallest != pos
+            if moved {
+                let tp = prob[pos]
+                prob[pos] = prob[smallest]
+                prob[smallest] = tp
+                let ti = index[pos]
+                index[pos] = index[smallest]
+                index[smallest] = ti
+                pos = smallest
+            }
+            if moved == false {
+                sifting = false
+            }
+        }
+        bp = bp - 1
+    }
+    let mut ep: usize = count
+    while ep > 1 {
+        let end = ep - 1
+        let tp2 = prob[0]
+        prob[0] = prob[end]
+        prob[end] = tp2
+        let ti2 = index[0]
+        index[0] = index[end]
+        index[end] = ti2
+        let bound = end
+        let mut pos2: usize = 0
+        let mut sift2 = true
+        while sift2 {
+            let left2 = pos2 * 2 + 1
+            let right2 = pos2 * 2 + 2
+            let mut small2 = pos2
+            if left2 < bound {
+                let pl2 = prob[left2]
+                let psA = prob[small2]
+                if pl2 < psA {
+                    small2 = left2
+                }
+            }
+            if right2 < bound {
+                let pr2 = prob[right2]
+                let psB = prob[small2]
+                if pr2 < psB {
+                    small2 = right2
+                }
+            }
+            let moved2 = small2 != pos2
+            if moved2 {
+                let sp = prob[pos2]
+                prob[pos2] = prob[small2]
+                prob[small2] = sp
+                let si = index[pos2]
+                index[pos2] = index[small2]
+                index[small2] = si
+                pos2 = small2
+            }
+            if moved2 == false {
+                sift2 = false
+            }
+        }
+        ep = ep - 1
+    }
+}
+
+fun sampleTopp(sampler: Sampler, probs: Span<f32>, topp: f32, coin: f32) -> i32 {
+    let prob = sampler.prob
+    let index = sampler.index
+    let n = std.mem.len(probs)
+    let nf = (n as i32) as f32
+    let denom = nf - 1.0
+    let one: f32 = 1.0
+    let cutoff = (one - topp) / denom
+    let mut n0: usize = 0
+    let mut i: usize = 0
+    while i < n {
+        let p = probs[i]
+        let keep = p >= cutoff
+        if keep {
+            prob[n0] = p
+            index[n0] = i as i32
+            n0 = n0 + 1
+        }
+        i = i + 1
+    }
+    sortDescByProb(prob, index, n0)
+    let mut cumulative: f32 = 0.0
+    let mut last_idx: usize = 0
+    if n0 > 0 {
+        last_idx = n0 - 1
+    }
+    let mut found = false
+    let mut j: usize = 0
+    while j < n0 {
+        if found == false {
+            cumulative = cumulative + prob[j]
+            let over = cumulative > topp
+            if over {
+                last_idx = j
+                found = true
+                j = n0
+            }
+        }
+        if found == false {
+            j = j + 1
+        }
+    }
+    let r = coin * cumulative
+    let mut cdf: f32 = 0.0
+    let mut k: usize = 0
+    while k <= last_idx {
+        cdf = cdf + prob[k]
+        let hit = r < cdf
+        if hit {
+            return index[k]
+        }
+        k = k + 1
+    }
+    return index[last_idx]
+}
+
+fun sampleTopk(sampler: Sampler, probs: Span<f32>, topk: usize, coin: f32) -> i32 {
+    let prob = sampler.prob
+    let index = sampler.index
+    let n = std.mem.len(probs)
+    let mut i: usize = 0
+    while i < n {
+        prob[i] = probs[i]
+        index[i] = i as i32
+        i = i + 1
+    }
+    sortDescByProb(prob, index, n)
+    let mut k: usize = topk
+    if k > n {
+        k = n
+    }
+    let mut mass: f32 = 0.0
+    let mut a: usize = 0
+    while a < k {
+        mass = mass + prob[a]
+        a = a + 1
+    }
+    let r = coin * mass
+    let mut cdf: f32 = 0.0
+    let mut last: usize = 0
+    if k > 0 {
+        last = k - 1
+    }
+    let mut b: usize = 0
+    while b <= last {
+        cdf = cdf + prob[b]
+        let hit = r < cdf
+        if hit {
+            return index[b]
+        }
+        b = b + 1
+    }
+    return index[last]
+}
+
+pub fun main(world: World) -> Void raises {
+    // Fixed normalized distribution (sum = 1, distinct values).
+    let base: [5]f32 = [0.1, 0.4, 0.05, 0.3, 0.15]
+    let probs: Span<f32> = base
+
+    // Stack scratch (compile-time sized), bundled into the Sampler and reused.
+    let mut ps: [5]f32 = [0.0, 0.0, 0.0, 0.0, 0.0]
+    let mut ix: [5]i32 = [0, 0, 0, 0, 0]
+    let psp: MutSpan<f32> = ps
+    let ixp: MutSpan<i32> = ix
+    let sampler = Sampler {
+        prob: psp,
+        index: ixp,
+        temperature: 0.0,
+        topp: 0.0,
+        topk: 0
+    }
+
+    // --- sort sanity: copy probs into scratch, sort desc, check order + extremes.
+    let mut c0: usize = 0
+    while c0 < 5 {
+        ps[c0] = base[c0]
+        ix[c0] = c0 as i32
+        c0 = c0 + 1
+    }
+    sortDescByProb(psp, ixp, 5)
+    let okSort = ix[0] == 1 && ix[1] == 3 && ix[2] == 4 && ix[3] == 0 && ix[4] == 2
+    let okSortP = ps[0] > 0.399 && ps[0] < 0.401 && ps[4] > 0.049 && ps[4] < 0.051
+
+    // --- top-p: cutoff = (1-topp)/(n-1). topp 0.75 keeps {.4,.3,.15,.1} (drops .05),
+    // crosses 0.75 at the 3rd entry (cum 0.85) -> nucleus = indices [1,3,4].
+    let okPa = sampleTopp(sampler, probs, 0.75, 0.5) == 3
+    let okPb = sampleTopp(sampler, probs, 0.75, 0.1) == 1
+    let okPc = sampleTopp(sampler, probs, 0.75, 0.95) == 4
+    // topp 0.999 keeps all; crosses only at the last entry (cum 1.0).
+    let okPd = sampleTopp(sampler, probs, 0.999, 0.99) == 2
+
+    // --- top-k: renormalized prefix of the top k. k=2 mass 0.7; k=3 mass 0.85.
+    let okKa = sampleTopk(sampler, probs, 2, 0.5) == 1
+    let okKb = sampleTopk(sampler, probs, 2, 0.9) == 3
+    let okKc = sampleTopk(sampler, probs, 3, 0.95) == 4
+
+    let okSortAll = okSort && okSortP
+    let okPp = okPa && okPb && okPc && okPd
+    let okKk = okKa && okKb && okKc
+    let okAll = okSortAll && okPp && okKk
+    if okAll {
+        check world.out.write("sampler topk topp ok\n")
+    }
+    return
+}

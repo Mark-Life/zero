@@ -69,7 +69,7 @@ pub fun main(world: World) -> Void raises {
     let argc = std.args.len()
     let model_arg = std.args.get(1)
     if argc < 2 || model_arg.has == false {
-        check world.err.write("usage: llama2 <model.bin> --prompt <text> --tokens <n> [--temperature <t>]\n")
+        check world.err.write("usage: llama2 <model.bin> --prompt <text> --tokens <n> [--temperature <t>] [--topp <p>] [--topk <k>]\n")
         return
     }
     let model = model_arg.value
@@ -78,6 +78,10 @@ pub fun main(world: World) -> Void raises {
     let mut tokens_arg: String = "256"
     let mut temperature: String = "1.0"
     let mut tokenizer_path: String = "tokenizer.bin"
+    // top-p / top-k default to 0 (disabled) — plain multinomial, preserving v0.1
+    // behavior and the existing temperature-only parity tests.
+    let mut topp_arg: String = "0"
+    let mut topk_arg: String = "0"
 
     // Minimal flag scan: advance one arg at a time, match a known flag, and read
     // the following arg as its value. Values are assumed not to collide with flag
@@ -103,6 +107,18 @@ pub fun main(world: World) -> Void raises {
                 let v = std.args.get(i + 1)
                 if v.has {
                     temperature = v.value
+                }
+            }
+            if std.mem.eql(f, "--topp") {
+                let v = std.args.get(i + 1)
+                if v.has {
+                    topp_arg = v.value
+                }
+            }
+            if std.mem.eql(f, "--topk") {
+                let v = std.args.get(i + 1)
+                if v.has {
+                    topk_arg = v.value
                 }
             }
             if std.mem.eql(f, "--tokenizer") {
@@ -161,7 +177,28 @@ pub fun main(world: World) -> Void raises {
     }
     let mut tm: owned<Mapping> = tok_mapped.value
     let tok_bytes = std.fs.mappingBytes(&tm)
-    let tk = buildTokenizer(tok_bytes, cfg.vocab_size)
+
+    // Enhancement F: one combined vocab-index region for O(log vocab) tokenizer
+    // lookup — `2 * vocab` i32s, sliced inside buildTokenizer into an entry-offset
+    // table (O(1) random access) and a string-sorted id list (binary search).
+    // Allocated once here (anonymous mmap, like RunState) and filled + sorted by
+    // buildTokenizer. One region (not two) keeps the record-returning call within
+    // the direct backend's five-integer-argument cap.
+    let vocab_idx = cfg.vocab_size as usize
+    let idx_count = vocab_idx * 2
+    let idx_bytes_need = idx_count * 4
+    let idx_heap = std.mem.pageAlloc()
+    let idx_region = std.mem.allocBytes(idx_heap, idx_bytes_need)
+    if idx_region.has == false {
+        check world.err.write("error: cannot allocate tokenizer index\n")
+        std.fs.munmap(&mut tm)
+        std.fs.munmap(&mut m)
+        return
+    }
+    let idx_base: MutSpan<u8> = idx_region.value
+    let tok_idx: MutSpan<i32> = std.mem.bytesAsMutI32(idx_base)
+
+    let tk = buildTokenizer(tok_bytes, tok_idx)
     let prompt_bytes = std.mem.span(prompt)
     let prompt_need = std.mem.len(prompt_bytes) + 3
     let seq_cap = cfg.seq_len as usize
@@ -209,6 +246,13 @@ pub fun main(world: World) -> Void raises {
     // matching `llama2.c`'s `steps` clamp.
     let temp_bytes = std.mem.span(temperature)
     let temp = parseF32(temp_bytes)
+    // top-p is a float in (0,1); top-k a positive integer. Both default to 0
+    // (off). Parsed leniently like --temperature (std.parse is compile-time only).
+    let topp_bytes = std.mem.span(topp_arg)
+    let topp = parseF32(topp_bytes)
+    let topk_bytes = std.mem.span(topk_arg)
+    let topk_usize = parseUsize(topk_bytes)
+    let topk = topk_usize as i32
     let mut steps = parseUsize(tokens_bytes)
     let seq_len_u = cfg.seq_len as usize
     if steps == 0 {
@@ -231,6 +275,43 @@ pub fun main(world: World) -> Void raises {
     }
     let dec_scratch: MutSpan<u8> = dec_region.value
 
+    // Two vocab-sized scratch regions the top-p / top-k paths sort over: a prob
+    // copy (f32) and the parallel original-index array (i32). Allocated once and
+    // reused per token (like RunState), then bundled into the Sampler. Built here
+    // in straight-line position so the loop passes a plain record local (a record
+    // literal as a call arg is not allowed inside the loop).
+    let vocab_u = cfg.vocab_size as usize
+    let sp_need = vocab_u * 4
+    let sp_heap = std.mem.pageAlloc()
+    let sp_region = std.mem.allocBytes(sp_heap, sp_need)
+    if sp_region.has == false {
+        check world.err.write("error: cannot allocate sampler prob scratch\n")
+        std.fs.munmap(&mut tm)
+        std.fs.munmap(&mut m)
+        return
+    }
+    let sp_base: MutSpan<u8> = sp_region.value
+    let prob_scratch: MutSpan<f32> = std.mem.bytesAsMutF32(sp_base)
+
+    let ix_heap = std.mem.pageAlloc()
+    let ix_region = std.mem.allocBytes(ix_heap, sp_need)
+    if ix_region.has == false {
+        check world.err.write("error: cannot allocate sampler index scratch\n")
+        std.fs.munmap(&mut tm)
+        std.fs.munmap(&mut m)
+        return
+    }
+    let ix_base: MutSpan<u8> = ix_region.value
+    let index_scratch: MutSpan<i32> = std.mem.bytesAsMutI32(ix_base)
+
+    let sampler = Sampler {
+        prob: prob_scratch,
+        index: index_scratch,
+        temperature: temp,
+        topp: topp,
+        topk: topk
+    }
+
     // Autoregressive generation loop (llama2.c `generate`). A fixed PRNG seed
     // keeps temperature>0 runs reproducible; temperature 0 (argmax) ignores it.
     let mut rng: u64 = 12345
@@ -250,7 +331,7 @@ pub fun main(world: World) -> Void raises {
         if in_prompt == false {
             rng = rngNext(rng)
             let coin = randomF32(rng)
-            next = sample(step_logits, temp, coin)
+            next = sample(sampler, step_logits, coin)
         }
         pos = pos + 1
 
