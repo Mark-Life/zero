@@ -252,14 +252,46 @@ pub fun encode(t: Tokenizer, text: Span<u8>, out: MutSpan<i32>, bos: Bool) -> us
     return nTok
 }
 
-// The display bytes for `token`, as a view into the mapped vocab. Mirrors
-// `llama2.c` `decode`: after BOS (prev == 1) a single leading space is stripped
-// (the sentencepiece dummy-prefix convention). The raw-byte `<0xNN>` form is not
-// expanded in v0.1 — those fallback tokens are rare in argmax story output and
-// expanding one needs a writable single-byte buffer the backend can't emit yet.
-pub fun decode(t: Tokenizer, prev: i32, token: i32) -> Span<u8> {
+// Value (0..15) of a single ASCII hex digit byte, or -1 if it is not a hex
+// digit. Accepts both upper- and lower-case a-f.
+fun hexDigit(b: u8) -> i32 {
+    let v = b as i32
+    let zero = 48 as i32
+    let nine = 57 as i32
+    if v >= zero {
+        if v <= nine {
+            return v - zero
+        }
+    }
+    let bigA = 65 as i32
+    let bigF = 70 as i32
+    if v >= bigA {
+        if v <= bigF {
+            return v - bigA + 10
+        }
+    }
+    let lowA = 97 as i32
+    let lowF = 102 as i32
+    if v >= lowA {
+        if v <= lowF {
+            return v - lowA + 10
+        }
+    }
+    return 0 - 1
+}
+
+// The display bytes for `token`. Mirrors `llama2.c` `decode`: after BOS
+// (prev == 1) a single leading space is stripped (the sentencepiece dummy-prefix
+// convention), and a raw-byte fallback token of the form `<0xNN>` decodes to the
+// single byte 0xNN. `scratch` is caller-owned writable storage (>= 1 byte) used
+// to hold that one decoded byte so the returned span outlives this call; for all
+// other tokens the result is a zero-copy view into the mapped vocab.
+pub fun decode(t: Tokenizer, prev: i32, token: i32, scratch: MutSpan<u8>) -> Span<u8> {
     let piece = tokenStr(t, token)
     let plen = std.mem.len(piece)
+
+    // Strip a single sentencepiece dummy-prefix space right after BOS first, then
+    // inspect the resulting window — the same order as `llama2.c` `decode`.
     let mut lo: usize = 0
     if prev == 1 {
         if plen > 0 {
@@ -270,6 +302,35 @@ pub fun decode(t: Tokenizer, prev: i32, token: i32) -> Span<u8> {
             }
         }
     }
+
+    // Raw-byte fallback: a `<0xNN>` window (exactly 6 bytes) -> the single byte
+    // 0xNN, matching `llama2.c`'s `sscanf(piece, "<0x%02hhX>", ...)`.
+    let span = plen - lo
+    if span == 6 {
+        let lt = piece[lo] == (60 as u8)
+        let z0 = piece[lo + 1] == (48 as u8)
+        let xc = piece[lo + 2] == (120 as u8)
+        let gt = piece[lo + 5] == (62 as u8)
+        if lt {
+            if z0 {
+                if xc {
+                    if gt {
+                        let hi = hexDigit(piece[lo + 3])
+                        let lo2 = hexDigit(piece[lo + 4])
+                        if hi >= 0 {
+                            if lo2 >= 0 {
+                                let val = hi * 16 + lo2
+                                scratch[0] = val as u8
+                                let one = scratch[0..1]
+                                return one
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let res = piece[lo..plen]
     return res
 }

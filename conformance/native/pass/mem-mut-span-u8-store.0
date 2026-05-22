@@ -1,0 +1,33 @@
+pub fun main(world: World) -> Void raises {
+    let alloc = std.mem.pageAlloc()
+    let region = std.mem.allocBytes(alloc, 256)
+    if region.has {
+        let buf: MutSpan<u8> = region.value
+        // Write computed bytes through the span index, then read them back.
+        let mut i: usize = 0
+        while i < 256 {
+            let v = (i * 7 + 3) % 256
+            buf[i] = v as u8
+            i = i + 1
+        }
+        let mut ok = true
+        let mut j: usize = 0
+        while j < 256 {
+            let got = buf[j]
+            let want = ((j * 7 + 3) % 256) as u8
+            if got == want {
+                ok = ok
+            } else {
+                ok = false
+            }
+            j = j + 1
+        }
+        let a: u8 = buf[0]
+        let b: u8 = buf[255]
+        let three: u8 = 3
+        let last: u8 = ((255 * 7 + 3) % 256) as u8
+        if ok && std.mem.len(buf) == 256 && a == three && b == last {
+            check world.out.write("mem mut span u8 store ok\n")
+        }
+    }
+}

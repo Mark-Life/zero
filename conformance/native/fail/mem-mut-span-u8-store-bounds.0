@@ -1,0 +1,10 @@
+pub fun main(world: World) -> Void raises {
+    let alloc = std.mem.pageAlloc()
+    let region = std.mem.allocBytes(alloc, 8)
+    if region.has {
+        let buf: MutSpan<u8> = region.value
+        let bad: usize = 8
+        buf[bad] = 1 as u8
+        check world.out.write("unreachable\n")
+    }
+}

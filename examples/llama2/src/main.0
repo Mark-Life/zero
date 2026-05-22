@@ -218,6 +218,19 @@ pub fun main(world: World) -> Void raises {
         steps = seq_len_u
     }
 
+    // One-byte scratch the tokenizer writes raw-byte `<0xNN>` fallback tokens into,
+    // so `decode` can return a span that outlives the call (page stays mapped for
+    // the whole run).
+    let dec_heap = std.mem.pageAlloc()
+    let dec_region = std.mem.allocBytes(dec_heap, 4096)
+    if dec_region.has == false {
+        check world.err.write("error: cannot allocate decode scratch\n")
+        std.fs.munmap(&mut tm)
+        std.fs.munmap(&mut m)
+        return
+    }
+    let dec_scratch: MutSpan<u8> = dec_region.value
+
     // Autoregressive generation loop (llama2.c `generate`). A fixed PRNG seed
     // keeps temperature>0 runs reproducible; temperature 0 (argmax) ignores it.
     let mut rng: u64 = 12345
@@ -249,8 +262,9 @@ pub fun main(world: World) -> Void raises {
             pos = steps
         }
         if stop == false {
-            // Stream the decoded piece (a view into the live tokenizer mapping).
-            let piece = decode(tk, token, next)
+            // Stream the decoded piece (a view into the live tokenizer mapping,
+            // or the decode scratch for a raw-byte `<0xNN>` fallback token).
+            let piece = decode(tk, token, next, dec_scratch)
             check world.out.write(piece)
             token = next
         }

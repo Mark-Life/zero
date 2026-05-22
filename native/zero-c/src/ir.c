@@ -1621,6 +1621,8 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
       }
       if (expr->left && expr->left->kind == EXPR_IDENT) {
         const IrLocal *span_local = ir_function_find_local(fun, expr->left->text);
+        // u8 byte-view reads stay on IR_VALUE_BYTE_VIEW_INDEX_LOAD (handled by all
+        // object backends); only wider element types use the typed INDEX_LOAD here.
         if (span_local && span_local->type == IR_TYPE_BYTE_VIEW && span_local->element_type != IR_TYPE_U8) {
           IrValue *index = NULL;
           if (!ir_lower_expr(program, ir, fun, expr->right, &index)) return false;
@@ -3193,7 +3195,7 @@ static bool ir_lower_index_store(const Program *program, IrProgram *ir, IrFuncti
     return false;
   }
   const IrLocal *local = ir_function_find_local(mir_fun, target->left->text);
-  bool is_span_target = local && local->type == IR_TYPE_BYTE_VIEW && local->element_type != IR_TYPE_U8;
+  bool is_span_target = local && local->type == IR_TYPE_BYTE_VIEW;
   if (!local || (!local->is_array && !is_span_target)) {
     ir_mark_unsupported(ir, "direct backend indexed assignment target is not a fixed array or span local", line, column, target->left->text);
     return false;
