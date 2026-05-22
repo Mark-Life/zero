@@ -242,6 +242,12 @@ string and asserts the token sequence; optionally a timing note in `validate.sh`
 
 # G. Real Llama-2 models + int8 quantization
 
+**Plan: [`quantization.md`](./quantization.md)** — full phased implementation plan. It
+supersedes this section's "Both / needs `bytesAsI8`" framing: the int8 path lands in **pure
+Zero, no compiler change** (read weight quants as `u8` + arithmetic sign-decode; keep
+activation quants in an `i32` scratch via item C). `bytesAsI8`/`i8` is demoted to an optional
+perf follow-up. The spec below is the original sketch, kept for context.
+
 **Goal.** Run a model people actually use — TinyLlama-1.1B or Llama-2-7B — not just
 TinyStories. Closes README limitation #2's "tuned for stories15M" framing for real.
 
@@ -289,6 +295,10 @@ Phase 8), then a real quantized TinyLlama/Llama-2-7B producing coherent output u
 ---
 
 # E. Cross-platform (macOS / Windows / ARM) — "not only Linux"
+
+**Status: 📋 Planned** — implementation plan in [`cross-platform.md`](./cross-platform.md)
+(scopes native macOS arm64 first; Windows + Linux-ARM64 as follow-ons). The spec below is the
+original backlog entry, kept for context.
 
 **Goal.** Run the binary natively off linux-musl-x64. For *this* repo's owner the prize is
 native **macOS arm64** (kills the Docker dependency on your own machine). Closes README
@@ -492,6 +502,7 @@ bash examples/llama2/validate.sh
 ## Connections
 
 - [`plan.md`](./plan.md) — v0.1 implementation (complete), phase notes, backend gotchas.
+- [`cross-platform.md`](./cross-platform.md) — implementation plan for item E (native macOS arm64).
 - [`overview.md`](./overview.md) — mission, original roadmap (v0.2–v0.7), open questions.
 - [`aggregate-abi.md`](./aggregate-abi.md) — the direct-backend record/span ABI and its limits.
 - [`phase-0-followups.md`](./phase-0-followups.md) — Phase 0 hardening items for upstream.
