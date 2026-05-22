@@ -164,14 +164,24 @@ pub fun main(world: World) -> Void raises {
     let tk = buildTokenizer(tok_bytes, cfg.vocab_size)
     let prompt_bytes = std.mem.span(prompt)
     let prompt_need = std.mem.len(prompt_bytes) + 3
-    if prompt_need > 1024 {
-        check world.err.write("error: prompt too long for v0.1 (max 1021 bytes)\n")
+    let seq_cap = cfg.seq_len as usize
+    if prompt_need > seq_cap {
+        check world.err.write("error: prompt too long for this model's context window\n")
         std.fs.munmap(&mut tm)
         std.fs.munmap(&mut m)
         return
     }
-    let mut prompt_tokens: [1024]i32 = [0_i32; 1024]
-    let pt: MutSpan<i32> = prompt_tokens
+    let pt_bytes_need = seq_cap * 4
+    let pt_heap = std.mem.pageAlloc()
+    let pt_region = std.mem.allocBytes(pt_heap, pt_bytes_need)
+    if pt_region.has == false {
+        check world.err.write("error: cannot allocate prompt token buffer\n")
+        std.fs.munmap(&mut tm)
+        std.fs.munmap(&mut m)
+        return
+    }
+    let pt_base: MutSpan<u8> = pt_region.value
+    let pt: MutSpan<i32> = std.mem.bytesAsMutI32(pt_base)
     let n_prompt = encode(tk, prompt_bytes, pt, true)
     if n_prompt < 1 {
         check world.err.write("error: prompt encoded to zero tokens\n")

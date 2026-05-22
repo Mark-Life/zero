@@ -328,6 +328,8 @@ for (const fixture of [
   "conformance/native/pass/mem-bytes-as-mut-f32.0",
   "conformance/native/pass/mem-bytes-as-f64.0",
   "conformance/native/pass/mem-bytes-as-f32-mmap.0",
+  "conformance/native/pass/mem-bytes-as-i32.0",
+  "conformance/native/pass/mem-bytes-as-mut-i32.0",
   "conformance/native/pass/mem-mut-span-slice.0",
   "conformance/native/pass/transformer-forward.0",
   "conformance/native/pass/tokenizer-encode.0",
@@ -1866,6 +1868,8 @@ for (const runtimeFixture of [
   ["conformance/native/pass/mem-bytes-as-mut-f32.0", "mem-bytes-as-mut-f32", { stdout: "mem bytes as mut f32 ok\n" }],
   ["conformance/native/pass/mem-bytes-as-f64.0", "mem-bytes-as-f64", { stdout: "mem bytes as f64 ok\n" }],
   ["conformance/native/pass/mem-bytes-as-f32-mmap.0", "mem-bytes-as-f32-mmap", { stdout: "mem bytes as f32 mmap ok\n" }],
+  ["conformance/native/pass/mem-bytes-as-i32.0", "mem-bytes-as-i32", { stdout: "mem bytes as i32 ok\n" }],
+  ["conformance/native/pass/mem-bytes-as-mut-i32.0", "mem-bytes-as-mut-i32", { stdout: "mem bytes as mut i32 ok\n" }],
   ["conformance/native/pass/mem-mut-span-slice.0", "mem-mut-span-slice", { stdout: "mem mut span slice ok\n" }],
   ["conformance/native/pass/transformer-forward.0", "transformer-forward", { stdout: "transformer forward ok\n", libm: true }],
   ["conformance/native/pass/tokenizer-encode.0", "tokenizer-encode", { stdout: "tokenizer encode ok\n" }],
@@ -1947,6 +1951,7 @@ await assertBoundsTrap("conformance/native/fail/indexed-mutation-oob.0", "indexe
 await assertBoundsTrap("conformance/native/fail/codec-read-f32-le-bounds.0", "codec-read-f32-le-bounds");
 await assertBoundsTrap("conformance/native/fail/codec-read-i32-le-bounds.0", "codec-read-i32-le-bounds");
 await assertBoundsTrap("conformance/native/fail/mem-bytes-as-f32-bounds.0", "mem-bytes-as-f32-bounds");
+await assertBoundsTrap("conformance/native/fail/mem-bytes-as-i32-bounds.0", "mem-bytes-as-i32-bounds");
 
 // A record-returning call as an argument can't be hoisted into a loop condition
 // (it would build once, not per iteration); the direct backend rejects it instead

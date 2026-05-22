@@ -985,6 +985,10 @@ static const char *std_call_return_type(const Expr *callee) {
   else if (strcmp(name.data, "std.mem.bytesAsF64") == 0) result = "Span<f64>";
   else if (strcmp(name.data, "std.mem.bytesAsMutF32") == 0) result = "MutSpan<f32>";
   else if (strcmp(name.data, "std.mem.bytesAsMutF64") == 0) result = "MutSpan<f64>";
+  else if (strcmp(name.data, "std.mem.bytesAsI32") == 0) result = "Span<i32>";
+  else if (strcmp(name.data, "std.mem.bytesAsU32") == 0) result = "Span<u32>";
+  else if (strcmp(name.data, "std.mem.bytesAsMutI32") == 0) result = "MutSpan<i32>";
+  else if (strcmp(name.data, "std.mem.bytesAsMutU32") == 0) result = "MutSpan<u32>";
   else if (strcmp(name.data, "std.mem.bufLen") == 0) result = "usize";
   else if (strcmp(name.data, "std.mem.reset") == 0) result = "Void";
   else if (strcmp(name.data, "std.mem.capacity") == 0) result = "usize";
@@ -1152,6 +1156,10 @@ static int std_call_arg_count(const char *name) {
   if (strcmp(name, "std.mem.bytesAsF64") == 0) return 1;
   if (strcmp(name, "std.mem.bytesAsMutF32") == 0) return 1;
   if (strcmp(name, "std.mem.bytesAsMutF64") == 0) return 1;
+  if (strcmp(name, "std.mem.bytesAsI32") == 0) return 1;
+  if (strcmp(name, "std.mem.bytesAsU32") == 0) return 1;
+  if (strcmp(name, "std.mem.bytesAsMutI32") == 0) return 1;
+  if (strcmp(name, "std.mem.bytesAsMutU32") == 0) return 1;
   if (strcmp(name, "std.mem.bufLen") == 0) return 1;
   if (strcmp(name, "std.mem.reset") == 0) return 1;
   if (strcmp(name, "std.mem.capacity") == 0) return 1;
@@ -1311,6 +1319,10 @@ static const char *std_call_arg_type(const char *name, size_t index) {
   if (strcmp(name, "std.mem.bytesAsF64") == 0) return "Span<u8>";
   if (strcmp(name, "std.mem.bytesAsMutF32") == 0) return "MutSpan<u8>";
   if (strcmp(name, "std.mem.bytesAsMutF64") == 0) return "MutSpan<u8>";
+  if (strcmp(name, "std.mem.bytesAsI32") == 0) return "Span<u8>";
+  if (strcmp(name, "std.mem.bytesAsU32") == 0) return "Span<u8>";
+  if (strcmp(name, "std.mem.bytesAsMutI32") == 0) return "MutSpan<u8>";
+  if (strcmp(name, "std.mem.bytesAsMutU32") == 0) return "MutSpan<u8>";
   if (strcmp(name, "std.mem.bufLen") == 0) return "ref<ByteBuf>";
   if (strcmp(name, "std.mem.reset") == 0) return "mutref<FixedBufAlloc>";
   if (strcmp(name, "std.mem.capacity") == 0) return "FixedBufAlloc";

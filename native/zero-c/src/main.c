@@ -861,6 +861,10 @@ static const StdHelperInfo std_helpers[] = {
   {"std.mem.bytesAsF64", "Span<f64>", 1, "memory", "target-neutral", "reinterprets borrowed bytes as f64; no copy", false},
   {"std.mem.bytesAsMutF32", "MutSpan<f32>", 1, "memory", "target-neutral", "reinterprets borrowed bytes as mutable f32; no copy", false},
   {"std.mem.bytesAsMutF64", "MutSpan<f64>", 1, "memory", "target-neutral", "reinterprets borrowed bytes as mutable f64; no copy", false},
+  {"std.mem.bytesAsI32", "Span<i32>", 1, "memory", "target-neutral", "reinterprets borrowed bytes as i32; no copy", false},
+  {"std.mem.bytesAsU32", "Span<u32>", 1, "memory", "target-neutral", "reinterprets borrowed bytes as u32; no copy", false},
+  {"std.mem.bytesAsMutI32", "MutSpan<i32>", 1, "memory", "target-neutral", "reinterprets borrowed bytes as mutable i32; no copy", false},
+  {"std.mem.bytesAsMutU32", "MutSpan<u32>", 1, "memory", "target-neutral", "reinterprets borrowed bytes as mutable u32; no copy", false},
   {"std.mem.bufLen", "usize", 1, "memory", "target-neutral", "no allocation", false},
   {"std.mem.reset", "Void", 1, "alloc", "target-neutral", "resets explicit allocator", true},
   {"std.mem.capacity", "usize", 1, "alloc", "target-neutral", "no allocation", false},
@@ -8211,7 +8215,7 @@ static void append_self_host_subset_json(ZBuf *buf, const Program *program, cons
   zbuf_append(buf, "],\"sourceForms\":[\"package-local-modules\",\"functions\",\"while\",\"if\",\"return\",\"fixed-arrays\",\"primitive-locals\",\"shape\",\"enum\",\"minimal-choice\",\"strings\",\"byte-spans\",\"fallibility\",\"explicit-alloc\"]");
   zbuf_append(buf, ",\"featureFacts\":{");
   zbuf_append(buf, "\"strings\":{\"status\":\"native-direct-lowered\",\"representation\":\"readonly-data-ptr-len\",\"indexing\":\"bounds-checked-u8\",\"slicing\":\"bounds-checked-byte-view\",\"dataSegments\":true}");
-  zbuf_append(buf, ",\"spans\":{\"status\":\"native-direct-lowered\",\"readonlyRepresentation\":\"ptr-len\",\"mutableRepresentation\":\"ptr-len-mutspan-u8\",\"helpers\":[\"std.mem.len\",\"std.mem.eqlBytes\",\"std.mem.copy\",\"std.mem.fill\",\"std.mem.bytesAsF32\",\"std.mem.bytesAsF64\",\"std.mem.bytesAsMutF32\",\"std.mem.bytesAsMutF64\"]}");
+  zbuf_append(buf, ",\"spans\":{\"status\":\"native-direct-lowered\",\"readonlyRepresentation\":\"ptr-len\",\"mutableRepresentation\":\"ptr-len-mutspan-u8\",\"helpers\":[\"std.mem.len\",\"std.mem.eqlBytes\",\"std.mem.copy\",\"std.mem.fill\",\"std.mem.bytesAsF32\",\"std.mem.bytesAsF64\",\"std.mem.bytesAsMutF32\",\"std.mem.bytesAsMutF64\",\"std.mem.bytesAsI32\",\"std.mem.bytesAsU32\",\"std.mem.bytesAsMutI32\",\"std.mem.bytesAsMutU32\"]}");
   zbuf_append(buf, ",\"aggregates\":{\"shape\":\"staged\",\"enum\":\"staged\",\"choice\":\"staged\",\"directLowering\":false}");
   zbuf_append(buf, ",\"fallibility\":{\"status\":\"staged\",\"directLowering\":false}");
   zbuf_append(buf, ",\"containers\":{\"status\":\"staged-explicit-storage\",\"directLowering\":false}");

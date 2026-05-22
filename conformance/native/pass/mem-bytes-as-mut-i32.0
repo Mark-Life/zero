@@ -1,0 +1,26 @@
+pub fun main(world: World) -> Void raises {
+    let alloc = std.mem.pageAlloc()
+    let region = std.mem.allocBytes(alloc, 4096)
+    if region.has {
+        let bytes: MutSpan<u8> = region.value
+        let ints: MutSpan<i32> = std.mem.bytesAsMutI32(bytes)
+        ints[0] = 7
+        ints[1] = 0 - 9
+        ints[3] = ints[0] + ints[1]
+        ints[1023] = 123456
+        let v0: i32 = ints[0]
+        let v1: i32 = ints[1]
+        let v2: i32 = ints[2]
+        let v3: i32 = ints[3]
+        let last: i32 = ints[1023]
+        let seven: i32 = 7
+        let negNine: i32 = 0 - 9
+        let zero: i32 = 0
+        let negTwo: i32 = 0 - 2
+        let big: i32 = 123456
+        if std.mem.len(ints) == 1024 && v0 == seven && v1 == negNine &&
+            v2 == zero && v3 == negTwo && last == big {
+            check world.out.write("mem bytes as mut i32 ok\n")
+        }
+    }
+}

@@ -20,6 +20,8 @@ Runnable today:
 | `std.mem.bufBytes(&buf)` | `MutSpan<u8>` | Borrows writable bytes from an owned `ByteBuf`. |
 | `std.mem.bytesAsF32(bytes)` / `std.mem.bytesAsF64(bytes)` | `Span<f32>` / `Span<f64>` | Reinterprets a `Span<u8>` as a typed float view over the same bytes — no copy, no allocation. Length becomes `byteLen / 4` (or `/ 8`); the pointer is unchanged. |
 | `std.mem.bytesAsMutF32(bytes)` / `std.mem.bytesAsMutF64(bytes)` | `MutSpan<f32>` / `MutSpan<f64>` | Mutable form over `MutSpan<u8>`. Required to *write* float results into a heap region: there is no `writeF32Le`, so kernels store through a typed span. |
+| `std.mem.bytesAsI32(bytes)` / `std.mem.bytesAsU32(bytes)` | `Span<i32>` / `Span<u32>` | Reinterprets a `Span<u8>` as a typed 32-bit integer view over the same bytes — no copy, no allocation. Length becomes `byteLen / 4`; the pointer is unchanged. |
+| `std.mem.bytesAsMutI32(bytes)` / `std.mem.bytesAsMutU32(bytes)` | `MutSpan<i32>` / `MutSpan<u32>` | Mutable form over `MutSpan<u8>`. Required to *write* 32-bit integer results into a heap region: there is no `writeI32Le`, so callers store through a typed span. |
 | `std.mem.bufLen(&buf)` | `usize` | Returns the live length of a `ByteBuf`. |
 | `std.mem.reset(&mut arena)` | `Void` | Resets caller-owned arena/fixed-buffer allocation state. |
 | `std.mem.capacity(arena)` | `usize` | Reports fixed-buffer capacity. |

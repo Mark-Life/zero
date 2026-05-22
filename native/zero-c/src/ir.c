@@ -1167,6 +1167,14 @@ static bool ir_byte_view_reinterpret_element(const char *callee, IrTypeKind *out
     if (out) *out = IR_TYPE_F64;
     return true;
   }
+  if (strcmp(callee, "std.mem.bytesAsI32") == 0 || strcmp(callee, "std.mem.bytesAsMutI32") == 0) {
+    if (out) *out = IR_TYPE_I32;
+    return true;
+  }
+  if (strcmp(callee, "std.mem.bytesAsU32") == 0 || strcmp(callee, "std.mem.bytesAsMutU32") == 0) {
+    if (out) *out = IR_TYPE_U32;
+    return true;
+  }
   return false;
 }
 

@@ -1,0 +1,29 @@
+pub fun main(world: World) -> Void raises {
+    let buf: [12]u8 = [1, 0, 0, 0, 2, 1, 0, 0, 255, 255, 255, 255]
+    let span: Span<u8> = buf
+    let view: Span<i32> = std.mem.bytesAsI32(span)
+    let r0: i32 = view[0]
+    let r1: i32 = view[1]
+    let r2: i32 = view[2]
+    let one: i32 = 1
+    let twoFiftyEight: i32 = 258
+    let negOne: i32 = 0 - 1
+    let alloc = std.mem.pageAlloc()
+    let region = std.mem.allocBytes(alloc, 4096)
+    if region.has && std.mem.len(view) == 3 && r0 == one && r1 == twoFiftyEight && r2 == negOne {
+        let bytes: MutSpan<u8> = region.value
+        let ints: MutSpan<i32> = std.mem.bytesAsMutI32(bytes)
+        ints[0] = 1000
+        ints[1] = 0 - 1000
+        ints[1023] = ints[0] + ints[1]
+        let a: i32 = ints[0]
+        let b: i32 = ints[1]
+        let c: i32 = ints[1023]
+        let thousand: i32 = 1000
+        let negThousand: i32 = 0 - 1000
+        let zero: i32 = 0
+        if std.mem.len(ints) == 1024 && a == thousand && b == negThousand && c == zero {
+            check world.out.write("mem bytes as i32 ok\n")
+        }
+    }
+}
