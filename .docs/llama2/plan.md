@@ -524,12 +524,60 @@ incl. the no-`break` exit), `generatedCBytes == 0` ⇒ **runs in CI**; wired int
 + runtime lists). The full libm+fs pipeline is Docker-validated through the example.
 `conformance` + `docs:test` green.
 
-### Phase 8 — Validation
+### Phase 8 — Validation — ✅ DONE (2026-05-22, `feat/std-math-llama2`)
 
 Numerical parity vs `llama2.c` on stories15M (same prompt, temperature 0 = deterministic
 argmax → exact token stream modulo libm ULPs). Land as a conformance fixture
 (`assertDirectRuntimeOrUnsupported`, `libm: true`) and/or `benchmarks/zero/` entry
 (overview Open Question #5). Document weight download in README.
+
+**✅ Landed:** the Zero example matches `karpathy/llama2.c` **token-for-token** on the real
+60MB `stories15M.bin`. Verified end-to-end via zig + `docker run --platform linux/amd64`
+(both binaries link the **same musl libm** — the Zero exe statically via zig, the C reference
+compiled under amd64 Alpine — so libm is not a variable):
+
+- **Temperature 0 (greedy argmax):** byte-identical output across prompts (`"Once upon a
+  time"`, `"Lily and Tom went to the park"`, `"The little robot"`, `"One day"` @256 tok, and
+  the empty prompt = pure BOS generation). The canonical `"Once upon a time"` continuation is
+  the expected *"...a little girl named Lily. She loved to play outside in the sunshine..."*.
+- **Temperature > 0 (softmax + PRNG + multinomial):** also byte-identical once the seed and
+  sampler are aligned — `llama2.c` with `-s 12345 -p 0` (fixed seed; top-p disabled, since
+  v0.1 uses plain multinomial) reproduces the Zero stream exactly. This works because the
+  xorshift\* PRNG was ported bit-for-bit in Phase 6, so the whole softmax→coin→`sampleMult`
+  path matches, not just argmax.
+- **One documented deviation (not a numeric/token difference):** raw-byte `<0xNN>` fallback
+  tokens are printed literally by v0.1 (Phase 5), where `llama2.c` emits the byte — same token
+  *ids*. The harness normalizes `<0xNN>`→byte before diffing. (top-p/top-k remain deferred;
+  hence `-p 0` on the reference.)
+
+**Deliverables (Open Q5 "both"):**
+
+- **Reproducible script** `examples/llama2/validate.sh` — fetches weights + tokenizer +
+  `run.c`, builds both, runs the parity matrix (5 temp-0 + 3 temp>0 cases), normalizes raw-byte
+  tokens, diffs. Prints `PASS: llama2.zero matches llama2.c token-for-token on stories15M.`
+  Requires Docker + node (the busybox container has no perl/python, so normalization runs
+  host-side via node, a repo dependency).
+- **CI conformance fixture** `conformance/native/pass/generate-argmax.0` (`libm: true`) — the
+  "small deterministic conformance fixture (tiny token budget)" Open Q5 calls for. A
+  self-contained mirror of the example (kernels + `forward` + `argmax` + the `main.0`
+  generation loop) on a tiny synthetic model (dim 4 / 1 layer / 2 heads / **seq_len 6 / vocab
+  4**), running the full forward→argmax→feedback loop for six steps and asserting the exact
+  emitted token sequence `2 3 1 0 2 3` against a libm C reference
+  (`.zero/probe/llama2_gen_ref.c`). Wired into `run.mjs` (check + runtime lists). Two design
+  points: it uses an **unshared classifier** (`wcls` ≠ `tet`) so the argmax isn't pinned to a
+  self-similar fixed point (a shared classifier makes token 0 an attractor → degenerate `0 0 0
+  0 0 0`); and the smallest argmax margin is 0.077 (far above libm ULP slack), so the sequence
+  is robust. This is the integration the per-component fixtures (`transformer-forward`,
+  `sampler-sample`, `generate-loop`) don't cover: forward feeds argmax feeds the KV cache feeds
+  forward, producing a specific multi-token stream.
+- **No compiler change** — Phase 8 is pure tooling/validation (third llama2 phase needing none,
+  after 6 and 7). No conformance/`native:test`/`docs:test` regressions.
+
+**Deferred (not blocking v0.1):** a `benchmarks/zero/` perf entry — the bench harness runs
+single `.0` files, but llama2 is a multi-file fs+libm package needing the 60MB model under
+`--backend zero-elf64` + Docker, so it doesn't fit the single-file harness. The validation
+script already surfaces a perf signal (the reference prints `achieved tok/s`); a formal
+benchmark is a post-v0.1 follow-up (overview #6, ties to SIMD).
 
 ## File Touchpoints
 
@@ -545,7 +593,9 @@ argmax → exact token stream modulo libm ULPs). Land as a conformance fixture
 | `docs-site/articles/modules/{fs,mem,codec}.md` | 0a/0b | status entries |
 | `conformance/native/{pass,fail}/mmap-*.0`, `page-alloc-*.0`, `codec-read-i32-le.0`, `aggregate-shape-abi.0` | 0a/0b/2 | fixtures |
 | `conformance/native/pass/generate-loop.0` | 7 | `parseUsize` + generation control-flow fixture (CI) |
-| `examples/llama2/zero.json` + `README.md` | 1/2/7 | manifest, weight download, `--backend` build, run/stream |
+| `conformance/native/pass/generate-argmax.0` | 8 | end-to-end forward→argmax→feedback fixture, exact token seq (CI, libm) |
+| `examples/llama2/validate.sh` | 8 | real-stories15M parity vs `llama2.c` (Docker; temp 0 + temp>0) |
+| `examples/llama2/zero.json` + `README.md` | 1/2/7/8 | manifest, weight download, `--backend` build, run/stream, validation |
 | `examples/llama2/src/main.0` | 1/2/7 | CLI, load, generation loop |
 | `examples/llama2/src/checkpoint.0` | 2 | header + weight views |
 | `examples/llama2/src/ops.0` | 3 | rmsnorm/matmul/softmax/rope/swiglu |
@@ -563,13 +613,13 @@ argmax → exact token stream modulo libm ULPs). Land as a conformance fixture
 5. **Numerical parity.** libm pins to musl (F5); reference must be generated against musl. Temperature 0 (argmax) gives a deterministic stream for exact-ish comparison; sampled output only checks distribution/sanity.
 6. **f64 absent in `std.math`.** Forward pass is f32 throughout (matches stories15M and llama2.c) — not a blocker, just a constraint to hold.
 
-## Exit Criteria
+## Exit Criteria — ✅ all met (v0.1, 2026-05-22)
 
-- `std.fs.mmap` + real `pageAlloc` land with fixtures green; a program reads f32 from a mapped file and allocates a zeroed multi-MB region at runtime.
-- `examples/llama2` builds for `linux-musl-x64` and runs stories15M end-to-end.
-- Generated tokens match `llama2.c` (temperature 0) within libm tolerance.
-- `pnpm run conformance` / `native:test` / `docs:test` green with new fixtures + docs.
-- README documents weight/tokenizer download, build, run.
+- ✅ `std.fs.mmap` + real `pageAlloc` land with fixtures green; a program reads f32 from a mapped file and allocates a zeroed multi-MB region at runtime. (Phase 0a)
+- ✅ `examples/llama2` builds for `linux-musl-x64` and runs stories15M end-to-end. (Phase 7; verified Phase 8 under Docker)
+- ✅ Generated tokens match `llama2.c` (temperature 0) within libm tolerance — in fact byte-identical, and also at temperature > 0 with the seed/sampler aligned. (Phase 8)
+- ✅ `pnpm run conformance` / `native:test` / `docs:test` green with new fixtures + docs.
+- ✅ README documents weight/tokenizer download, build, run — plus a `validate.sh` parity harness.
 
 ## Open Questions
 

@@ -1,0 +1,591 @@
+// llama2 Phase 8: end-to-end greedy generation on a tiny synthetic model.
+//
+// Self-contained mirror of examples/llama2 (checkpoint shapes + ops kernels +
+// transformer.forward + sampler.argmax + the main.0 generation loop), shrunk to
+// dim=4/hidden=8/1 layer/2 heads/seq=6/vocab=4 with deterministic integer-filled
+// weights (same fills as transformer-forward.0, plus a distinct *unshared*
+// classifier so the argmax isn't pinned to a self-similar fixed point). Starting
+// from token 0, it runs the autoregressive loop — forward at pos, take argmax of
+// the logits, feed the chosen token back in — for six steps and checks the
+// emitted token sequence against a libm C reference (.zero/probe/llama2_gen_ref.c
+// -> 2 3 1 0 2 3; smallest argmax margin 0.077, far above libm ULP slack). This
+// is the integration test the per-component fixtures don't cover: forward feeds
+// argmax feeds the KV cache feeds forward, producing a specific token stream —
+// the same property validated against llama2.c on real stories15M (Phase 8).
+
+shape Config {
+    dim: i32,
+    hidden_dim: i32,
+    n_layers: i32,
+    n_heads: i32,
+    n_kv_heads: i32,
+    vocab_size: i32,
+    seq_len: i32,
+}
+
+shape Weights {
+    token_embedding_table: Span<f32>,
+    rms_att_weight: Span<f32>,
+    wq: Span<f32>,
+    wk: Span<f32>,
+    wv: Span<f32>,
+    wo: Span<f32>,
+    rms_ffn_weight: Span<f32>,
+    w1: Span<f32>,
+    w2: Span<f32>,
+    w3: Span<f32>,
+    rms_final_weight: Span<f32>,
+    wcls: Span<f32>,
+}
+
+shape RunState {
+    base: MutSpan<u8>,
+    x_off: usize,
+    xb_off: usize,
+    xb2_off: usize,
+    hb_off: usize,
+    hb2_off: usize,
+    q_off: usize,
+    att_off: usize,
+    logits_off: usize,
+    key_off: usize,
+    value_off: usize,
+}
+
+// ---- kernels (ports of examples/llama2/src/ops.0) ----
+
+fun rmsnorm(output: MutSpan<f32>, input: Span<f32>, weights: Span<f32>, eps: f32) -> Void {
+    let n: usize = std.mem.len(input)
+    let mut ss: f32 = 0.0
+    let mut i: usize = 0
+    while i < n {
+        let v: f32 = input[i]
+        ss = ss + v * v
+        i = i + 1
+    }
+    let nf: f32 = (n as i32) as f32
+    ss = ss / nf
+    ss = ss + eps
+    let inv: f32 = 1.0 / std.math.sqrtf(ss)
+    let mut j: usize = 0
+    while j < n {
+        output[j] = weights[j] * (inv * input[j])
+        j = j + 1
+    }
+}
+
+fun matmul(output: MutSpan<f32>, input: Span<f32>, weights: Span<f32>) -> Void {
+    let d: usize = std.mem.len(output)
+    let n: usize = std.mem.len(input)
+    let mut i: usize = 0
+    while i < d {
+        let row: usize = i * n
+        let mut val: f32 = 0.0
+        let mut j: usize = 0
+        while j < n {
+            let idx: usize = row + j
+            val = val + weights[idx] * input[j]
+            j = j + 1
+        }
+        output[i] = val
+        i = i + 1
+    }
+}
+
+fun softmax(x: MutSpan<f32>) -> Void {
+    let n: usize = std.mem.len(x)
+    let mut maxv: f32 = x[0]
+    let mut i: usize = 1
+    while i < n {
+        if x[i] > maxv {
+            maxv = x[i]
+        }
+        i = i + 1
+    }
+    let mut sum: f32 = 0.0
+    let mut j: usize = 0
+    while j < n {
+        let e: f32 = std.math.expf(x[j] - maxv)
+        x[j] = e
+        sum = sum + e
+        j = j + 1
+    }
+    let mut k: usize = 0
+    while k < n {
+        x[k] = x[k] / sum
+        k = k + 1
+    }
+}
+
+fun rope(vec: MutSpan<f32>, pos: i32, head_size: usize) -> Void {
+    let n: usize = std.mem.len(vec)
+    let posf: f32 = pos as f32
+    let hsf: f32 = (head_size as i32) as f32
+    let base: f32 = 10000.0
+    let mut i: usize = 0
+    while i < n {
+        let head_dim: usize = i % head_size
+        let hd: f32 = (head_dim as i32) as f32
+        let exponent: f32 = hd / hsf
+        let denom: f32 = std.math.powf(base, exponent)
+        let freq: f32 = 1.0 / denom
+        let val: f32 = posf * freq
+        let fcr: f32 = std.math.cosf(val)
+        let fci: f32 = std.math.sinf(val)
+        let i1: usize = i + 1
+        let v0: f32 = vec[i]
+        let v1: f32 = vec[i1]
+        vec[i] = v0 * fcr - v1 * fci
+        vec[i1] = v0 * fci + v1 * fcr
+        i = i + 2
+    }
+}
+
+fun swiglu(hb: MutSpan<f32>, hb2: Span<f32>) -> Void {
+    let n: usize = std.mem.len(hb)
+    let mut i: usize = 0
+    while i < n {
+        let v: f32 = hb[i]
+        let negv: f32 = 0.0 - v
+        let e: f32 = std.math.expf(negv)
+        let denom: f32 = 1.0 + e
+        let sig: f32 = 1.0 / denom
+        let silu: f32 = v * sig
+        let g: f32 = hb2[i]
+        hb[i] = silu * g
+        i = i + 1
+    }
+}
+
+// ---- sampler (port of examples/llama2/src/sampler.0 argmax) ----
+
+fun argmax(v: Span<f32>) -> i32 {
+    let n: usize = std.mem.len(v)
+    let mut mi: i32 = 0
+    let mut mv: f32 = v[0]
+    let mut i: usize = 1
+    while i < n {
+        if v[i] > mv {
+            mv = v[i]
+            mi = i as i32
+        }
+        i = i + 1
+    }
+    return mi
+}
+
+// ---- run state (port of examples/llama2/src/transformer.0) ----
+
+fun kvDim(cfg: Config) -> usize {
+    let dim = cfg.dim as usize
+    let n_heads = cfg.n_heads as usize
+    let n_kv_heads = cfg.n_kv_heads as usize
+    return dim * n_kv_heads / n_heads
+}
+
+fun runStateFloats(cfg: Config) -> usize {
+    let dim = cfg.dim as usize
+    let hidden = cfg.hidden_dim as usize
+    let n_layers = cfg.n_layers as usize
+    let n_heads = cfg.n_heads as usize
+    let vocab = cfg.vocab_size as usize
+    let seq_len = cfg.seq_len as usize
+    let kv_dim = kvDim(cfg)
+    let cache = n_layers * seq_len * kv_dim
+    let mut total: usize = 0
+    total = total + dim
+    total = total + dim
+    total = total + dim
+    total = total + hidden
+    total = total + hidden
+    total = total + dim
+    total = total + n_heads * seq_len
+    total = total + vocab
+    total = total + cache
+    total = total + cache
+    return total
+}
+
+fun mallocRunState(base: MutSpan<u8>, cfg: Config) -> RunState {
+    let dim = cfg.dim as usize
+    let hidden = cfg.hidden_dim as usize
+    let n_layers = cfg.n_layers as usize
+    let n_heads = cfg.n_heads as usize
+    let vocab = cfg.vocab_size as usize
+    let seq_len = cfg.seq_len as usize
+    let kv_dim = kvDim(cfg)
+    let cache = n_layers * seq_len * kv_dim
+
+    let mut off: usize = 0
+    let x_off = off
+    off = off + dim
+    let xb_off = off
+    off = off + dim
+    let xb2_off = off
+    off = off + dim
+    let hb_off = off
+    off = off + hidden
+    let hb2_off = off
+    off = off + hidden
+    let q_off = off
+    off = off + dim
+    let att_off = off
+    off = off + n_heads * seq_len
+    let logits_off = off
+    off = off + vocab
+    let key_off = off
+    off = off + cache
+    let value_off = off
+    off = off + cache
+
+    return RunState {
+        base: base,
+        x_off: x_off,
+        xb_off: xb_off,
+        xb2_off: xb2_off,
+        hb_off: hb_off,
+        hb2_off: hb2_off,
+        q_off: q_off,
+        att_off: att_off,
+        logits_off: logits_off,
+        key_off: key_off,
+        value_off: value_off
+    }
+}
+
+fun view(base: MutSpan<u8>, off: usize, count: usize) -> MutSpan<f32> {
+    let start = off * 4
+    let end = start + count * 4
+    return std.mem.bytesAsMutF32(base[start..end])
+}
+
+fun forward(cfg: Config, w: Weights, s: RunState, token: i32, pos: i32) -> Void {
+    let dim = cfg.dim as usize
+    let hidden = cfg.hidden_dim as usize
+    let n_layers = cfg.n_layers as usize
+    let n_heads = cfg.n_heads as usize
+    let n_kv_heads = cfg.n_kv_heads as usize
+    let vocab = cfg.vocab_size as usize
+    let seq_len = cfg.seq_len as usize
+    let kv_dim = kvDim(cfg)
+    let kv_mul = n_heads / n_kv_heads
+    let head_size = dim / n_heads
+    let eps: f32 = 0.00001
+    let posu = pos as usize
+    let cache = n_layers * seq_len * kv_dim
+
+    let base = s.base
+
+    let tet = w.token_embedding_table
+    let rms_att = w.rms_att_weight
+    let wq = w.wq
+    let wk = w.wk
+    let wv = w.wv
+    let wo = w.wo
+    let rms_ffn = w.rms_ffn_weight
+    let w1 = w.w1
+    let w2 = w.w2
+    let w3 = w.w3
+    let rms_final = w.rms_final_weight
+    let wcls = w.wcls
+
+    let x = view(base, s.x_off, dim)
+    let tokenu = token as usize
+    let emb_start = tokenu * dim
+    let emb_end = emb_start + dim
+    let emb = tet[emb_start..emb_end]
+    let mut ce: usize = 0
+    while ce < dim {
+        x[ce] = emb[ce]
+        ce = ce + 1
+    }
+
+    let sqrt_hs = std.math.sqrtf((head_size as i32) as f32)
+
+    let mut l: usize = 0
+    while l < n_layers {
+        let loff = l * seq_len * kv_dim
+
+        let xb = view(base, s.xb_off, dim)
+        let xb2 = view(base, s.xb2_off, dim)
+        let q = view(base, s.q_off, dim)
+        let hb = view(base, s.hb_off, hidden)
+        let hb2 = view(base, s.hb2_off, hidden)
+        let att = view(base, s.att_off, n_heads * seq_len)
+        let kc = view(base, s.key_off, cache)
+        let vc = view(base, s.value_off, cache)
+        let k_off = s.key_off + loff + posu * kv_dim
+        let v_off = s.value_off + loff + posu * kv_dim
+        let k = view(base, k_off, kv_dim)
+        let v = view(base, v_off, kv_dim)
+
+        let ra_lo = l * dim
+        let ra_hi = ra_lo + dim
+        let ra = rms_att[ra_lo..ra_hi]
+        rmsnorm(xb, x, ra, eps)
+
+        let wq_lo = l * dim * dim
+        let wq_hi = wq_lo + dim * dim
+        let wq_l = wq[wq_lo..wq_hi]
+        matmul(q, xb, wq_l)
+
+        let wkv_stride = dim * kv_dim
+        let wk_lo = l * wkv_stride
+        let wk_hi = wk_lo + wkv_stride
+        let wk_l = wk[wk_lo..wk_hi]
+        matmul(k, xb, wk_l)
+
+        let wv_l = wv[wk_lo..wk_hi]
+        matmul(v, xb, wv_l)
+
+        rope(q, pos, head_size)
+        rope(k, pos, head_size)
+
+        let mut h: usize = 0
+        while h < n_heads {
+            let qoff = h * head_size
+            let aoff = h * seq_len
+            let kvh = (h / kv_mul) * head_size
+
+            let mut t: usize = 0
+            while t <= posu {
+                let kbase = loff + t * kv_dim + kvh
+                let mut score: f32 = 0.0
+                let mut i: usize = 0
+                while i < head_size {
+                    let qi = qoff + i
+                    let ki = kbase + i
+                    score = score + q[qi] * kc[ki]
+                    i = i + 1
+                }
+                score = score / sqrt_hs
+                att[aoff + t] = score
+                t = t + 1
+            }
+
+            let sm_lo = aoff
+            let sm_hi = aoff + posu + 1
+            let att_h = att[sm_lo..sm_hi]
+            softmax(att_h)
+
+            let mut z: usize = 0
+            while z < head_size {
+                xb[qoff + z] = 0.0
+                z = z + 1
+            }
+            let mut t2: usize = 0
+            while t2 <= posu {
+                let vbase = loff + t2 * kv_dim + kvh
+                let a = att[aoff + t2]
+                let mut i2: usize = 0
+                while i2 < head_size {
+                    let xi = qoff + i2
+                    let vi = vbase + i2
+                    xb[xi] = xb[xi] + a * vc[vi]
+                    i2 = i2 + 1
+                }
+                t2 = t2 + 1
+            }
+            h = h + 1
+        }
+
+        let wo_lo = l * dim * dim
+        let wo_hi = wo_lo + dim * dim
+        let wo_l = wo[wo_lo..wo_hi]
+        matmul(xb2, xb, wo_l)
+        let mut r1: usize = 0
+        while r1 < dim {
+            x[r1] = x[r1] + xb2[r1]
+            r1 = r1 + 1
+        }
+
+        let rf_lo = l * dim
+        let rf_hi = rf_lo + dim
+        let rf = rms_ffn[rf_lo..rf_hi]
+        rmsnorm(xb, x, rf, eps)
+
+        let w13_stride = dim * hidden
+        let w13_lo = l * w13_stride
+        let w13_hi = w13_lo + w13_stride
+        let w1_l = w1[w13_lo..w13_hi]
+        matmul(hb, xb, w1_l)
+        let w3_l = w3[w13_lo..w13_hi]
+        matmul(hb2, xb, w3_l)
+        swiglu(hb, hb2)
+        let w2_l = w2[w13_lo..w13_hi]
+        matmul(xb, hb, w2_l)
+
+        let mut r2: usize = 0
+        while r2 < dim {
+            x[r2] = x[r2] + xb[r2]
+            r2 = r2 + 1
+        }
+
+        l = l + 1
+    }
+
+    rmsnorm(x, x, rms_final, eps)
+    let logits = view(base, s.logits_off, vocab)
+    matmul(logits, x, wcls)
+}
+
+// ---- synthetic weights (same integer fill as the C reference) ----
+
+shape Fill {
+    a: usize,
+    b: usize,
+    m: usize,
+    sub: i32,
+    scale: f32,
+}
+
+fun fillw(i: usize, p: Fill) -> f32 {
+    let prod: usize = i * p.a + p.b
+    let md: usize = prod % p.m
+    let mdi: i32 = md as i32
+    let v: i32 = mdi - p.sub
+    let vf: f32 = v as f32
+    return vf * p.scale
+}
+
+fun fillrms(i: usize) -> f32 {
+    let r: usize = i % 3
+    let rf: f32 = (r as i32) as f32
+    let one: f32 = 1.0
+    let step: f32 = 0.05
+    return one + rf * step
+}
+
+fun fillRange(buf: MutSpan<f32>, off: usize, count: usize, p: Fill) -> Void {
+    let mut i: usize = 0
+    while i < count {
+        buf[off + i] = fillw(i, p)
+        i = i + 1
+    }
+}
+
+fun fillRmsRange(buf: MutSpan<f32>, off: usize, count: usize) -> Void {
+    let mut i: usize = 0
+    while i < count {
+        buf[off + i] = fillrms(i)
+        i = i + 1
+    }
+}
+
+fun wview(base: MutSpan<u8>, off: usize, count: usize) -> Span<f32> {
+    let start = off * 4
+    let end = start + count * 4
+    return std.mem.bytesAsF32(base[start..end])
+}
+
+// Expected argmax token at each generation step (from llama2_gen_ref.c).
+fun expectedTok(pos: usize) -> i32 {
+    if pos == 0 {
+        return 2
+    }
+    if pos == 1 {
+        return 3
+    }
+    if pos == 2 {
+        return 1
+    }
+    if pos == 3 {
+        return 0
+    }
+    if pos == 4 {
+        return 2
+    }
+    return 3
+}
+
+pub fun main(world: World) -> Void raises {
+    let cfg = Config {
+        dim: 4,
+        hidden_dim: 8,
+        n_layers: 1,
+        n_heads: 2,
+        n_kv_heads: 2,
+        vocab_size: 4,
+        seq_len: 6
+    }
+
+    // weights region: 204 f32 (tet 16, rms_att 4, wq 16, wk 16, wv 16, wo 16,
+    // rms_ffn 4, w1 32, w2 32, w3 32, rms_final 4, wcls 16) = 816 bytes.
+    let alloc = std.mem.pageAlloc()
+    let wregion = std.mem.allocBytes(alloc, 816)
+    if wregion.has == false {
+        return
+    }
+    let wbase: MutSpan<u8> = wregion.value
+    let wall: MutSpan<f32> = std.mem.bytesAsMutF32(wbase)
+    let p_tet = Fill { a: 7, b: 3, m: 13, sub: 6, scale: 0.1 }
+    let p_q = Fill { a: 5, b: 1, m: 11, sub: 5, scale: 0.04 }
+    let p_k = Fill { a: 3, b: 2, m: 11, sub: 5, scale: 0.04 }
+    let p_v = Fill { a: 9, b: 4, m: 11, sub: 5, scale: 0.04 }
+    let p_o = Fill { a: 2, b: 7, m: 11, sub: 5, scale: 0.04 }
+    let p_w1 = Fill { a: 11, b: 5, m: 13, sub: 6, scale: 0.03 }
+    let p_w2 = Fill { a: 4, b: 9, m: 13, sub: 6, scale: 0.03 }
+    let p_w3 = Fill { a: 6, b: 1, m: 13, sub: 6, scale: 0.03 }
+    let p_cls = Fill { a: 8, b: 2, m: 13, sub: 6, scale: 0.1 }
+    fillRange(wall, 0, 16, p_tet)
+    fillRmsRange(wall, 16, 4)
+    fillRange(wall, 20, 16, p_q)
+    fillRange(wall, 36, 16, p_k)
+    fillRange(wall, 52, 16, p_v)
+    fillRange(wall, 68, 16, p_o)
+    fillRmsRange(wall, 84, 4)
+    fillRange(wall, 88, 32, p_w1)
+    fillRange(wall, 120, 32, p_w2)
+    fillRange(wall, 152, 32, p_w3)
+    fillRmsRange(wall, 184, 4)
+    fillRange(wall, 188, 16, p_cls)
+
+    let weights = Weights {
+        token_embedding_table: wview(wbase, 0, 16),
+        rms_att_weight: wview(wbase, 16, 4),
+        wq: wview(wbase, 20, 16),
+        wk: wview(wbase, 36, 16),
+        wv: wview(wbase, 52, 16),
+        wo: wview(wbase, 68, 16),
+        rms_ffn_weight: wview(wbase, 84, 4),
+        w1: wview(wbase, 88, 32),
+        w2: wview(wbase, 120, 32),
+        w3: wview(wbase, 152, 32),
+        rms_final_weight: wview(wbase, 184, 4),
+        wcls: wview(wbase, 188, 16)
+    }
+
+    let rs_floats = runStateFloats(cfg)
+    let rs_bytes = rs_floats * 4
+    let rsregion = std.mem.allocBytes(alloc, rs_bytes)
+    if rsregion.has == false {
+        return
+    }
+    let rs_base: MutSpan<u8> = rsregion.value
+    let state = mallocRunState(rs_base, cfg)
+    let vocab = cfg.vocab_size as usize
+
+    // Greedy generation loop (mirrors examples/llama2/src/main.0): start at token
+    // 0, forward at each position, take the argmax of the logits, feed it back in.
+    // `good` counts steps whose argmax matches the reference; a broken feedback,
+    // KV cache, or argmax diverges and drops the count below seq_len.
+    let mut token: i32 = 0
+    let mut good: i32 = 0
+    let mut pos: usize = 0
+    while pos < 6 {
+        forward(cfg, weights, state, token, pos as i32)
+        let logits = view(rs_base, state.logits_off, vocab)
+        let next = argmax(logits)
+        let want = expectedTok(pos)
+        if next == want {
+            good = good + 1
+        }
+        token = next
+        pos = pos + 1
+    }
+
+    if good == 6 {
+        check world.out.write("generate argmax ok\n")
+    }
+    return
+}
