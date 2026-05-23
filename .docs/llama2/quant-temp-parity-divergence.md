@@ -1,112 +1,97 @@
-# Open bug: quantized **temp>0** parity divergence vs `runq.c` on real models
+# RESOLVED: quantized temp>0 parity divergence was a libm (`expf`) mismatch
 
-**Status:** OPEN — discovered 2026-05-22 while validating Q-opt; **not yet fixed**.
-**Scope:** the int8 (runq.c "version 2") path only. The f32 path is unaffected.
-**Severity:** blocks the upstream PR's claim of token-for-token int8 parity for any
-sampled (temperature > 0) generation. Greedy (temp 0) generation is *mostly* fine.
+**Status:** RESOLVED 2026-05-23. **Not a Zero bug** — no kernel or `forwardQ`
+change. The fault was in `examples/llama2/validate.sh`: it built the C reference
+with the **container's Alpine gcc/musl**, while the Zero exe statically links
+**zig's bundled musl**. Those two musl builds' `expf` (and `sinf`/`cosf`/`powf`/
+`sqrtf`) differ by ~1 ULP, which is enough to flip sampled tokens. Fix: build the
+reference with the same `zig cc` toolchain the Zero exe links, so both sides
+share one libm. The full f32 + int8 (temp 0, temp>0, top-p) matrix then matches
+`run.c`/`runq.c` token-for-token.
 
-This doc is a self-contained handoff so a future agent can finish the diagnosis and
-fix without re-deriving the context. Read [`quantization.md`](./quantization.md) (the
-G + Q-opt plan) first for the format and kernel background.
+The original open-bug write-up is preserved below §"Original handoff" for context;
+§1–§3 here record the actual root cause, evidence, and fix.
 
 ---
 
-## 1. Symptom
+## 1. Root cause
 
-Running `examples/llama2/validate.sh` against a **real** quantized `stories15M_q80.bin`
-(see §4 for how to make one without PyTorch) gives:
+- Zero's int8 kernels are **bit-exact** vs `runq.c`: a pos-0 bisection confirmed
+  `dequantRow` (embedding), `quantizeActs`, and every `matmulQ` (q/k/v/wo/w1/w3,
+  and the shared classifier) produce byte-identical f32 to the reference.
+- The **only** difference is libm. The Zero exe links zig's musl; `validate.sh`
+  built the reference with Alpine's musl. On a single layer-0 forward, `expf`
+  disagreed on **72 / 768** FFN activations, each by **exactly 1 ULP**. The
+  Alpine result was the correctly-rounded f32 in all 72 cases; zig's musl `expf`
+  was 1 ULP off (faithfully but not correctly rounded; 43 low / 29 high).
+- Why temp 0 *mostly* survived but temp>0 *always* diverged: argmax absorbs a
+  sub-ULP perturbation of the logits, but multinomial / top-p sampling turns it
+  into a different drawn token, after which the sequences decorrelate.
+- Why the **f32** path "passed" while int8 failed: identical libm skew is present
+  in *both* paths (same shared kernels, same `expf`). The f32 path simply has
+  wider logit margins on the tested prompts and never flipped a token — it passed
+  by luck, not by bit-exactness. Once the reference uses the matching libm, the
+  f32 path is bit-exact too.
 
-| Matrix | Result |
-|--------|--------|
-| f32 — temp 0, temp>0, top-p (vs `run.c`) | **all PASS, token-for-token** |
-| int8 — temp 0 / argmax (vs `runq.c`) | **mostly pass**: 3/4 prompts byte-identical; one long prompt ("Lily and Tom went to the park", 120 tok) flips |
-| int8 — temp>0 multinomial (vs `runq.c`) | **ALL diverge** |
-| int8 — temp>0 + top-p (vs `runq.c`) | **ALL diverge** |
+## 2. How it was found (runtime numerical bisection)
 
-The divergence is **gradual**: the two outputs agree for ~30–40 tokens, then one
-sampled token flips and everything after differs. Example (`-t 1.0 -s 12345`,
-prompt "The dragon"):
+A throwaway probe (`.zero/probe/llama2-dump/`, a copy of the example with a
+truncated `forwardQ`) dumped raw f32 buffers from Zero; `runq.c` was patched
+(`.zero/llama2-data/runq_dump.c`) to dump the same buffers; both ran on the same
+`stories15M_q80.bin` under the amd64 container and were diffed offline.
 
-```
-zero: ... carrying a whip like a sword, so noone scared him. The dragon kept looking around ...
-runq: ... carrying a whip like a sword, so one of the tornadoes was in the clouds. The dragon dragged ...
-                                          ^ first divergent token (~token 30)
-```
+1. **pos-0 logits differ** (22294/32000, ~1 ULP) with identical argmax → a
+   single-forward bug (every int8 kernel runs in forward 0), so bisect *within*.
+2. **embedding** `x` (dequantRow) — bit-identical (real f32-vs-f32).
+3. **per-layer residual trace** — first divergence appears after **layer 0**.
+4. **layer-0 sub-step snapshots** — identical through `xb_attn`, `wo`, the attn
+   residual, `w1`, and `w3`; first divergence is the **`swiglu` output**.
+5. `swiglu` *inputs* are identical but its output differs → isolate the one
+   transcendental: dump `expf(-hb[i])` from both → **72/768 differ by 1 ULP**.
+   Compared against the f64 `exp` truth: Alpine `expf` correctly-rounded, zig's
+   1 ULP off → **libm mismatch**, not a Zero kernel issue.
+6. **Confirm fix:** rebuild `runq.c` with `zig cc -target x86_64-linux-musl`
+   (the toolchain the Zero exe links) → Zero **matches** it token-for-token, and
+   **differs** from the Alpine-gcc build. Full matrix passes.
 
-This is the fingerprint of a **ULP-level difference in the quantized logits**: argmax
-is robust to it (most temp-0 runs survive 100+ steps), but multinomial/top-p sampling
-turns a sub-ULP probability difference into a different drawn token, after which the
-sequences decorrelate completely.
+(The `1.0 + e` / `1.0 / denom` bare-float literals in `swiglu` were also checked
+— Zero defaults bare float literals to f64 — but an f32-strict rewrite produced
+*identical* output, so they are not involved here and were left unchanged.)
 
-## 2. Critical facts (established, do not re-litigate)
+## 3. The fix
 
-1. **The f32 path is perfect.** zero's f32 `forward` matches `run.c` token-for-token on
-   all temp 0 / temp>0 / top-p cases. So the shared f32 kernels (`rmsnorm`, `rope`,
-   `softmax`, attention, `swiglu`, residual adds) and the sampler are correct vs the
-   reference. The bug is in the **int8-specific** path.
+`examples/llama2/validate.sh` now compiles `run.c` and `runq.c` with
+`zig cc -target x86_64-linux-musl` (a `build_ref` helper) instead of the
+container's `apk add gcc && gcc`. Both binaries are static linux-musl-x64 ELFs
+that link the *same* zig-bundled musl as the Zero exe; the amd64 Alpine container
+is now used only to *run* them (qemu on non-x64 hosts). Requires `zig` on the
+host (already required, since `zero build --target linux-musl-x64` shells out to
+`zig cc`).
 
-2. **It is PRE-EXISTING in item G — NOT introduced by Q-opt.** Proven decisively:
-   `git stash` the Q-opt changes, rebuild the committed-G compiler + example, run the
-   same q80 model — the committed-G binary produces **byte-identical** divergent output
-   to the Q-opt binary. Q-opt only swapped the arithmetic int8 decode for a `movsbl`
-   load and packed activations into `i8`; that is value-preserving (the decoded weight
-   value and the activation quants are bit-identical either way), so it cannot be the
-   cause.
+Note on the CI fixture (`conformance/native/pass/generate-argmax-q.0`): it is
+argmax on a tiny model with a 0.151 winner margin — robust to libm ULP noise *by
+design*, so it cannot catch a sampling-level divergence, and a deterministic
+temp>0 fixture would itself be libm-fragile. The real regression gate is
+`validate.sh` now building the reference against the shared libm.
 
-3. **It was never caught before** because G's quantized branch in `validate.sh`
-   *self-skips* when `stories15M_q80.bin` is absent, and no q80 model had ever been
-   produced (needs `export.py` + PyTorch, or the §4 converter). The CI fixture
-   `conformance/native/pass/generate-argmax-q.0` only tests **argmax on a tiny model**
-   (dim 4, 2 layers) and is bit-exact there — it is too small/short to surface a
-   ULP-level accumulation, and it never exercises the sampler.
+---
 
-4. **Both engines read the identical q80 bytes.** The §4 converter's quantization
-   quality is therefore irrelevant to *parity* — whatever int8 weights/scales the file
-   holds, `zero` and `runq_ref` both read the same ones. A divergence between the two
-   engines is purely a **difference in computation**, not in the data.
+## Original handoff (for context; the suspects below were all cleared)
 
-## 3. What has been ruled out (with evidence)
+The reproduction recipe in §4 still applies (how to make a `stories15M_q80.bin`
+without PyTorch). The "remaining suspects" the original doc listed —
+`quantizeActs`, `matmulQ`, the shared-classifier path, MHA-vs-GQA — were each
+verified bit-exact during the bisection; none was the cause.
 
-- **`roundHA` (activation-quant rounding).** `ops.0`'s `roundHA` uses
-  `floorf(v + 0.5)`, which is genuinely *not* bit-equal to C `round()` for a float just
-  below `n.5` (the float sum rounds up across the integer boundary). It was rewritten to
-  a bit-exact frac-compare (`fl = floorf(v); frac = v - fl; frac >= 0.5 ? fl+1 : fl`) and
-  the real-model output **did not change at all** → this model's activations never land
-  on that boundary, so `roundHA` is not the cause here. (The rewrite was reverted to keep
-  Q-opt value-preserving, but the `floorf(v+0.5)` justification comment in `ops.0` is
-  mathematically wrong and the imprecision is a real latent bug worth fixing anyway.)
-- **The sampler.** `run.c` and `runq.c` have **byte-identical** `softmax`,
-  `sample_mult`, and `sample_topp` (verified by `diff`). Since the f32 sampler parity
-  passes, zero's sampler is correct vs both. Not the cause.
-- **The forward structure.** `diff`'ing `run.c`'s `forward` against `runq.c`'s shows the
-  only differences are (a) `matmul` → `quantize` + quantized `matmul`, and (b) the
-  key/value vectors are computed into scratch then `memcpy`'d into the kv cache *after*
-  rope, vs run.c writing straight into the cache — which is **mathematically
-  equivalent** (same values land in the cache). zero uses the run.c style (kv as cache
-  sub-views); not a numerical difference.
-- **`rmsnorm`** is byte-identical between `run.c` and `runq.c`.
-- **The quantized kernels' source.** `matmulQ` (per-group int32 accumulate, reset,
-  `(ivalf * wscale) * xscale` left-to-right), `quantizeActs` (`scale = wmax/127`,
-  `round(x/scale)`), and `dequantRow` (`q[i] * s[i/gs]`) all match `runq.c`'s
-  `matmul`/`quantize`/`dequantize` line-for-line, and are bit-exact vs the
-  runq.c-derived oracle on the tiny fixture.
-- **FMA / `-ffp-contract`.** Ruled out indirectly: if `gcc -O3` were forming FMAs in the
-  reference, the *f32* matmul would diverge too (it has the same `val += a*b` shape) —
-  but f32 parity is perfect. So the emulated/target CPU isn't contracting, and the
-  quantized matmul isn't either.
-
-## 4. How to reproduce (no PyTorch needed)
+### How to reproduce / make the quantized model (no PyTorch needed)
 
 `validate.sh` needs `stories15M_q80.bin` in `$LLAMA2_DATA` (default
-`.zero/llama2-data/`). The canonical way is `export.py --version 2` (needs torch +
-`stories15M.pt`). Without torch, convert the **f32** `stories15M.bin` directly — both
-engines read the same bytes, so this is a valid parity input (see §2.4). GS=32 divides
-both inner matmul dims (dim 288, hidden 768); stories15M is a shared-classifier model.
-
-Save as a throwaway (e.g. `.zero/probe/f32_to_q80.py`), run
-`python3 f32_to_q80.py stories15M.bin stories15M_q80.bin`, then `bash
-examples/llama2/validate.sh`. Expected output size for stories15M: **17,101,696 bytes**
-(256 header + 14,976 f32 rmsnorm + 17,086,464 quant/scale blocks).
+`.zero/llama2-data/`). Without torch, convert the **f32** `stories15M.bin`
+directly — both engines read the same bytes, so this is a valid parity input.
+GS=32 divides both inner matmul dims (dim 288, hidden 768); stories15M is a
+shared-classifier model. Save the script as a throwaway, run
+`python3 f32_to_q80.py stories15M.bin stories15M_q80.bin`. Expected size:
+**17,101,696 bytes** (256 header + 14,976 f32 rmsnorm + 17,086,464 quant/scale).
 
 ```python
 import struct, sys
@@ -191,76 +176,9 @@ open(dst, 'wb').write(out)
 print(f"wrote {dst}: {len(out)} bytes, GS={GS}, shared={shared}")
 ```
 
-### Focused one-shot comparison (faster than the whole matrix)
+### Pointers
 
-```sh
-# build runq_ref once (validate.sh also does this):
-#   gcc -O3 -o runq_ref runq.c -lm   (runq.c fetched from karpathy/llama2.c master)
-docker run --rm --platform linux/amd64 -v "$(pwd)":/work -w /work/.zero/llama2-data alpine sh -c '
-  /work/.zero/out/llama2 stories15M_q80.bin --prompt "The dragon" --tokens 100 --temperature 1.0 > z.txt
-  ./runq_ref stories15M_q80.bin -z tokenizer.bin -t 1.0 -p 0 -s 12345 -n 100 -i "The dragon" > r.txt
-  diff z.txt r.txt
-'
-```
-
-Zero's PRNG seed is hard-coded 12345 (see `sampler.0`); pass `-s 12345` to runq_ref, and
-`-p 0` to disable runq's default top-p when testing plain multinomial.
-
-## 5. Remaining suspect & how to investigate
-
-The difference is a **sub-ULP perturbation of the quantized logits** that argmax mostly
-absorbs. Everything in §3 matched on inspection, so the next step is **runtime
-numerical bisection** — find *where* the first divergence appears, not *what looks*
-different in source.
-
-The obstacle: Zero has no float formatter, so you can't `printf` logits from the example
-directly. Options, roughly in order of effort:
-
-1. **Dump raw f32 bytes from both engines and diff offline.** Add a temporary
-   `world.out.write` of the raw `Span<u8>` view over a chosen activation buffer (e.g.
-   `logits`, or `xb` after layer 0) in `forwardQ` for `pos == 0` only, and the
-   equivalent `fwrite(s->logits, sizeof(float), …)` in a local copy of `runq.c`. Run
-   both on the **same single token** (no sampling), compare the f32 arrays element-wise
-   to find the first differing element and its magnitude (1 ULP? more?).
-2. **Bisect by layer.** Once you know pos-0 logits differ, dump the residual stream `x`
-   after each layer to find the first layer that diverges, then dump each sub-step
-   (after `quantizeActs`, after each `matmulQ`, after attention) within that layer.
-3. **Bisect by op.** The prime suspects, given §3 cleared the obvious ones:
-   - **`quantizeActs` producing different int8 quants** for some group — even one quant
-     off by 1 perturbs a dot product. Dump `xq.q`/`xq.s` after a `quantizeActs` call and
-     compare to runq's `s->xq.q`/`s->xq.s`. (roundHA was cleared for the *boundary* case,
-     but check `wmax`/`scale` agree bit-for-bit; note runq.c's `wmax` is accumulated as
-     `float val = fabs(double)` — confirm zero's `absf` path matches for every value.)
-   - **`matmulQ` float accumulation** — confirm the `(float)ival * ws * xs` chain and the
-     `val` running sum are bit-identical (they look identical in source; verify in
-     emitted code that zero isn't, e.g., keeping an intermediate in a wider register).
-   - **The shared classifier path** (stories15M is shared; the tiny fixture is
-     *unshared*, so this path is **untested** by CI). Verify `mapWeightsQ` points the
-     classifier at `q_tokens` with the right base/`size_each`, and that `dequantRow`
-     (embedding) and the classifier `matmulQ` agree with runq's whole-table
-     `dequantize` + classifier `matmul`.
-   - **MHA vs GQA** — the tiny fixture is GQA (`kv_mul=2`); stories15M is MHA
-     (`kv_mul=1`). The MHA path is exercised by the f32 parity (which passes), but
-     re-confirm the quantized forward's head indexing matches under `kv_mul=1`.
-
-The cheapest high-value experiment: **dump pos-0 logits from both engines and diff.**
-That immediately says whether it's a single-forward bug (look within one forward) or a
-cross-position/kv-cache accumulation (look at the cache path).
-
-## 6. Definition of done
-
-`bash examples/llama2/validate.sh` with a real `stories15M_q80.bin` present prints
-`PASS: llama2.zero matches runq.c token-for-token` for the **int8 temp 0, temp>0, and
-top-p** matrices (the f32 matrix already passes). Then ideally tighten the CI fixture so
-it would have caught this — e.g. a longer/shared-classifier tiny model, or an explicit
-temp>0 (sampled) assertion in `generate-argmax-q.0`'s sibling.
-
-## 7. Pointers
-
-- `examples/llama2/src/ops.0` — `matmulQ`, `quantizeActs`, `dequantRow`, `roundHA`.
-- `examples/llama2/src/transformer.0` — `forwardQ`, `layerQWeight`, `mallocRunStateQ`.
-- `examples/llama2/src/checkpoint.0` — `mapWeightsQ` (weight base offsets, shared-cls).
-- `examples/llama2/validate.sh` — `parity_one_q` / `parity_topp_q` (the failing matrix).
-- `conformance/native/pass/generate-argmax-q.0` — the tiny CI parity gate (argmax-only).
-- Reference: `runq.c` from `karpathy/llama2.c` master (`quantize` / `matmul` /
-  `dequantize` / `forward`). `validate.sh` fetches it next to `run.c`.
+- `examples/llama2/src/ops.0` — `matmulQ`, `quantizeActs`, `dequantRow` (all
+  verified bit-exact vs `runq.c`); `swiglu` (calls `expf`).
+- `examples/llama2/validate.sh` — `build_ref` (the fix: zig-cc reference build).
+- Reference: `runq.c` from `karpathy/llama2.c` master. `validate.sh` fetches it.
