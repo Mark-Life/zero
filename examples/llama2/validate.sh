@@ -25,19 +25,34 @@
 #     both share that musl libm. Both run inside an amd64 Alpine container (under
 #     qemu on non-x64 hosts). Requires Docker + zig.
 #
+#   * Linux/arm64: the Zero exe is a static linux-musl-arm64 ELF (the AArch64 ELF
+#     backend) that links zig's bundled musl; the reference is
+#     `zig cc -target aarch64-linux-musl`, so both share that same musl libm. Both
+#     run inside an arm64 Alpine container — NATIVE (no qemu) on an Apple Silicon
+#     host, where Docker Desktop's Linux VM is itself arm64. Requires Docker + zig.
+#
 #   * macOS/arm64 (this host, no Docker): the Zero exe is a Mach-O arm64 binary
 #     that links macOS libSystem (which provides libm); the reference is
 #     `zig cc -target aarch64-macos`, so both share libSystem's libm. Both run
 #     directly on the host. Requires zig (no Docker).
 #
-# The branch is auto-selected from `uname` (darwin+arm64 -> native; otherwise the
-# Docker/Linux branch). Force the Docker branch anywhere with LLAMA2_FORCE_DOCKER=1.
+# Branch selection (auto from `uname`, with overrides):
+#   * darwin + arm64        -> native branch (no Docker). The default on Apple Silicon.
+#   * everything else       -> Docker branch. Its container platform defaults to the
+#                              host arch: an arm64 host (incl. Apple Silicon under
+#                              LLAMA2_FORCE_DOCKER=1) runs linux/arm64 NATIVELY; an
+#                              x86 host runs linux/amd64. Force amd64 anywhere with
+#                              LLAMA2_DOCKER_PLATFORM=linux/amd64 (e.g. an x86 CI gate).
+#   * LLAMA2_FORCE_DOCKER=1  -> take the Docker branch even on darwin-arm64 (selects
+#                              the linux/arm64 container on this host).
 #
-# The f32 matrix is token-for-token (gated) on both branches. The int8 matrix is
-# token-for-token (gated) on Linux but informational on the native darwin branch:
-# there the same libSystem libm is on both sides, yet the int8 path's tight logit
-# margins still flip on a sub-ULP FP-contraction difference (the Zero backend emits
-# separate fmul+fadd; no single runq.c build matches it) — see
+# The f32 matrix is token-for-token (gated) on all branches. The int8 matrix is
+# token-for-token (gated) on both Docker branches (linux/amd64 AND linux/arm64),
+# where the Zero exe and the C ref link the *same* zig musl on both sides, so it is
+# bit-exact. It is informational only on the native darwin branch: there the same
+# libSystem libm is on both sides, yet the int8 path's tight logit margins still
+# flip on a sub-ULP FP-contraction difference (the Zero backend emits separate
+# fmul+fadd; no single runq.c build matches it) — see
 # .docs/llama2/blockers/P6-int8-fp-margin-darwin.md.
 #
 # CI story: Linux/Docker is the continuous parity gate (it runs in CI and matches
@@ -60,9 +75,23 @@ if [ "${LLAMA2_FORCE_DOCKER:-0}" != "1" ] && [ "$(uname -s)" = "Darwin" ] && [ "
   native=1
 fi
 
-# Docker-branch knobs (unused on the native branch).
+# Docker-branch knobs (unused on the native branch). The container platform defaults
+# to the host arch — an arm64 host (incl. Apple Silicon under LLAMA2_FORCE_DOCKER=1)
+# runs linux/arm64 NATIVELY, an x86 host runs linux/amd64 — and is overridable with
+# LLAMA2_DOCKER_PLATFORM (e.g. =linux/amd64 to force the amd64 gate on an arm64 host).
+# alpine is multi-arch, so the same image serves both platforms.
 img="alpine"
-plat="linux/amd64"
+case "$(uname -m)" in
+  arm64|aarch64) host_plat="linux/arm64" ;;
+  *)             host_plat="linux/amd64" ;;
+esac
+plat="${LLAMA2_DOCKER_PLATFORM:-$host_plat}"
+# Map the Docker platform to the zig/Zero target triple used on the Docker branch.
+case "$plat" in
+  linux/arm64) docker_target="aarch64-linux-musl"; docker_arch="arm64" ;;
+  linux/amd64) docker_target="x86_64-linux-musl"; docker_arch="amd64" ;;
+  *) echo "error: unsupported LLAMA2_DOCKER_PLATFORM='$plat' (use linux/arm64 or linux/amd64)." >&2; exit 1 ;;
+esac
 
 model_url="https://huggingface.co/karpathy/tinyllamas/resolve/main/stories15M.bin"
 tok_url="https://github.com/karpathy/llama2.c/raw/master/tokenizer.bin"
@@ -90,10 +119,16 @@ if [ "$native" -eq 1 ]; then
   zero_target="aarch64-macos"
   echo "==> host: darwin-arm64 — native branch (no Docker; macOS libSystem libm)"
 else
-  command -v docker >/dev/null 2>&1 || { echo "error: docker is required (runs the linux-musl-x64 binaries under amd64)." >&2; exit 1; }
-  # Linux/x64 (or forced): linux-musl-x64 ELF + x86_64-linux-musl reference, run under amd64.
-  zero_target="x86_64-linux-musl"
-  echo "==> host: $(uname -s)/$(uname -m) — Docker/Linux branch (amd64 container; musl libm)"
+  command -v docker >/dev/null 2>&1 || { echo "error: docker is required (runs the linux-musl-$docker_arch binaries in a $plat container)." >&2; exit 1; }
+  # Docker/Linux branch: the C reference triple matches the Zero exe's target — both
+  # link zig's bundled musl, so the libm is identical. On arm64 the container runs
+  # natively (no qemu) on an arm64 host; on amd64 it runs under qemu on a non-x64 host.
+  zero_target="$docker_target"
+  if [ "$docker_arch" = "arm64" ]; then
+    echo "==> host: $(uname -s)/$(uname -m) — Docker/Linux branch ($plat container, native on arm64; musl libm)"
+  else
+    echo "==> host: $(uname -s)/$(uname -m) — Docker/Linux branch ($plat container, qemu on non-x64; musl libm)"
+  fi
 fi
 
 # Build a C reference (run.c / runq.c) with the SAME toolchain the Zero exe links
@@ -120,6 +155,8 @@ build_ref() { # build_ref <src.c> <out-binary> [extra cc flags...]
 build_zero() {
   if [ "$native" -eq 1 ]; then
     "$zero" build --backend zero-macho64 --emit exe --target darwin-arm64 "$root/examples/llama2" --out "$zero_bin" >/dev/null
+  elif [ "$docker_arch" = "arm64" ]; then
+    "$zero" build --backend zero-elf-aarch64 --emit exe --target linux-musl-arm64 "$root/examples/llama2" --out "$zero_bin" >/dev/null
   else
     "$zero" build --backend zero-elf64 --emit exe --target linux-musl-x64 "$root/examples/llama2" --out "$zero_bin" >/dev/null
   fi
@@ -160,6 +197,8 @@ fi
 
 if [ "$native" -eq 1 ]; then
   echo "==> building llama2.zero (--backend zero-macho64, darwin-arm64)"
+elif [ "$docker_arch" = "arm64" ]; then
+  echo "==> building llama2.zero (--backend zero-elf-aarch64, linux-musl-arm64)"
 else
   echo "==> building llama2.zero (--backend zero-elf64, linux-musl-x64)"
 fi
@@ -214,14 +253,17 @@ parity_topp() {
 }
 
 # Whether the int8 matrix is GATED (a divergence fails the run) or INFORMATIONAL
-# (a divergence is reported but does not fail it). On the Docker/Linux branch the
-# int8 path is bit-exact vs runq.c and stays gated. On the native darwin branch it
-# is informational: the int8 logits' tight margins make a token flip on a sub-ULP
-# FP-reduction-order difference that no reference build can eliminate (the Zero
-# backend, `runq.c` built with FMA, and `runq.c` built without FMA are three
-# distinct legal roundings that disagree on the tightest tokens). See
+# (a divergence is reported but does not fail it). On BOTH Docker/Linux branches
+# (linux/amd64 AND linux/arm64) the int8 path is bit-exact vs runq.c and stays
+# gated: the Zero exe and the C ref link the *same* zig musl on both sides, so the
+# matmulQ reductions round identically. It is informational only on the native
+# darwin branch: there the same libSystem libm is on both sides, yet the int8
+# logits' tight margins make a token flip on a sub-ULP FP-reduction-order
+# difference that no reference build can eliminate (the Zero backend, `runq.c`
+# built with FMA, and `runq.c` built without FMA are three distinct legal roundings
+# that disagree on the tightest tokens). See
 # .docs/llama2/blockers/P6-int8-fp-margin-darwin.md. The f32 matrix is gated on
-# both branches (its wider margins are bit-exact).
+# every branch (its wider margins are bit-exact).
 if [ "$native" -eq 1 ]; then q_gated=0; else q_gated=1; fi
 
 # q_result <label> — print the per-case line and report the gating outcome. When

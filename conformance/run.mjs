@@ -28,6 +28,22 @@ await mkdir(outDir, { recursive: true });
 const libmSkipped = [];
 const darwinNativeRan = [];
 const darwinNativeSkipped = [];
+const linuxArm64Ran = [];
+const linuxArm64Skipped = [];
+
+// The linux/arm64 backend gate runs built executables in a `linux/arm64` Docker container. Apple
+// Silicon + Docker Desktop runs that platform natively (no qemu); on any host without docker the
+// branch no-ops, exactly like the darwin branch off-darwin, so CI/non-docker hosts are unaffected.
+// This is independent of `runnableDirectTarget` (this host's runnable direct target is darwin-arm64;
+// the linux/arm64 branch is a separate parallel mechanism usable whenever docker is present).
+const dockerLinuxArm64 = await (async () => {
+  try {
+    const probe = await execFileAsync("docker", ["run", "--rm", "--platform", "linux/arm64", "alpine", "uname", "-m"]);
+    return probe.stdout.trim() === "aarch64";
+  } catch {
+    return false;
+  }
+})();
 
 async function assertBoundsTrap(fixture, name) {
   const out = `${outDir}/${name}`;
@@ -100,6 +116,44 @@ async function assertDarwinNativeOrUnsupported(fixture, name, expected) {
     if (expected.file) assert.equal(await readFile(`${outDir}/${expected.file.name}`, "utf8"), expected.file.text);
   }
   darwinNativeRan.push(name);
+}
+
+// Builds a fixture for linux-musl-arm64 and, when docker is present, runs the resulting ELF aarch64
+// executable in a `linux/arm64` container, asserting the same observable result the linux/darwin
+// checks expect. Features the AArch64 ELF backend does not implement yet bail with CGEN004 (or a
+// missing toolchain bails BLD003), recorded as a tolerated skip rather than a failure — mirroring
+// the darwin-native branch. The backend is HONEST (it never accept-and-miscompiles), so every
+// fixture that *builds* must produce correct output; as later phases land, skips flip to runs with
+// no harness change. On a host without docker this is a no-op so the suite is unaffected. `expected`
+// reuses the assertDirectRuntimeOrUnsupported shape and additionally honours `expected.exitCode`.
+async function assertLinuxArm64NativeOrUnsupported(fixture, name, expected) {
+  if (!dockerLinuxArm64) return;
+  const out = `${outDir}/${name}-linux-arm64`;
+  await rm(out, { force: true });
+  const build = await execFileAsync(zero, ["build", "--json", "--emit", "exe", "--target", "linux-musl-arm64", fixture, "--out", out]).catch((error) => error);
+  if (build.code) {
+    const code = JSON.parse(build.stdout).diagnostics?.[0]?.code;
+    // CGEN004 = backend feature not yet implemented; BLD003 = no target-capable toolchain; TAR002 =
+    // a capability (heap/fs/args/…) withheld by the linux-arm64 manifest until a later phase lifts
+    // it. All three are tolerated skips — the backend never accept-and-miscompiles.
+    assert.ok(code === "CGEN004" || code === "BLD003" || code === "TAR002", `unexpected linux-arm64 diagnostic ${code} for ${name}`);
+    linuxArm64Skipped.push(name);
+    return;
+  }
+  // Mount the repo root and run with it as the working directory, so a fixture's relative data path
+  // (e.g. an mmap of conformance/fixtures/*.bin) resolves exactly as it does for the darwin-native
+  // helper, which runs the binary from the repo root. The executable lives under outDir within the repo.
+  const repo = process.cwd();
+  const run = await execFileAsync("docker", ["run", "--rm", "--platform", "linux/arm64", "-v", `${repo}:/repo`, "-w", "/repo", "alpine", `/repo/${outDir}/${name}-linux-arm64`, ...(expected.args ?? [])], expected.env ? { env: { ...process.env, ...expected.env } } : {}).catch((error) => error);
+  if (expected.exitCode !== undefined) {
+    assert.equal(run.code ?? 0, expected.exitCode, `linux-arm64 exit code mismatch for ${name}`);
+  } else if (!run.code && !run.signal) {
+    if (expected.stdout instanceof RegExp) assert.match(run.stdout, expected.stdout);
+    else if (expected.stdout !== undefined) assert.equal(run.stdout, expected.stdout);
+    if (expected.stderr !== undefined) assert.equal(run.stderr, expected.stderr);
+    if (expected.file) assert.equal(await readFile(`${outDir}/${expected.file.name}`, "utf8"), expected.file.text);
+  }
+  linuxArm64Ran.push(name);
 }
 
 async function assertElf64Object(path, exportedName) {
@@ -279,6 +333,7 @@ for (const fixture of [
   "conformance/native/pass/null-maybe.0",
   "conformance/native/pass/meta-typed-target-type.0",
   "conformance/native/pass/std-args.0",
+  "conformance/native/pass/std-args-libm.0",
   "conformance/native/pass/std-env.0",
   "conformance/native/pass/std-fs.0",
   "conformance/native/pass/std-fs-bytes.0",
@@ -868,6 +923,30 @@ assert.equal(directI64ObjBody.generatedCBytes, 0);
 assert.equal(directI64ObjBody.objectBackend.objectEmission.path, "direct-elf64-object");
 assert(directI64ObjBytes.includes(Buffer.from([0x48, 0xb8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f])));
 assert(directI64ObjBytes.includes(Buffer.from([0x48, 0x01, 0xc8])));
+
+// AArch64 ELF backend structure (machine 183). The object path emits the exported function + symbol;
+// the direct-exe path emits a self-contained ELF executable. direct-exe-return is a literal-42 main,
+// so both carry the asserted `movz w0,#42; ret` leaf (and the exe additionally the `movz x8,#93;
+// svc #0` exit sequence). These keep both AArch64 paths green as later phases grow the backend.
+const aarch64ObjOut = `${outDir}/direct-exe-return-aarch64.o`;
+const aarch64ObjJson = await execFileAsync(zero, ["build", "--json", "--emit", "obj", "--target", "linux-musl-arm64", "examples/direct-exe-return.0", "--out", aarch64ObjOut]);
+const aarch64ObjBody = JSON.parse(aarch64ObjJson.stdout);
+assert.equal(aarch64ObjBody.emit, "obj");
+assert.equal(aarch64ObjBody.compiler, "zero-elf-aarch64");
+assert.equal(aarch64ObjBody.generatedCBytes, 0);
+await assertElfAarch64Object(aarch64ObjOut, "main");
+
+const aarch64ExeOut = `${outDir}/direct-exe-return-aarch64`;
+const aarch64ExeJson = await execFileAsync(zero, ["build", "--json", "--emit", "exe", "--target", "linux-musl-arm64", "examples/direct-exe-return.0", "--out", aarch64ExeOut]);
+const aarch64ExeBody = JSON.parse(aarch64ExeJson.stdout);
+assert.equal(aarch64ExeBody.emit, "exe");
+assert.equal(aarch64ExeBody.compiler, "zero-elf-aarch64");
+assert.equal(aarch64ExeBody.generatedCBytes, 0);
+await assertElfAarch64Executable(aarch64ExeOut);
+if (dockerLinuxArm64) {
+  const aarch64ExeRun = await execFileAsync("docker", ["run", "--rm", "--platform", "linux/arm64", "-v", `${process.cwd()}/${outDir}:/w`, "alpine", "/w/direct-exe-return-aarch64"]).catch((error) => error);
+  assert.equal(aarch64ExeRun.code ?? 0, 42, "linux-arm64 direct-exe-return should exit 42");
+}
 
 const metaJsonSuccess = await execFileAsync(zero, ["check", "--json", "conformance/native/pass/meta-typed-target-type.0"]);
 const metaJsonSuccessBody = JSON.parse(metaJsonSuccess.stdout);
@@ -1848,6 +1927,7 @@ for (const runtimeFixture of [
   ["conformance/native/pass/match-choice-fallback.0", "match-choice-fallback", { stdout: "choice fallback ok\n" }],
   ["conformance/native/pass/null-maybe.0", "null-maybe", { stdout: /null maybe ok/ }],
   ["conformance/native/pass/std-args.0", "std-args", { stdout: "alpha\n", args: ["alpha", "beta"] }],
+  ["conformance/native/pass/std-args-libm.0", "std-args-libm", { stdout: "std args libm ok\n", args: ["123456789"] }],
   ["conformance/native/pass/std-env.0", "std-env", { stdout: "env ok\n", env: { ZERO_CONFORMANCE_ENV: "agent-env" } }],
   ["conformance/native/pass/std-fs.0", "std-fs", { stdout: "fs ok\n", file: { name: "std-fs-write.txt", text: "zero write\n" } }],
   ["conformance/native/pass/std-fs-bytes.0", "std-fs-bytes", { stdout: "fs bytes ok\n", stderr: "fs bytes err ok\n" }],
@@ -1952,6 +2032,7 @@ for (const runtimeFixture of [
 ]) {
   await assertDirectRuntimeOrUnsupported(...runtimeFixture);
   await assertDarwinNativeOrUnsupported(...runtimeFixture);
+  await assertLinuxArm64NativeOrUnsupported(...runtimeFixture);
 }
 
 const abiDump = await execFileAsync(zero, ["abi", "dump", "--json", "conformance/native/pass/const-layout.0"]);
@@ -1997,6 +2078,7 @@ for (const runtimeFixture of [
 ]) {
   await assertDirectRuntimeOrUnsupported(...runtimeFixture);
   await assertDarwinNativeOrUnsupported(...runtimeFixture);
+  await assertLinuxArm64NativeOrUnsupported(...runtimeFixture);
 }
 
 await assertBoundsTrap("conformance/native/fail/bounds-array-index.0", "bounds-array-index");
@@ -2581,6 +2663,10 @@ if (libmSkipped.length > 0) {
 
 if (runnableDirectTarget === "darwin-arm64") {
   console.log(`darwin-arm64 native: ${darwinNativeRan.length} fixture(s) ran, ${darwinNativeSkipped.length} skipped (Mach-O backend feature not yet implemented — CGEN004)`);
+}
+
+if (dockerLinuxArm64) {
+  console.log(`linux-arm64 (docker): ${linuxArm64Ran.length} ran, ${linuxArm64Skipped.length} skipped (AArch64 ELF backend feature not yet implemented — CGEN004)`);
 }
 
 console.log("conformance ok");

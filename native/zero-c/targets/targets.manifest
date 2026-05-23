@@ -52,7 +52,7 @@ libc = "musl"
 libcMode = "bundled-libc"
 exeSuffix = ""
 zigTarget = "aarch64-linux-musl"
-capabilities = ["memory", "stdio", "time", "rand"]
+capabilities = ["memory", "stdio", "args", "env", "fs", "heap", "time", "rand"]
 
 [[target]]
 name = "linux-x64"
@@ -80,7 +80,7 @@ libc = "gnu"
 libcMode = "sysroot"
 exeSuffix = ""
 zigTarget = "aarch64-linux-gnu"
-capabilities = ["memory", "stdio", "time", "rand"]
+capabilities = ["memory", "stdio", "args", "env", "fs", "heap", "time", "rand"]
 
 [[target]]
 name = "win32-x64.exe"

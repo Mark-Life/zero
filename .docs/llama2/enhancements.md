@@ -59,6 +59,7 @@ a clean error. From v0.1 phases:
 | G | Real Llama-2 + int8 quantization | High | Large | Pure Zero | ✅ Done |
 | E | Cross-platform (macOS / Windows / ARM) | High | Med-Large | Compiler | Backlog |
 | H | SIMD / multi-threaded matmul (perf) | Medium | Large | Compiler | Backlog |
+| I | Precise fs-mmap direct-exe gate (x64 + arm64) | Low | Small | Compiler | Backlog |
 | T | **Training** | High (risky) | **Very Large** | Both | Backlog (see deep-dive) |
 
 \* D's cosmetic payoff is small, but it unlocks general mutable `u8` buffers — a real
@@ -485,6 +486,37 @@ The honest framing for a PR: *correctness-validated training on a tiny model*, n
 production training.
 
 ---
+
+# I. Precise fs-mmap direct-exe eligibility (x64 + arm64)
+
+**Status: Backlog.** Spun out of E (cross-platform); deliberately *not* folded into the Linux ARM64
+port so it can be decided on its own merits.
+
+**The issue.** The default (no-`--backend`) direct-exe path is gated by `self_host_caps_allowed`
+(main.c), which excludes `fs` (along with time/rand/net/proc/web). That gate uses the `fs` capability
+as a *coarse proxy* for "needs hosted-runtime shims." But **file mmap is pure syscalls** on the ELF
+targets (`openat`/`mmap`/`close`/`munmap` via raw `svc` on aarch64, `syscall` on x64) — fully
+self-contained in the direct-exe, no shim, no obj+link. So an fs-use-is-mmap-only program *is*
+direct-exe-capable, yet the coarse gate forces it to need an explicit `--backend`. Today the three
+backends disagree on a pure-mmap program with no `--backend`: macOS **builds** it (mmap→libSystem→
+obj+link, bypassing the gate), x86-64 ELF **rejects** it (CGEN004, needs `--backend`), and AArch64 ELF
+also **rejects** it (it was made to match x64 — the Linux ARM64 port intentionally did *not* ship a
+backend-local carve-out).
+
+**The fix.** Make default-direct-exe eligibility **precise and target-general**: a program whose only
+beyond-self-host capability is `fs`, and whose fs use is entirely the syscall-lowered mmap family
+(host/mmap/munmap), is direct-exe-eligible on **both** ELF syscall targets (linux-x64 *and*
+linux-arm64) — not via a per-backend special-case. Keep `fs` required as a *capability* (mmap reads
+file contents — it must still be declared); only the build-routing relaxes. Net effect: x64 and arm64
+both build+run pure-mmap programs by default and their mmap conformance fixtures flip skip→run on both;
+macOS already reaches the same outcome via obj+link. This cleanly separates the two concepts the gate
+currently conflates — *capability* (what the program may do) vs *direct-exe build mechanics* (can the
+direct backend emit a standalone exe on this target).
+
+**Effort.** Small + localized (a `self_host_caps_allowed`/eligibility refinement + an "fs use is
+mmap-only" IR scan, applied to both ELF exe emitters), but it changes **x86-64** semantics and flips
+x64 conformance fixtures, so it needs its own validation pass — hence a separate item, not part of E.
+The llama2 example does not depend on it (it builds with `--backend` and uses libm→obj+link anyway).
 
 ## Appendix — commands
 

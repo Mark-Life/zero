@@ -58,7 +58,7 @@ static const char *fallback_manifest =
 "libcMode = \"bundled-libc\"\n"
 "exeSuffix = \"\"\n"
 "zigTarget = \"aarch64-linux-musl\"\n"
-"capabilities = [\"memory\", \"stdio\", \"time\", \"rand\"]\n"
+"capabilities = [\"memory\", \"stdio\", \"args\", \"env\", \"fs\", \"heap\", \"time\", \"rand\"]\n"
 "[[target]]\n"
 "name = \"linux-x64\"\n"
 "aliases = [\"x86_64-linux-gnu\"]\n"
@@ -84,7 +84,7 @@ static const char *fallback_manifest =
 "libcMode = \"sysroot\"\n"
 "exeSuffix = \"\"\n"
 "zigTarget = \"aarch64-linux-gnu\"\n"
-"capabilities = [\"memory\", \"stdio\", \"time\", \"rand\"]\n"
+"capabilities = [\"memory\", \"stdio\", \"args\", \"env\", \"fs\", \"heap\", \"time\", \"rand\"]\n"
 "[[target]]\n"
 "name = \"win32-x64.exe\"\n"
 "aliases = [\"x86_64-windows-msvc\"]\n"
@@ -438,7 +438,7 @@ static bool target_math_runtime_supported(const ZTargetInfo *target) {
   const char *object_emitter = z_direct_object_emitter(target);
   return target &&
          strcmp(z_direct_exe_emitter(target), "none") != 0 &&
-         ((strcmp(object_emitter, "zero-elf64") == 0 && target->os && strcmp(target->os, "linux") == 0) ||
+         (((strcmp(object_emitter, "zero-elf64") == 0 || strcmp(object_emitter, "zero-elf-aarch64") == 0) && target->os && strcmp(target->os, "linux") == 0) ||
           (strcmp(object_emitter, "zero-macho64") == 0 && target->os && strcmp(target->os, "macos") == 0));
 }
 
@@ -449,11 +449,11 @@ void z_append_math_runtime_json(ZBuf *buf, const ZTargetInfo *target) {
       zbuf_append(buf, "{\"status\":\"supported\",\"provider\":\"libm\",\"providerLink\":\"system-library\",\"capabilityGate\":\"none\",\"staticLibraries\":[],\"systemLibraries\":[\"System\"],\"reason\":\"macOS Mach-O direct link plan resolves std.math through libSystem (libm)\"}");
       return;
     }
-    zbuf_append(buf, "{\"status\":\"supported\",\"provider\":\"libm\",\"providerLink\":\"system-library\",\"capabilityGate\":\"none\",\"staticLibraries\":[],\"systemLibraries\":[\"m\"],\"reason\":\"linux ELF64 direct link plan resolves std.math through libm\"}");
+    zbuf_append(buf, "{\"status\":\"supported\",\"provider\":\"libm\",\"providerLink\":\"system-library\",\"capabilityGate\":\"none\",\"staticLibraries\":[],\"systemLibraries\":[\"m\"],\"reason\":\"linux ELF direct link plan resolves std.math through libm\"}");
     return;
   }
   const char *reason = "target has no audited math runtime provider";
-  if (target && strcmp(z_direct_object_emitter(target), "zero-elf64") != 0 && strcmp(z_direct_object_emitter(target), "zero-macho64") != 0) reason = "math runtime currently requires the ELF64 or Mach-O direct object link plan";
+  if (target && strcmp(z_direct_object_emitter(target), "zero-elf64") != 0 && strcmp(z_direct_object_emitter(target), "zero-elf-aarch64") != 0 && strcmp(z_direct_object_emitter(target), "zero-macho64") != 0) reason = "math runtime currently requires the ELF or Mach-O direct object link plan";
   else if (target && (!target->os || (strcmp(target->os, "linux") != 0 && strcmp(target->os, "macos") != 0))) reason = "math runtime is available on linux (ELF64) and macOS (Mach-O) in this phase";
   zbuf_appendf(
     buf,

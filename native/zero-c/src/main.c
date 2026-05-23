@@ -8417,9 +8417,9 @@ static bool target_readiness_select_diag(const Command *command, const SourceInp
     RuntimeImportAudit audit = runtime_import_audit_from_ir(ir);
     bool needs_http_runtime = runtime_import_audit_uses_http_provider(&audit);
     const char *object_emitter = z_direct_object_emitter(target);
-    bool runtime_object_emitter_supported = object_emitter && (strcmp(object_emitter, "zero-macho64") == 0 || strcmp(object_emitter, "zero-elf64") == 0);
+    bool runtime_object_emitter_supported = object_emitter && (strcmp(object_emitter, "zero-macho64") == 0 || strcmp(object_emitter, "zero-elf64") == 0 || strcmp(object_emitter, "zero-elf-aarch64") == 0);
     if (!runtime_object_emitter_supported) {
-      init_direct_backend_diag(diag, command, input, target, emit_kind, "runtime helpers currently require the Mach-O or ELF64 object link plan");
+      init_direct_backend_diag(diag, command, input, target, emit_kind, "runtime helpers currently require the Mach-O or ELF object link plan");
       return false;
     }
     if (needs_http_runtime && !z_target_is_host(target)) {
@@ -9529,14 +9529,14 @@ int main(int argc, char **argv) {
     RuntimeImportAudit runtime_audit = runtime_import_audit_from_ir(&ir);
     bool needs_http_runtime = runtime_import_audit_uses_http_provider(&runtime_audit);
     const char *object_emitter = z_direct_object_emitter(target);
-    bool runtime_object_emitter_supported = object_emitter && (strcmp(object_emitter, "zero-macho64") == 0 || strcmp(object_emitter, "zero-elf64") == 0);
+    bool runtime_object_emitter_supported = object_emitter && (strcmp(object_emitter, "zero-macho64") == 0 || strcmp(object_emitter, "zero-elf64") == 0 || strcmp(object_emitter, "zero-elf-aarch64") == 0);
     if (ship_command) {
       int rc = return_direct_backend_error(&command, &input, target, "exe", "host runtime link plan is not wired into ship yet; use zero build or zero run", &ir, &program);
       z_free_source(&input);
       return rc;
     }
     if (!runtime_object_emitter_supported) {
-      int rc = return_direct_backend_error(&command, &input, target, "exe", "runtime helpers currently require the Mach-O or ELF64 object link plan", &ir, &program);
+      int rc = return_direct_backend_error(&command, &input, target, "exe", "runtime helpers currently require the Mach-O or ELF object link plan", &ir, &program);
       z_free_source(&input);
       return rc;
     }
@@ -9551,7 +9551,9 @@ int main(int argc, char **argv) {
     phase_started = now_ms();
     bool emitted_object = strcmp(object_emitter, "zero-macho64") == 0
                             ? z_emit_macho64_object_from_ir(&ir, &object, &diag)
-                            : z_emit_elf64_object_from_ir(&ir, &object, &diag);
+                            : strcmp(object_emitter, "zero-elf-aarch64") == 0
+                                ? z_emit_elf_aarch64_object_from_ir(&ir, &object, &diag)
+                                : z_emit_elf64_object_from_ir(&ir, &object, &diag);
     input.codegen_ms = now_ms() - phase_started;
     if (!emitted_object) {
       z_map_source_diag(&input, &diag);
@@ -9575,7 +9577,12 @@ int main(int argc, char **argv) {
     ZToolchainPlan runtime_toolchain = z_plan_toolchain(command.cc, command.profile, target);
 
     phase_started = now_ms();
-    input.emitted_object_cache_hit = compiler_cache_touch("emitted-object", compile_cache_key(&input, target, command.profile, strcmp(object_emitter, "zero-macho64") == 0 ? "direct-macho64-object-runtime-link" : "direct-elf64-object-runtime-link"));
+    const char *runtime_object_cache_tag = strcmp(object_emitter, "zero-macho64") == 0
+                                              ? "direct-macho64-object-runtime-link"
+                                              : strcmp(object_emitter, "zero-elf-aarch64") == 0
+                                                  ? "direct-elf-aarch64-object-runtime-link"
+                                                  : "direct-elf64-object-runtime-link";
+    input.emitted_object_cache_hit = compiler_cache_touch("emitted-object", compile_cache_key(&input, target, command.profile, runtime_object_cache_tag));
     bool wrote_object = z_write_binary_file(object_file, (const unsigned char *)object.data, object.len, &diag);
     if (wrote_object) wrote_object = compile_zero_runtime_object(runtime_object_file, &runtime_toolchain, &command, target, &diag);
     if (wrote_object && needs_http_runtime) wrote_object = compile_zero_http_curl_object(http_object_file, &runtime_toolchain, &command, target, &diag);

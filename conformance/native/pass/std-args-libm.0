@@ -1,0 +1,21 @@
+// Regression for the obj+link entry path: a program that uses BOTH std.args (reading argv) and a
+// libm call (std.math.sqrtf). The libm dependency forces the obj+link route — the executable is a
+// relocatable object linked against the platform crt0, which calls main(argc, argv) via the C ABI.
+// main must therefore seed argc/argv from the C-ABI argument registers into wherever std.args reads
+// them; if it does not, the first argv access faults under crt0. (A pure std.args program takes the
+// self-contained direct-exe route instead, so neither path alone covers this combination.)
+//
+// argv[1] is a 9-character argument, so its byte length is 9; sqrtf(9.0) is exactly 3.0. Gating the
+// "ok" line on both the argv length and the libm result ties the two features together: the line
+// only prints when argv was read correctly AND libm was linked and called correctly.
+pub fun main(world: World) -> Void raises {
+    let count = std.args.len()
+    let arg = std.args.get(1)
+    if count == 2 && arg.has {
+        let n: usize = std.mem.len(arg.value)
+        let root: f32 = std.math.sqrtf(n as f32)
+        if n == 9 && root == 3.0 {
+            check world.out.write("std args libm ok\n")
+        }
+    }
+}

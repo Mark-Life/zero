@@ -5,8 +5,9 @@ It loads a Llama 2 checkpoint, runs the forward pass on the CPU, and streams the
 tokens to stdout — a single statically-linked binary with no runtime dependencies.
 
 **Status:** v0.1 — runs Karpathy's TinyLlamas checkpoints (`stories15M`, and the larger
-`stories42M` / `stories110M` with no rebuild) on `linux-musl-x64` **and natively on
-`darwin-arm64` (Apple Silicon, no Docker)**: single-threaded,
+`stories42M` / `stories110M` with no rebuild) on `linux-musl-x64`, `linux-musl-arm64`
+(native-in-Docker on Apple Silicon), **and natively on `darwin-arm64` (Apple Silicon, no
+Docker)**: single-threaded,
 argmax / temperature / top-p / top-k sampling. Both f32 and an auto-detected, parity-checked
 **int8 (`runq.c` v2)** path run from the same binary — the int8 path reaches real Llama-2
 sizes via a one-time export (still single-threaded; no SIMD/threads yet). Output matches the
@@ -21,6 +22,8 @@ make -C native/zero-c
 # 2. build this example -> a static binary for your host
 #    Linux x86-64:
 bin/zero build --backend zero-elf64 --emit exe --target linux-musl-x64 examples/llama2 --out .zero/out/llama2
+#    Linux ARM64:
+bin/zero build --backend zero-elf-aarch64 --emit exe --target linux-musl-arm64 examples/llama2 --out .zero/out/llama2
 #    macOS (Apple Silicon) — native, no Docker:
 bin/zero build --backend zero-macho64 --emit exe --target darwin-arm64 examples/llama2 --out .zero/out/llama2
 
@@ -33,8 +36,17 @@ curl -L -O https://github.com/karpathy/llama2.c/raw/master/tokenizer.bin
 ```
 
 On Apple Silicon the `--backend zero-macho64 --target darwin-arm64` build is a native
-Mach-O binary — it runs directly, no container. On a non-Apple-Silicon, non-Linux host,
-run the `linux-musl-x64` binary under an amd64 container (step 4 only):
+Mach-O binary — it runs directly, no container. The `linux-musl-arm64` build also runs in
+an arm64 container, **natively (no qemu)** on Apple Silicon — Docker Desktop's Linux VM is
+itself arm64:
+
+```sh
+docker run --rm --platform linux/arm64 -v "$(pwd)":/work -w /work alpine \
+  .zero/out/llama2 stories15M.bin --prompt "Once upon a time" --tokens 256 --temperature 0
+```
+
+On a non-Apple-Silicon, non-Linux host, run the `linux-musl-x64` binary under an amd64
+container (step 4 only):
 
 ```sh
 docker run --rm --platform linux/amd64 -v "$(pwd)":/work -w /work alpine \
@@ -60,13 +72,17 @@ the example is built with an explicit backend:
 # Linux x86-64 (static musl ELF):
 bin/zero build --backend zero-elf64 --emit exe --target linux-musl-x64 examples/llama2 --out .zero/out/llama2
 
+# Linux ARM64 (static musl ELF, AArch64):
+bin/zero build --backend zero-elf-aarch64 --emit exe --target linux-musl-arm64 examples/llama2 --out .zero/out/llama2
+
 # macOS / Apple Silicon (native Mach-O arm64):
 bin/zero build --backend zero-macho64 --emit exe --target darwin-arm64 examples/llama2 --out .zero/out/llama2
 ```
 
-`linux-musl-x64` and `darwin-arm64` are the supported targets. The Mach-O build links `mmap`
-and `libm` through `libSystem` (the same external-call path the ELF build uses for `musl`), so
-the example needs no source change between the two — the same `.0` sources compile for both.
+`linux-musl-x64`, `linux-musl-arm64`, and `darwin-arm64` are the supported targets. The Mach-O
+build links `mmap` and `libm` through `libSystem`; both ELF builds link them through zig's
+bundled `musl` (`mmap` via raw syscalls, `libm` via the same external-call path) — so the example
+needs no source change across the three, the same `.0` sources compile for all.
 
 ## Run
 
@@ -186,13 +202,20 @@ roomy machine (the KV cache scales with `seq_len`, so a shorter context lowers t
 
 [`validate.sh`](./validate.sh) checks numerical parity against the upstream `llama2.c`. It
 fetches the weights, tokenizer, and `run.c`, builds both the Zero exe and the C reference, and
-diffs the generated token streams over several prompts. It runs one of two branches, picked
+diffs the generated token streams over several prompts. It runs one of three branches, picked
 automatically from the host:
 
 | Host | Branch | Zero exe | C reference | Run via |
 | --- | --- | --- | --- | --- |
-| `linux-arm64` / non-x64 / `LLAMA2_FORCE_DOCKER=1` | Docker | `zero-elf64`, `linux-musl-x64` | `zig cc -target x86_64-linux-musl` (musl `libm`) | amd64 Alpine container (qemu) |
 | `darwin-arm64` (Apple Silicon) | **native, no Docker** | `zero-macho64`, `darwin-arm64` | `zig cc -target aarch64-macos` (`libSystem` `libm`) | **directly on the host** |
+| arm64 host / `LLAMA2_FORCE_DOCKER=1` on Apple Silicon | Docker (arm64) | `zero-elf-aarch64`, `linux-musl-arm64` | `zig cc -target aarch64-linux-musl` (musl `libm`) | arm64 Alpine container — **native (no qemu)** on Apple Silicon |
+| x86 host / non-arm64 / `LLAMA2_DOCKER_PLATFORM=linux/amd64` | Docker (amd64) | `zero-elf64`, `linux-musl-x64` | `zig cc -target x86_64-linux-musl` (musl `libm`) | amd64 Alpine container (qemu on non-x64) |
+
+The Docker branch picks its container platform from the host arch — `linux/arm64` on an
+arm64 host (run natively on Apple Silicon, no qemu), `linux/amd64` on an x86 host. Force a
+platform anywhere with `LLAMA2_DOCKER_PLATFORM=linux/arm64` or `=linux/amd64` (e.g. an
+x86 CI gate). On Apple Silicon, `LLAMA2_FORCE_DOCKER=1` selects the native `linux/arm64`
+branch.
 
 ```sh
 bash examples/llama2/validate.sh
@@ -223,12 +246,14 @@ top-p. That checkpoint is the one-time `export.py --version 2` step from
 [Quantized models](#quantized-int8-models), so the quantized matrix self-skips (never failing
 the run) when it is absent — the f32 matrix above stays dependency-free.
 
-On the **Linux** branch the int8 matrix is **gated** and matches `runq.c` token-for-token. On
-the **native darwin** branch it is **informational** (reported, but it does not fail the run):
-the int8 path's quantized logits sit closer to the sampling decision boundary than the smallest
-sub-ULP FP-reduction-order difference between the Zero backend and any single `runq.c` build, so
-a few tokens flip. This is expected per-platform behavior, not a Zero bug — the f32 matrix is
-bit-exact on the same host, and int8 is token-for-token on the `linux-musl-x64` gate; see
+On **both Docker branches** (`linux/amd64` and `linux/arm64`) the int8 matrix is **gated** and
+matches `runq.c` token-for-token: the Zero exe and the C reference link the *same* zig `musl` on
+both sides, so the `matmulQ` reductions round identically. On the **native darwin** branch it is
+**informational** (reported, but it does not fail the run): the int8 path's quantized logits sit
+closer to the sampling decision boundary than the smallest sub-ULP FP-reduction-order difference
+between the Zero backend and any single `runq.c` build, so a few tokens flip. This is expected
+per-platform behavior, not a Zero bug — the f32 matrix is bit-exact on the same host, and int8 is
+token-for-token on both `linux-musl` gates; see
 [`.docs/llama2/blockers/P6-int8-fp-margin-darwin.md`](../../.docs/llama2/blockers/P6-int8-fp-margin-darwin.md).
 
 CI runs the Linux/Docker branch (the continuous parity gate); the native darwin branch is a
@@ -269,10 +294,11 @@ compiler work this exercised — start with [`overview.md`](../../.docs/llama2/o
 
 ## Limitations (v0.1)
 
-- **Target:** `linux-musl-x64` and **`darwin-arm64` (native Apple Silicon, no Docker)**. Both
-  are parity-validated (f32 token-for-token per platform; see [Validation](#validation)). Other
-  hosts run the `linux-musl-x64` binary via Docker. Windows and Linux-ARM64 remain
-  [backlog](../../.docs/llama2/enhancements.md) follow-ons.
+- **Target:** `linux-musl-x64`, `linux-musl-arm64` (native-in-Docker on Apple Silicon), and
+  **`darwin-arm64` (native Apple Silicon, no Docker)**. All three are parity-validated (f32
+  token-for-token per platform; the two `linux-musl` targets are also int8 token-for-token; see
+  [Validation](#validation)). Other hosts run the `linux-musl-x64` binary via Docker. Windows
+  remains a [backlog](../../.docs/llama2/enhancements.md) follow-on.
 - **Precision / threads:** single-threaded f32, plus an int8 (`runq.c` v2) quantized path
   (auto-detected, parity-checked). Real Llama-2 sizes additionally want threading/SIMD (see the
   [backlog](../../.docs/llama2/enhancements.md)).
