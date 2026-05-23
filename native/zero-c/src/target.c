@@ -437,19 +437,24 @@ void z_append_http_runtime_json(ZBuf *buf, const ZTargetInfo *target) {
 static bool target_math_runtime_supported(const ZTargetInfo *target) {
   const char *object_emitter = z_direct_object_emitter(target);
   return target &&
-         strcmp(object_emitter, "zero-elf64") == 0 &&
          strcmp(z_direct_exe_emitter(target), "none") != 0 &&
-         target->os && strcmp(target->os, "linux") == 0;
+         ((strcmp(object_emitter, "zero-elf64") == 0 && target->os && strcmp(target->os, "linux") == 0) ||
+          (strcmp(object_emitter, "zero-macho64") == 0 && target->os && strcmp(target->os, "macos") == 0));
 }
 
 void z_append_math_runtime_json(ZBuf *buf, const ZTargetInfo *target) {
   if (target_math_runtime_supported(target)) {
+    const char *object_emitter = z_direct_object_emitter(target);
+    if (strcmp(object_emitter, "zero-macho64") == 0) {
+      zbuf_append(buf, "{\"status\":\"supported\",\"provider\":\"libm\",\"providerLink\":\"system-library\",\"capabilityGate\":\"none\",\"staticLibraries\":[],\"systemLibraries\":[\"System\"],\"reason\":\"macOS Mach-O direct link plan resolves std.math through libSystem (libm)\"}");
+      return;
+    }
     zbuf_append(buf, "{\"status\":\"supported\",\"provider\":\"libm\",\"providerLink\":\"system-library\",\"capabilityGate\":\"none\",\"staticLibraries\":[],\"systemLibraries\":[\"m\"],\"reason\":\"linux ELF64 direct link plan resolves std.math through libm\"}");
     return;
   }
   const char *reason = "target has no audited math runtime provider";
-  if (target && strcmp(z_direct_object_emitter(target), "zero-elf64") != 0) reason = "math runtime currently requires the ELF64 direct object link plan";
-  else if (target && (!target->os || strcmp(target->os, "linux") != 0)) reason = "math runtime is linux-only in this phase";
+  if (target && strcmp(z_direct_object_emitter(target), "zero-elf64") != 0 && strcmp(z_direct_object_emitter(target), "zero-macho64") != 0) reason = "math runtime currently requires the ELF64 or Mach-O direct object link plan";
+  else if (target && (!target->os || (strcmp(target->os, "linux") != 0 && strcmp(target->os, "macos") != 0))) reason = "math runtime is available on linux (ELF64) and macOS (Mach-O) in this phase";
   zbuf_appendf(
     buf,
     "{\"status\":\"unsupported\",\"provider\":null,\"providerLink\":\"none\",\"capabilityGate\":\"none\",\"staticLibraries\":[],\"systemLibraries\":[],\"reason\":\"%s\"}",

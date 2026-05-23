@@ -580,6 +580,7 @@ typedef struct {
   bool is_record;
   bool is_mutable;
   bool is_page_alloc;
+  bool is_mapping;
   char *shape_name;
   int line;
   int column;

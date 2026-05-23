@@ -3760,6 +3760,20 @@ static bool ir_collect_function_locals(const Program *program, IrProgram *ir, Ir
   return true;
 }
 
+// A span bound directly to std.fs.mappingBytes(&m) views a memory mapping, whose byte length is
+// 64-bit. Detecting this at local-collection time lets the Mach-O backend keep that span's length
+// slot 64-bit (rather than the ordinary 32-bit element count), so a >4 GiB mapping's length survives
+// the Span<u8> conversion. Other span uses are unaffected.
+static bool ir_let_initializer_is_mapping_bytes(const Stmt *stmt) {
+  const Expr *expr = stmt ? stmt->expr : NULL;
+  if (!expr || expr->kind != EXPR_CALL || expr->args.len != 1) return false;
+  if (expr->left && expr->left->kind == EXPR_MEMBER && expr->left->text && strcmp(expr->left->text, "mappingBytes") == 0) return true;
+  char *callee = ir_expr_callee_name(expr->left);
+  bool match = callee && strcmp(callee, "std.fs.mappingBytes") == 0;
+  free(callee);
+  return match;
+}
+
 static bool ir_collect_stmt_locals(const Program *program, IrProgram *ir, IrFunction *mir_fun, const StmtVec *body) {
   for (size_t i = 0; i < body->len; i++) {
     const Stmt *stmt = body->items[i];
@@ -3797,6 +3811,16 @@ static bool ir_collect_stmt_locals(const Program *program, IrProgram *ir, IrFunc
       ir_function_push_local(ir, mir_fun, stmt->name, type, false, false, false, NULL, let_element_type, 0, 0, 0, stmt->mutable_binding || mutable_byte_view, stmt->line, stmt->column);
       if (stmt_type && strcmp(stmt_type, "PageAlloc") == 0) {
         mir_fun->locals[mir_fun->local_len - 1].is_page_alloc = true;
+      }
+      // A memory mapping carries a 64-bit byte length (files may exceed 4 GiB), unlike the 32-bit
+      // element-count length of an ordinary span. Flag the Mapping view, the Maybe wrapping it, and any
+      // Span<u8> bound straight to std.fs.mappingBytes(&m), so backends that store span lengths in 32
+      // bits (Mach-O) widen this one length slot to 64-bit. The 64-bit slot round-trips a 32-bit count
+      // unchanged, so an ordinary span value later assigned to such a local stays correct.
+      if ((stmt_type && (strcmp(stmt_type, "owned<Mapping>") == 0 || strcmp(stmt_type, "Mapping") == 0 ||
+                         strcmp(stmt_type, "Maybe<owned<Mapping>>") == 0)) ||
+          ir_let_initializer_is_mapping_bytes(stmt)) {
+        mir_fun->locals[mir_fun->local_len - 1].is_mapping = true;
       }
     } else if (stmt->kind == STMT_IF) {
       if (!ir_collect_stmt_locals(program, ir, mir_fun, &stmt->then_body) || !ir_collect_stmt_locals(program, ir, mir_fun, &stmt->else_body)) return false;

@@ -4234,9 +4234,58 @@ static bool ir_instrs_need_zero_runtime_object(const IrInstr *instrs, size_t len
   return false;
 }
 
-static bool ir_needs_zero_runtime_object(const IrProgram *ir) {
+// std.mem.pageAlloc and std.fs.mmap/munmap lower to libSystem calls on Mach-O. On ELF64 those are
+// raw syscalls (no external link step); on Mach-O they are `bl _mmap`/`_open`/`_lseek`/`_close`/
+// `_munmap` externals resolved by the host linker, so a program using either must take the object +
+// link path (the direct-exe path cannot bind libSystem symbols). These scanners detect the value
+// kinds that lower to a libSystem external so the dispatch can route such macho programs through
+// obj + link: the anonymous page-alloc kind plus the file-mmap kinds (FS_MMAP / FS_MUNMAP, which the
+// CHECK/Maybe wrappers carry as a `left`/sub-value the recursion reaches).
+static bool ir_value_uses_libsystem_mmap(const IrValue *value) {
+  if (!value) return false;
+  if (value->kind == IR_VALUE_PAGE_ALLOC ||
+      value->kind == IR_VALUE_FS_MMAP ||
+      value->kind == IR_VALUE_FS_MUNMAP) return true;
+  if (ir_value_uses_libsystem_mmap(value->index) ||
+      ir_value_uses_libsystem_mmap(value->left) ||
+      ir_value_uses_libsystem_mmap(value->right)) {
+    return true;
+  }
+  for (size_t i = 0; i < value->arg_len; i++) {
+    if (ir_value_uses_libsystem_mmap(value->args[i])) return true;
+  }
+  return false;
+}
+
+static bool ir_instrs_use_libsystem_mmap(const IrInstr *instrs, size_t len) {
+  for (size_t i = 0; instrs && i < len; i++) {
+    const IrInstr *instr = &instrs[i];
+    if (ir_value_uses_libsystem_mmap(instr->value) ||
+        ir_value_uses_libsystem_mmap(instr->index) ||
+        ir_instrs_use_libsystem_mmap(instr->then_instrs, instr->then_len) ||
+        ir_instrs_use_libsystem_mmap(instr->else_instrs, instr->else_len)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool ir_program_uses_libsystem_mmap(const IrProgram *ir) {
+  for (size_t i = 0; ir && i < ir->function_len; i++) {
+    if (ir_instrs_use_libsystem_mmap(ir->functions[i].instrs, ir->functions[i].instr_len)) return true;
+  }
+  return false;
+}
+
+static bool ir_needs_zero_runtime_object(const IrProgram *ir, const ZTargetInfo *target) {
   for (size_t i = 0; ir && i < ir->function_len; i++) {
     if (ir_instrs_need_zero_runtime_object(ir->functions[i].instrs, ir->functions[i].instr_len)) return true;
+  }
+  // Mach-O resolves pageAlloc and file mmap/munmap through libSystem (`_mmap`/`_open`/`_lseek`/
+  // `_close`/`_munmap`), external calls that only the object + link path can bind.
+  const char *object_emitter = z_direct_object_emitter(target);
+  if (object_emitter && strcmp(object_emitter, "zero-macho64") == 0 && ir_program_uses_libsystem_mmap(ir)) {
+    return true;
   }
   return false;
 }
@@ -8345,7 +8394,7 @@ static bool target_readiness_dry_emit(const Command *command, const ZTargetInfo 
   bool emitted = false;
   if (emit == EMIT_OBJ) {
     emitted = target_readiness_emit_object_dry_run(ir, z_direct_object_emitter(target), &artifact, diag);
-  } else if (emit == EMIT_EXE && ir && ir_needs_zero_runtime_object(ir)) {
+  } else if (emit == EMIT_EXE && ir && ir_needs_zero_runtime_object(ir, target)) {
     emitted = target_readiness_emit_object_dry_run(ir, z_direct_object_emitter(target), &artifact, diag);
   } else if (emit == EMIT_EXE) {
     emitted = target_readiness_emit_exe_dry_run(ir, z_direct_exe_emitter(target), &artifact, diag);
@@ -8364,7 +8413,7 @@ static bool target_readiness_select_diag(const Command *command, const SourceInp
     return false;
   }
 
-  if (ir && ir_needs_zero_runtime_object(ir)) {
+  if (ir && ir_needs_zero_runtime_object(ir, target)) {
     RuntimeImportAudit audit = runtime_import_audit_from_ir(ir);
     bool needs_http_runtime = runtime_import_audit_uses_http_provider(&audit);
     const char *object_emitter = z_direct_object_emitter(target);
@@ -9475,7 +9524,7 @@ int main(int argc, char **argv) {
   bool run_command = strcmp(command.command, "run") == 0;
   bool ship_command = strcmp(command.command, "ship") == 0;
   bool artifact_command = build_command || run_command || ship_command;
-  bool needs_zero_runtime = artifact_command && command.emit == EMIT_EXE && ir_needs_zero_runtime_object(&ir);
+  bool needs_zero_runtime = artifact_command && command.emit == EMIT_EXE && ir_needs_zero_runtime_object(&ir, target);
   if (needs_zero_runtime) {
     RuntimeImportAudit runtime_audit = runtime_import_audit_from_ir(&ir);
     bool needs_http_runtime = runtime_import_audit_uses_http_provider(&runtime_audit);
