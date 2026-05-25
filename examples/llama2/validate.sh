@@ -15,7 +15,7 @@
 # Both binaries must link the *same* libm, or token-for-token parity is
 # impossible: every libm's expf/sinf/cosf/powf/sqrtf differ by ~1 ULP, and the
 # int8 path's tighter logit margins can turn a sub-ULP expf gap into a flipped
-# sampled token (see .docs/llama2/quant-temp-parity-divergence.md). So the C
+# sampled token. So the C
 # reference is always compiled with the *same toolchain and triple* as the Zero
 # exe under test. This gives parity **per platform**, not byte-identity across
 # platforms:
@@ -52,8 +52,7 @@
 # bit-exact. It is informational only on the native darwin branch: there the same
 # libSystem libm is on both sides, yet the int8 path's tight logit margins still
 # flip on a sub-ULP FP-contraction difference (the Zero backend emits separate
-# fmul+fadd; no single runq.c build matches it) — see
-# .docs/llama2/blockers/P6-int8-fp-margin-darwin.md.
+# fmul+fadd; no single runq.c build matches it).
 #
 # CI story: Linux/Docker is the continuous parity gate (it runs in CI and matches
 # the linux-musl-x64 binary the project ships); the native darwin branch is a
@@ -261,8 +260,7 @@ parity_topp() {
 # logits' tight margins make a token flip on a sub-ULP FP-reduction-order
 # difference that no reference build can eliminate (the Zero backend, `runq.c`
 # built with FMA, and `runq.c` built without FMA are three distinct legal roundings
-# that disagree on the tightest tokens). See
-# .docs/llama2/blockers/P6-int8-fp-margin-darwin.md. The f32 matrix is gated on
+# that disagree on the tightest tokens). The f32 matrix is gated on
 # every branch (its wider margins are bit-exact).
 if [ "$native" -eq 1 ]; then q_gated=0; else q_gated=1; fi
 
@@ -382,7 +380,7 @@ if [ "$fail" -eq 0 ]; then
       echo "==> PASS: llama2.zero matches runq.c token-for-token on $model_q (int8)."
     else
       # Native branch only: some int8 cases diverged. This does not fail the run —
-      # see the q_result note + .docs/llama2/blockers/P6-int8-fp-margin-darwin.md.
+      # see the q_result note above.
       echo "==> NOTE: int8 (runq.c) had $q_diff informational divergence(s) on this"
       echo "    darwin host. The int8 logits' margins are tighter than the sub-ULP"
       echo "    FP-reduction-order difference between the Zero backend (separate"

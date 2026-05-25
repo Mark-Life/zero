@@ -125,7 +125,7 @@ curl -L -O https://huggingface.co/karpathy/tinyllamas/resolve/main/stories110M.b
 `stories42M` (159 MB) and `stories110M` (418 MB) both generate coherent text and match
 `llama2.c` **token-for-token** (temperature 0 and temperature > 0). Larger models are simply
 slower — single-threaded f32 inference scales ~linearly with parameter count. Real Llama-2
-sizes are a [backlog](../../.docs/llama2/enhancements.md) item.
+sizes become practical through the int8 path below.
 
 ### Quantized (int8) models
 
@@ -211,11 +211,10 @@ automatically from the host:
 | arm64 host / `LLAMA2_FORCE_DOCKER=1` on Apple Silicon | Docker (arm64) | `zero-elf-aarch64`, `linux-musl-arm64` | `zig cc -target aarch64-linux-musl` (musl `libm`) | arm64 Alpine container — **native (no qemu)** on Apple Silicon |
 | x86 host / non-arm64 / `LLAMA2_DOCKER_PLATFORM=linux/amd64` | Docker (amd64) | `zero-elf64`, `linux-musl-x64` | `zig cc -target x86_64-linux-musl` (musl `libm`) | amd64 Alpine container (qemu on non-x64) |
 
-The Docker branch picks its container platform from the host arch — `linux/arm64` on an
-arm64 host (run natively on Apple Silicon, no qemu), `linux/amd64` on an x86 host. Force a
-platform anywhere with `LLAMA2_DOCKER_PLATFORM=linux/arm64` or `=linux/amd64` (e.g. an
-x86 CI gate). On Apple Silicon, `LLAMA2_FORCE_DOCKER=1` selects the native `linux/arm64`
-branch.
+The Docker branch defaults its container arch to the host (`linux/arm64` on arm64 — native, no
+qemu; `linux/amd64` on x86). Override with `LLAMA2_DOCKER_PLATFORM=linux/arm64` or `=linux/amd64`
+(force an arch, e.g. an x86 CI gate), or `LLAMA2_FORCE_DOCKER=1` to take the Docker branch on
+Apple Silicon.
 
 ```sh
 bash examples/llama2/validate.sh
@@ -223,55 +222,50 @@ bash examples/llama2/validate.sh
 # ==> PASS: llama2.zero matches llama2.c token-for-token on stories15M (f32).
 ```
 
-Both branches build the C reference with the **same toolchain and triple** as the Zero exe
-under test — this is the crux of token-for-token parity. Every `libm` rounds `expf`/`sinf`/…
-slightly differently (~1 ULP), so the reference must link the *same* `libm` the Zero exe links:
-zig's bundled `musl` on Linux, macOS `libSystem` on Apple Silicon. The reference is also built
-with `-ffp-contract=off` to match the Zero backend's scalar FP (a separate multiply then add,
-never a fused multiply-add). The bar is **parity per platform** — macOS-Zero vs macOS-`llama2.c`,
-Linux-Zero vs Linux-`llama2.c` — not byte-identity *across* platforms, which `libm` and FP
-contraction differences make impossible.
+Both branches build the C reference with the **same toolchain and triple** as the Zero exe under
+test — the crux of token-for-token parity. Every `libm` rounds `expf`/`sinf`/… by ~1 ULP
+differently, so the reference links the *same* `libm` (zig's `musl` on Linux, `libSystem` on
+macOS) and builds with `-ffp-contract=off` to match the backend's scalar FP (separate multiply
+then add, never fused). So the bar is **parity per platform**, not byte-identity *across* them —
+`libm` and FP-contraction differences make that impossible.
 
-- **Temperature 0** (greedy argmax) — output is **byte-identical**.
-- **Temperature > 0** — also byte-identical once the seed and sampler are matched
-  (`llama2.c -s 12345 -p 0`), because the xorshift\* PRNG is reproduced bit-for-bit.
+**f32 — gated on every branch:**
 
-Both sides emit raw-byte fallback tokens as the actual byte, so the token streams are
-compared directly (`cmp`) — no normalization needed.
+- **Temperature 0** (greedy argmax) — **byte-identical**.
+- **Temperature > 0** — byte-identical once the seed and sampler match (`-s 12345 -p 0`); the
+  xorshift\* PRNG is reproduced bit-for-bit.
 
-The same script also runs an **int8 (`runq.c`) parity matrix** when a quantized
-`stories15M_q80.bin` is present: it builds `runq_ref` from `runq.c` (the same way it builds
-`run_ref` from `run.c`) and diffs Zero vs `runq_ref` across temperature 0, temperature > 0, and
-top-p. That checkpoint is the one-time `export.py --version 2` step from
-[Quantized models](#quantized-int8-models), so the quantized matrix self-skips (never failing
-the run) when it is absent — the f32 matrix above stays dependency-free.
+Raw-byte fallback tokens are emitted as the actual byte on both sides, so streams are compared
+directly with `cmp` — no normalization.
 
-On **both Docker branches** (`linux/amd64` and `linux/arm64`) the int8 matrix is **gated** and
-matches `runq.c` token-for-token: the Zero exe and the C reference link the *same* zig `musl` on
-both sides, so the `matmulQ` reductions round identically. On the **native darwin** branch it is
-**informational** (reported, but it does not fail the run): the int8 path's quantized logits sit
-closer to the sampling decision boundary than the smallest sub-ULP FP-reduction-order difference
-between the Zero backend and any single `runq.c` build, so a few tokens flip. This is expected
-per-platform behavior, not a Zero bug — the f32 matrix is bit-exact on the same host, and int8 is
-token-for-token on both `linux-musl` gates; see
-[`.docs/llama2/blockers/P6-int8-fp-margin-darwin.md`](../../.docs/llama2/blockers/P6-int8-fp-margin-darwin.md).
+**int8 (`runq.c`)** runs whenever a quantized `stories15M_q80.bin` is present (the one-time
+`export.py --version 2` step from [Quantized models](#quantized-int8-models)): the script builds
+`runq_ref` from `runq.c` and diffs Zero against it across temperature 0, temperature > 0, and
+top-p. It self-skips when the checkpoint is absent, so the f32 matrix stays dependency-free. The
+int8 matrix is:
+
+- **Gated on both Docker branches** — bit-exact vs `runq.c`; both sides link the same zig `musl`,
+  so the `matmulQ` reductions round identically.
+- **Informational on native darwin** — int8 logits sit nearer the sampling boundary than the
+  sub-ULP FP-reduction-order gap between the Zero backend and any single `runq.c` build, so a few
+  tokens flip. Expected per-platform behavior, not a Zero bug: f32 is bit-exact on the same host,
+  and int8 is token-for-token on both `linux-musl` gates.
 
 CI runs the Linux/Docker branch (the continuous parity gate); the native darwin branch is a
 local superset that an Apple Silicon dev runs with zero extra setup.
 
-`validate.sh`'s matrix targets `stories15M`, but the same mechanism parity-checks a *real*
-quantized model. The quick way: set `LLAMA2_DATA` to a directory holding your exported real
-checkpoint renamed to `stories15M_q80.bin` plus the matching `tokenizer.bin`, and the int8
-branch diffs it against `runq_ref` token-for-token. (To diff longer real continuations
-directly, build `runq_ref` once — `gcc -O3 -o runq_ref runq.c -lm` — then `cmp` the Zero exe's
-output against `./runq_ref <model>_q80.bin -z tokenizer.bin -t 0 -i "<prompt>"`, the exact
-invocation `validate.sh` uses.)
+**Checking a real quantized model.** The matrix targets `stories15M`, but the same mechanism
+works on any quantized checkpoint: point `LLAMA2_DATA` at a directory holding your exported model
+renamed `stories15M_q80.bin` plus its `tokenizer.bin`, and the int8 branch diffs it against
+`runq_ref` token-for-token. For longer continuations, build the ref once
+(`gcc -O3 -o runq_ref runq.c -lm`) and `cmp` Zero against
+`./runq_ref <model>_q80.bin -z tokenizer.bin -t 0 -i "<prompt>"` (the exact invocation
+`validate.sh` uses).
 
-For CI (no 60 MB download), `conformance/native/pass/generate-argmax.0` runs the full
-forward → argmax → feedback loop on a tiny synthetic model and asserts the exact token
-sequence against a libm C reference; `conformance/native/pass/generate-argmax-q.0` is its int8
-twin, asserting the same kind of sequence against a `runq.c`-derived reference on a tiny
-hand-authored quantized model.
+**CI without the 60 MB download.** `conformance/native/pass/generate-argmax.0` runs the full
+forward → argmax → feedback loop on a tiny synthetic model and asserts the exact token sequence
+against a libm C reference; `generate-argmax-q.0` is its int8 twin, against a `runq.c`-derived
+reference on a tiny hand-authored quantized model.
 
 ## How it works
 
@@ -288,26 +282,17 @@ The pipeline mirrors `llama2.c`, split across one flat package:
 
 Weights are `mmap`'d read-only and sliced into typed `Span<f32>` views with no copy; the
 mutable `RunState` is one zeroed anonymous-`mmap` region (sized at runtime from the header).
-The design docs under [`.docs/llama2/`](../../.docs/llama2/) cover the rationale and the
-compiler work this exercised — start with [`overview.md`](../../.docs/llama2/overview.md) and
-[`plan.md`](../../.docs/llama2/plan.md).
 
-## Limitations (v0.1)
+## Limitations
 
-- **Target:** `linux-musl-x64`, `linux-musl-arm64` (native-in-Docker on Apple Silicon), and
-  **`darwin-arm64` (native Apple Silicon, no Docker)**. All three are parity-validated (f32
-  token-for-token per platform; the two `linux-musl` targets are also int8 token-for-token; see
-  [Validation](#validation)). Other hosts run the `linux-musl-x64` binary via Docker. Windows
-  remains a [backlog](../../.docs/llama2/enhancements.md) follow-on.
-- **Precision / threads:** single-threaded f32, plus an int8 (`runq.c` v2) quantized path
-  (auto-detected, parity-checked). Real Llama-2 sizes additionally want threading/SIMD (see the
-  [backlog](../../.docs/llama2/enhancements.md)).
-- **Sampling:** argmax, temperature, top-p (nucleus), and top-k — the full sampler. top-p
-  is parity-checked against `llama2.c`; top-k has no upstream reference (fixture-validated).
-- **Tokenizer:** sorted-index lookup — an entry-offset table (O(1) random access) plus a
-  string-sorted id list binary-searched on `encode` (O(log vocab)), replacing the v0.1 linear
-  scan. Token ids are identical (parity-checked against `llama2.c`).
-
-Post-v0.1 enhancements (cross-platform, quantization, training) are scoped
-in [`.docs/llama2/enhancements.md`](../../.docs/llama2/enhancements.md); bigger models and
-top-p/top-k have since landed.
+- **Windows is not yet supported.** The supported targets are `linux-musl-x64`,
+  `linux-musl-arm64` (native-in-Docker on Apple Silicon), and `darwin-arm64` (native Apple
+  Silicon, no Docker) — all three parity-validated (f32 token-for-token per platform; the two
+  `linux-musl` targets are also int8 token-for-token; see [Validation](#validation)). Other hosts
+  run the `linux-musl-x64` binary via Docker.
+- **Single-threaded, no SIMD.** Both the f32 and the int8 (`runq.c` v2) paths are scalar
+  single-thread, so larger models are simply slower — throughput scales ~linearly with parameter
+  count. Correctness is unaffected.
+- **top-k is fixture-validated, not parity-checked.** It has no upstream `llama2.c` reference;
+  every other sampling path (argmax, temperature, top-p) is token-for-token against `llama2.c` /
+  `runq.c`.
