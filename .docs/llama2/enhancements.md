@@ -57,9 +57,9 @@ a clean error. From v0.1 phases:
 | B | top-p / top-k sampling | Med-High | Medium | Pure Zero | ✅ Done |
 | F | Faster tokenizer lookup (no linear scan) | Low | Medium | Pure Zero | ✅ Done |
 | G | Real Llama-2 + int8 quantization | High | Large | Pure Zero | ✅ Done |
-| E | Cross-platform (macOS / Windows / ARM) | High | Med-Large | Compiler | Backlog |
+| E | Cross-platform (macOS / Windows / ARM) | High | Med-Large | Compiler | 🟡 Partial — macOS + Linux-ARM64 ✅; Windows not implemented |
 | H | SIMD / multi-threaded matmul (perf) | Medium | Large | Compiler | Backlog |
-| I | Precise fs-mmap direct-exe gate (x64 + arm64) | Low | Small | Compiler | Backlog |
+| I | Precise fs-mmap direct-exe gate (x64 + arm64) | Low | Small | Compiler | ✅ Done ([doc](./fs-mmap-direct-exe.md)) |
 | T | **Training** | High (risky) | **Very Large** | Both | Backlog (see deep-dive) |
 
 \* D's cosmetic payoff is small, but it unlocks general mutable `u8` buffers — a real
@@ -489,8 +489,18 @@ production training.
 
 # I. Precise fs-mmap direct-exe eligibility (x64 + arm64)
 
-**Status: Backlog.** Spun out of E (cross-platform); deliberately *not* folded into the Linux ARM64
-port so it can be decided on its own merits.
+**Status: ✅ Done** — landed per [`fs-mmap-direct-exe.md`](./fs-mmap-direct-exe.md) (routing-only fix;
+the aarch64-only prototype landed + was reverted during the Linux-ARM64 campaign — this is its
+target-general form). Implementation: `ir_*_uses_non_mmap_fs` IR scanners + a
+`default_direct_exe_eligible` predicate wired at the two `default_direct_exe` routing sites in
+`main.c`; `self_host_subset_compatible` and the libsystem-mmap/macho path are left untouched, so
+x86-64/macho routing for every other program is byte-identical. Validated: full conformance green; the
+7 fs-mmap fixtures flip skip→run on x64 (cross-build) + arm64 (build + run-in-docker); pure-mmap
+programs build+run on both ELF targets with no `--backend`; non-mmap fs still requires `--backend`
+(scope guard intact); darwin still obj+links and runs (unchanged). `conformance/run.mjs` now enforces
+the build (`mustBuildElf`) on the ELF targets so the flip can't silently regress. Spun out of E
+(cross-platform); deliberately *not* folded into the Linux ARM64 port so it could be decided on its own
+merits. The spec below is the original backlog entry, kept for context.
 
 **The issue.** The default (no-`--backend`) direct-exe path is gated by `self_host_caps_allowed`
 (main.c), which excludes `fs` (along with time/rand/net/proc/web). That gate uses the `fs` capability

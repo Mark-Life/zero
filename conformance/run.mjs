@@ -66,6 +66,10 @@ async function assertDirectRuntimeOrUnsupported(fixture, name, expected) {
   if (build.code) {
     const body = JSON.parse(build.stdout);
     const code = body.diagnostics?.[0]?.code;
+    // `mustBuildElf` fixtures are direct-exe-eligible on the ELF syscall targets (pure-mmap fs,
+    // raw syscalls, no link); a failure here means the default-routing gate regressed, not a
+    // backend gap — so fail loudly instead of tolerating it as a skip.
+    assert.ok(!expected.mustBuildElf, `${name} must build on linux-musl-x64 (fs-mmap direct-exe eligibility) but failed with ${code}`);
     assert.ok(code === "CGEN004" || code === "BLD003", `unexpected diagnostic ${code} for ${name}`);
     if (code === "BLD003" && expected.libm) {
       libmSkipped.push(name);
@@ -136,6 +140,9 @@ async function assertLinuxArm64NativeOrUnsupported(fixture, name, expected) {
     // CGEN004 = backend feature not yet implemented; BLD003 = no target-capable toolchain; TAR002 =
     // a capability (heap/fs/args/…) withheld by the linux-arm64 manifest until a later phase lifts
     // it. All three are tolerated skips — the backend never accept-and-miscompiles.
+    // `mustBuildElf` fixtures are exempt: they are direct-exe-eligible (pure-mmap fs, raw syscalls,
+    // no link), so a build failure is a default-routing regression and must fail, not skip.
+    assert.ok(!expected.mustBuildElf, `${name} must build on linux-musl-arm64 (fs-mmap direct-exe eligibility) but failed with ${code}`);
     assert.ok(code === "CGEN004" || code === "BLD003" || code === "TAR002", `unexpected linux-arm64 diagnostic ${code} for ${name}`);
     linuxArm64Skipped.push(name);
     return;
@@ -1993,7 +2000,7 @@ for (const runtimeFixture of [
   ["conformance/native/pass/mem-bytes-as-f32.0", "mem-bytes-as-f32", { stdout: "mem bytes as f32 ok\n" }],
   ["conformance/native/pass/mem-bytes-as-mut-f32.0", "mem-bytes-as-mut-f32", { stdout: "mem bytes as mut f32 ok\n" }],
   ["conformance/native/pass/mem-bytes-as-f64.0", "mem-bytes-as-f64", { stdout: "mem bytes as f64 ok\n" }],
-  ["conformance/native/pass/mem-bytes-as-f32-mmap.0", "mem-bytes-as-f32-mmap", { stdout: "mem bytes as f32 mmap ok\n" }],
+  ["conformance/native/pass/mem-bytes-as-f32-mmap.0", "mem-bytes-as-f32-mmap", { stdout: "mem bytes as f32 mmap ok\n", mustBuildElf: true }],
   ["conformance/native/pass/mem-bytes-as-i32.0", "mem-bytes-as-i32", { stdout: "mem bytes as i32 ok\n" }],
   ["conformance/native/pass/mem-bytes-as-mut-i32.0", "mem-bytes-as-mut-i32", { stdout: "mem bytes as mut i32 ok\n" }],
   ["conformance/native/pass/mem-bytes-as-i8.0", "mem-bytes-as-i8", { stdout: "mem bytes as i8 ok\n" }],
@@ -2069,12 +2076,12 @@ for (const runtimeFixture of [
   ["conformance/native/pass/allocator-primitives.0", "allocator-primitives", { stdout: "allocator primitives ok\n" }],
   ["conformance/native/pass/owned-byte-buffer.0", "owned-byte-buffer", { stdout: "owned byte buffer ok\n" }],
   ["conformance/native/pass/page-alloc-region.0", "page-alloc-region", { stdout: "page alloc region ok\n" }],
-  ["conformance/native/pass/mmap-file-readonly.0", "mmap-file-readonly", { stdout: "mmap file readonly ok\n" }],
-  ["conformance/native/pass/mmap-file-notfound.0", "mmap-file-notfound", { stdout: "mmap notfound ok\n" }],
-  ["conformance/native/pass/mmap-maybe-success.0", "mmap-maybe-success", { stdout: "mmap maybe success ok\n" }],
-  ["conformance/native/pass/mmap-maybe-4gib-len.0", "mmap-maybe-4gib-len", { stdout: "mmap maybe 4gib len ok\n" }],
-  ["conformance/native/pass/mmap-munmap-loop.0", "mmap-munmap-loop", { stdout: "mmap munmap loop ok\n" }],
-  ["conformance/native/pass/mmap-munmap-early-return.0", "mmap-munmap-early-return", { stdout: "mmap early return ok\n" }],
+  ["conformance/native/pass/mmap-file-readonly.0", "mmap-file-readonly", { stdout: "mmap file readonly ok\n", mustBuildElf: true }],
+  ["conformance/native/pass/mmap-file-notfound.0", "mmap-file-notfound", { stdout: "mmap notfound ok\n", mustBuildElf: true }],
+  ["conformance/native/pass/mmap-maybe-success.0", "mmap-maybe-success", { stdout: "mmap maybe success ok\n", mustBuildElf: true }],
+  ["conformance/native/pass/mmap-maybe-4gib-len.0", "mmap-maybe-4gib-len", { stdout: "mmap maybe 4gib len ok\n", mustBuildElf: true }],
+  ["conformance/native/pass/mmap-munmap-loop.0", "mmap-munmap-loop", { stdout: "mmap munmap loop ok\n", mustBuildElf: true }],
+  ["conformance/native/pass/mmap-munmap-early-return.0", "mmap-munmap-early-return", { stdout: "mmap early return ok\n", mustBuildElf: true }],
 ]) {
   await assertDirectRuntimeOrUnsupported(...runtimeFixture);
   await assertDarwinNativeOrUnsupported(...runtimeFixture);

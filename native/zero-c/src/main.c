@@ -4277,6 +4277,68 @@ static bool ir_program_uses_libsystem_mmap(const IrProgram *ir) {
   return false;
 }
 
+// True if the value performs any fs op outside the syscall-lowered mmap family
+// (FS_HOST/FS_MMAP/FS_MUNMAP). Every other fs op needs a path-based open/read/write
+// that the read-only mmap exe path does not emit. Mirrors ir_value_uses_libsystem_mmap's
+// recursion shape; the deny-list is the audit-base fs set above.
+static bool ir_value_uses_non_mmap_fs(const IrValue *value) {
+  if (!value) return false;
+  switch (value->kind) {
+    case IR_VALUE_FS_OPEN:
+    case IR_VALUE_FS_CREATE:
+    case IR_VALUE_FS_READ_PATH:
+    case IR_VALUE_FS_WRITE_PATH:
+    case IR_VALUE_FS_READ_BYTES_PATH:
+    case IR_VALUE_FS_WRITE_BYTES_PATH:
+    case IR_VALUE_FS_READ_ALL:
+    case IR_VALUE_FS_READ_FILE:
+    case IR_VALUE_FS_WRITE_ALL_FILE:
+    case IR_VALUE_FS_CLOSE_FILE:
+    case IR_VALUE_FS_EXISTS:
+    case IR_VALUE_FS_REMOVE:
+    case IR_VALUE_FS_RENAME:
+    case IR_VALUE_FS_FILE_LEN:
+    case IR_VALUE_FS_MAKE_DIR:
+    case IR_VALUE_FS_REMOVE_DIR:
+    case IR_VALUE_FS_IS_DIR:
+    case IR_VALUE_FS_DIR_ENTRY_COUNT:
+    case IR_VALUE_FS_TEMP_NAME:
+    case IR_VALUE_FS_ATOMIC_WRITE:
+      return true;
+    default:
+      break;  // FS_HOST/FS_MMAP/FS_MUNMAP and all non-fs kinds: ok
+  }
+  if (ir_value_uses_non_mmap_fs(value->index) ||
+      ir_value_uses_non_mmap_fs(value->left) ||
+      ir_value_uses_non_mmap_fs(value->right)) {
+    return true;
+  }
+  for (size_t i = 0; i < value->arg_len; i++) {
+    if (ir_value_uses_non_mmap_fs(value->args[i])) return true;
+  }
+  return false;
+}
+
+static bool ir_instrs_use_non_mmap_fs(const IrInstr *instrs, size_t len) {
+  for (size_t i = 0; instrs && i < len; i++) {
+    const IrInstr *instr = &instrs[i];
+    if (ir_value_uses_non_mmap_fs(instr->value) ||
+        ir_value_uses_non_mmap_fs(instr->index) ||
+        ir_instrs_use_non_mmap_fs(instr->then_instrs, instr->then_len) ||
+        ir_instrs_use_non_mmap_fs(instr->else_instrs, instr->else_len)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool ir_program_uses_non_mmap_fs(const IrProgram *ir) {
+  for (size_t i = 0; ir && i < ir->function_len; i++) {
+    if (ir_instrs_use_non_mmap_fs(ir->functions[i].instrs, ir->functions[i].instr_len)) return true;
+  }
+  return false;
+}
+
 static bool ir_needs_zero_runtime_object(const IrProgram *ir, const ZTargetInfo *target) {
   for (size_t i = 0; ir && i < ir->function_len; i++) {
     if (ir_instrs_need_zero_runtime_object(ir->functions[i].instrs, ir->functions[i].instr_len)) return true;
@@ -8236,6 +8298,24 @@ static bool self_host_subset_compatible(const Program *program, const Capability
   return caps_allowed;
 }
 
+// Whether the default (no --backend) direct executable path can build this program.
+// Beyond the no-capability subset, a program whose only gated capability is `fs` and
+// whose fs use stays within the mmap family (FS_HOST/FS_MMAP/FS_MUNMAP) is buildable on
+// the ELF syscall exe targets, where mmap lowers to self-contained syscalls (no external
+// symbol, no obj+link). Mach-O is excluded: it resolves mmap through libSystem and is
+// routed to obj+link by ir_needs_zero_runtime_object before this predicate is consulted.
+static bool default_direct_exe_eligible(const Program *program, const CapabilitySummary *caps,
+                                        const IrProgram *ir, const ZTargetInfo *target) {
+  if (self_host_subset_compatible(program, caps)) return true;
+  if (!caps) return false;
+  if (caps->time || caps->rand || caps->net || caps->proc || caps->web) return false;
+  if (!caps->fs) return false;
+  if (ir_program_uses_non_mmap_fs(ir)) return false;
+  const char *exe = z_direct_exe_emitter(target);
+  return exe && (strcmp(exe, "zero-elf64-exe") == 0 ||
+                 strcmp(exe, "zero-elf-aarch64-exe") == 0);
+}
+
 static void append_self_host_subset_json(ZBuf *buf, const Program *program, const CapabilitySummary *caps, const ZTargetInfo *target) {
   bool compatible = self_host_subset_compatible(program, caps);
   zbuf_append(buf, "{\"contractVersion\":1,\"stage\":\"native-bootstrap\"");
@@ -8432,7 +8512,7 @@ static bool target_readiness_select_diag(const Command *command, const SourceInp
   const char *emitter = z_direct_exe_emitter(target);
   bool supported_exe = emitter && strcmp(emitter, "none") != 0 && requested_exe_backend_matches(command, emitter);
   CapabilitySummary caps = program_capabilities(program);
-  bool default_direct_exe = supported_exe && (!command || !command->backend) && self_host_subset_compatible(program, &caps);
+  bool default_direct_exe = supported_exe && (!command || !command->backend) && default_direct_exe_eligible(program, &caps, ir, target);
   bool requested_direct_exe = supported_exe && command && command->backend && command->backend[0];
   if (default_direct_exe || requested_direct_exe) return target_readiness_dry_emit(command, target, ir, diag);
   init_direct_backend_diag(diag, command, input, target, emit_kind, "direct executable backend is not implemented for this target/backend pair; use --emit obj for direct target objects or choose a supported direct executable target");
@@ -9649,7 +9729,7 @@ int main(int argc, char **argv) {
     z_free_source(&input);
     return 0;
   }
-  bool default_direct_exe = artifact_command && command.emit == EMIT_EXE && direct_exe_emitter && strcmp(direct_exe_emitter, "none") != 0 && !command.backend && self_host_subset_compatible(&program, &direct_exe_caps);
+  bool default_direct_exe = artifact_command && command.emit == EMIT_EXE && direct_exe_emitter && strcmp(direct_exe_emitter, "none") != 0 && !command.backend && default_direct_exe_eligible(&program, &direct_exe_caps, &ir, target);
   bool requested_direct_exe = artifact_command && command.emit == EMIT_EXE && command.backend &&
                               (strcmp(command.backend, "zero-elf64") == 0 ||
                                strcmp(command.backend, "zero-elf-aarch64") == 0 ||
