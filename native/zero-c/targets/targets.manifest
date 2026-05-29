@@ -24,7 +24,7 @@ libc = "default"
 libcMode = "sysroot"
 exeSuffix = ""
 zigTarget = "x86_64-macos"
-capabilities = ["memory", "stdio", "fs", "time", "rand"]
+capabilities = ["memory", "stdio", "args", "fs", "time", "rand"]
 
 [[target]]
 name = "linux-musl-x64"
@@ -52,7 +52,7 @@ libc = "musl"
 libcMode = "bundled-libc"
 exeSuffix = ""
 zigTarget = "aarch64-linux-musl"
-capabilities = ["memory", "stdio", "time", "rand"]
+capabilities = ["memory", "stdio", "args", "fs", "time", "rand"]
 
 [[target]]
 name = "linux-x64"
@@ -94,7 +94,7 @@ libc = "msvc"
 libcMode = "sysroot"
 exeSuffix = ".exe"
 zigTarget = "x86_64-windows-msvc"
-capabilities = ["memory", "stdio", "time", "rand"]
+capabilities = ["memory", "stdio", "fs", "time", "rand"]
 
 [[target]]
 name = "win32-arm64.exe"
@@ -108,4 +108,4 @@ libc = "msvc"
 libcMode = "sysroot"
 exeSuffix = ".exe"
 zigTarget = "aarch64-windows-msvc"
-capabilities = ["memory", "stdio", "time", "rand"]
+capabilities = ["memory", "stdio", "fs", "time", "rand"]

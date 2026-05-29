@@ -3,6 +3,7 @@
 #include "elf_format.h"
 #include "x64_emit.h"
 
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,11 +35,19 @@ static bool elf_ir_diag(ZDiag *diag, const IrProgram *ir) {
 }
 
 static bool elf_type_is_scalar(IrTypeKind type) {
-  return type == IR_TYPE_BOOL || type == IR_TYPE_U8 || type == IR_TYPE_U16 || type == IR_TYPE_USIZE || type == IR_TYPE_I32 || type == IR_TYPE_U32;
+  return type == IR_TYPE_BOOL || type == IR_TYPE_U8 || type == IR_TYPE_I8 || type == IR_TYPE_U16 || type == IR_TYPE_USIZE || type == IR_TYPE_I32 || type == IR_TYPE_U32;
 }
 
 static bool elf_type_is_i64(IrTypeKind type) {
   return type == IR_TYPE_I64 || type == IR_TYPE_U64;
+}
+
+static bool elf_type_is_f64(IrTypeKind type) {
+  return type == IR_TYPE_F64;
+}
+
+static bool elf_type_is_float(IrTypeKind type) {
+  return type == IR_TYPE_F32 || type == IR_TYPE_F64;
 }
 
 static bool elf_type_is_supported_scalar(IrTypeKind type) {
@@ -57,6 +66,10 @@ static void elf_emit_cast_normalize_rax(ZBuf *code, IrTypeKind source, IrTypeKin
     case IR_TYPE_U8:
       z_x64_emit_and_reg_u32(code, 0, 0xff, false);
       return;
+    case IR_TYPE_I8:
+      // Sign-extend the low byte so a signed-byte value carries the correct sign in arithmetic.
+      z_x64_emit_movsx_eax_al(code);
+      return;
     case IR_TYPE_U16:
       z_x64_emit_and_reg_u32(code, 0, 0xffff, false);
       return;
@@ -68,7 +81,12 @@ static void elf_emit_cast_normalize_rax(ZBuf *code, IrTypeKind source, IrTypeKin
     case IR_TYPE_I64:
     case IR_TYPE_U64:
       if (source == IR_TYPE_I32) z_x64_emit_cdqe(code);
-      else if (source != IR_TYPE_I64 && source != IR_TYPE_U64) z_x64_emit_mov_reg_from_reg(code, 0, 0, false);
+      else if (source == IR_TYPE_U32 || source == IR_TYPE_USIZE) {
+        // No truncation: a USIZE/U32-typed register may already hold a full 64-bit value when the
+        // source is a 64-bit-wide len slot (Span<u8>/Mapping/etc.). Standard 32-bit ops
+        // zero-extend their result into the full register, so any non-len source still presents a
+        // valid 64-bit zero-extended value here.
+      } else if (source != IR_TYPE_I64 && source != IR_TYPE_U64) z_x64_emit_mov_reg_from_reg(code, 0, 0, false);
       return;
     default:
       return;
@@ -86,6 +104,8 @@ static const char *elf_type_name(IrTypeKind type) {
     case IR_TYPE_U32: return "u32";
     case IR_TYPE_I64: return "i64";
     case IR_TYPE_U64: return "u64";
+    case IR_TYPE_F32: return "f32";
+    case IR_TYPE_F64: return "f64";
     case IR_TYPE_MAYBE_SCALAR: return "Maybe<usize>";
     default: return "unsupported";
   }
@@ -111,7 +131,26 @@ static unsigned elf_record_field_disp(const IrLocal *local, unsigned field_offse
   return local->frame_offset - field_offset;
 }
 
+// Load the ref<Record> / mutref<Record> pointer that the prologue stashed in the local's
+// first 8 frame bytes into `dst_reg`. Use BEFORE any subsequent load/store with `dst_reg` as the
+// base; the local's slot itself is untouched. Callers compute the field address as [dst_reg +
+// field_offset] (which fits in the standard [base+disp32] encoding for typical records).
+static void elf_emit_load_ref_record_ptr(ZBuf *code, const IrLocal *local, unsigned dst_reg) {
+  unsigned disp = local ? local->frame_offset : 0;
+  z_x64_emit_rbp_disp_reg(code, 0x8b, dst_reg, disp, true);
+}
+
 static void elf_emit_load_field_rax(ZBuf *code, const IrLocal *local, unsigned field_offset, IrTypeKind type) {
+  // ref<Record> field load — deref the stashed pointer into rcx first, then load the
+  // field at [rcx + field_offset]. rcx is a free scratch here (the field load lands in rax and
+  // the caller's pipeline ignores rcx). The deref's base disp uses rbp-relative encoding.
+  if (local && local->is_ref) {
+    elf_emit_load_ref_record_ptr(code, local, 1);
+    if (type == IR_TYPE_U8 || type == IR_TYPE_BOOL) z_x64_emit_movzx_reg32_ptr_reg_disp_u8(code, 0, 1, field_offset);
+    else if (elf_type_is_i64(type)) z_x64_emit_load_reg_ptr_reg_disp(code, 0, 1, field_offset, true);
+    else z_x64_emit_load_reg_ptr_reg_disp(code, 0, 1, field_offset, false);
+    return;
+  }
   unsigned disp = elf_record_field_disp(local, field_offset);
   if (type == IR_TYPE_U8 || type == IR_TYPE_BOOL) {
     z_x64_append_u8(code, 0x0f);
@@ -124,6 +163,16 @@ static void elf_emit_load_field_rax(ZBuf *code, const IrLocal *local, unsigned f
 }
 
 static void elf_emit_store_field_from_rax(ZBuf *code, const IrLocal *local, unsigned field_offset, IrTypeKind type) {
+  // mutref<Record> field store — deref the stashed pointer into rcx first, then store
+  // the value (in rax) at [rcx + field_offset]. rcx is scratch; the caller already materialized
+  // the value in rax. The ref/mutref mutability check is enforced in the FIELD_STORE handler.
+  if (local && local->is_ref) {
+    elf_emit_load_ref_record_ptr(code, local, 1);
+    if (type == IR_TYPE_U8 || type == IR_TYPE_BOOL) z_x64_emit_store_ptr_reg_disp_from_reg8(code, 1, field_offset, 0);
+    else if (elf_type_is_i64(type)) z_x64_emit_store_ptr_reg_disp_from_reg(code, 1, field_offset, 0, true);
+    else z_x64_emit_store_ptr_reg_disp_from_reg(code, 1, field_offset, 0, false);
+    return;
+  }
   unsigned disp = elf_record_field_disp(local, field_offset);
   if (type == IR_TYPE_U8 || type == IR_TYPE_BOOL) {
     z_x64_emit_rbp_disp_reg(code, 0x88, 0, disp, false);
@@ -134,14 +183,101 @@ static void elf_emit_store_field_from_rax(ZBuf *code, const IrLocal *local, unsi
   }
 }
 
+// Float scalar load/store. The frame offset is rbp-relative downward (locals grow
+// down), but z_x64_emit_movs_xmm_rbp_disp takes a raw signed displacement, so negate.
+static void elf_emit_load_local_xmm0(ZBuf *code, const IrFunction *fun, unsigned local_index) {
+  bool is64 = fun && local_index < fun->local_len && elf_type_is_f64(fun->locals[local_index].type);
+  z_x64_emit_movs_xmm_rbp_disp(code, 0, -(int32_t)elf_local_offset(fun, local_index), is64, true);
+}
+
+static void elf_emit_store_local_xmm0(ZBuf *code, const IrFunction *fun, unsigned local_index) {
+  bool is64 = fun && local_index < fun->local_len && elf_type_is_f64(fun->locals[local_index].type);
+  z_x64_emit_movs_xmm_rbp_disp(code, 0, -(int32_t)elf_local_offset(fun, local_index), is64, false);
+}
+
+static void elf_emit_load_field_xmm0(ZBuf *code, const IrLocal *local, unsigned field_offset, IrTypeKind type) {
+  // ref<Record> FP field load — deref the stashed ptr into rcx then movss/movsd from
+  // [rcx + field_offset] into xmm0.
+  if (local && local->is_ref) {
+    elf_emit_load_ref_record_ptr(code, local, 1);
+    z_x64_emit_movs_xmm_ptr_reg_disp(code, 0, 1, field_offset, elf_type_is_f64(type), true);
+    return;
+  }
+  z_x64_emit_movs_xmm_rbp_disp(code, 0, -(int32_t)elf_record_field_disp(local, field_offset), elf_type_is_f64(type), true);
+}
+
+static void elf_emit_store_field_xmm0(ZBuf *code, const IrLocal *local, unsigned field_offset, IrTypeKind type) {
+  // mutref<Record> FP field store — deref ptr into rcx, movss/movsd xmm0 → [rcx + off].
+  if (local && local->is_ref) {
+    elf_emit_load_ref_record_ptr(code, local, 1);
+    z_x64_emit_movs_xmm_ptr_reg_disp(code, 0, 1, field_offset, elf_type_is_f64(type), false);
+    return;
+  }
+  z_x64_emit_movs_xmm_rbp_disp(code, 0, -(int32_t)elf_record_field_disp(local, field_offset), elf_type_is_f64(type), false);
+}
+
+// Byte size of a typed-span / array element. 1-byte elements (u8/i8/Bool) need no index scaling;
+// 2-byte (u16) scales by 2; 8-byte (i64/u64/f64) by 8; everything else (i32/u32/usize/f32) by 4.
+// u16 is currently exercised only as a codec read result width.
 static unsigned elf_type_byte_size(IrTypeKind type) {
-  if (type == IR_TYPE_U8 || type == IR_TYPE_BOOL) return 1;
-  if (elf_type_is_i64(type)) return 8;
+  if (type == IR_TYPE_U8 || type == IR_TYPE_I8 || type == IR_TYPE_BOOL) return 1;
+  if (type == IR_TYPE_U16) return 2;
+  if (elf_type_is_i64(type) || elf_type_is_f64(type)) return 8;
   return 4;
 }
 
 static void elf_emit_lea_array_base_rax(ZBuf *code, const IrLocal *local) {
   z_x64_emit_rbp_disp_reg(code, 0x8d, 0, local->frame_offset, true);
+}
+
+// Forward declaration for the sret slot offset used by the record helpers below.
+static unsigned elf_sret_slot_offset(const IrFunction *fun);
+
+// lea reg, [rbp - frame_offset(local)] — used to pass record args by pointer / build sret targets.
+static void elf_emit_lea_local_addr_reg(ZBuf *code, const IrFunction *fun, unsigned local_index, unsigned reg) {
+  z_x64_emit_rbp_disp_reg(code, 0x8d, reg, elf_local_offset(fun, local_index), true);
+}
+
+static void elf_emit_lea_local_addr_rax(ZBuf *code, const IrFunction *fun, unsigned local_index) {
+  elf_emit_lea_local_addr_reg(code, fun, local_index, 0);
+}
+
+// Copy a record slot from src to dest (or through the saved sret pointer if dest_index == UINT_MAX),
+// 8 bytes at a time then a 4-byte tail. rax is scratch; the helper itself touches rdi, rsi, rax.
+static void elf_emit_record_copy_to(ZBuf *code, const IrFunction *fun, unsigned dest_index, unsigned src_index) {
+  unsigned size = src_index < fun->local_len ? fun->locals[src_index].byte_size : 0;
+  if (dest_index == UINT_MAX) {
+    z_x64_emit_rbp_disp_reg(code, 0x8b, 7, elf_sret_slot_offset(fun), true); // mov rdi, [rbp - sret]
+  } else {
+    elf_emit_lea_local_addr_reg(code, fun, dest_index, 7);
+  }
+  elf_emit_lea_local_addr_reg(code, fun, src_index, 6);
+  unsigned k = 0;
+  while (k + 8 <= size) {
+    z_x64_emit_load_reg_ptr_reg_disp(code, 0, 6, k, true);   // mov rax, [rsi + k]
+    z_x64_emit_store_ptr_reg_disp_from_reg(code, 7, k, 0, true);  // mov [rdi + k], rax
+    k += 8;
+  }
+  if (k + 4 <= size) {
+    z_x64_emit_load_reg_ptr_reg_disp(code, 0, 6, k, false);  // mov eax, [rsi + k]
+    z_x64_emit_store_ptr_reg_disp_from_reg(code, 7, k, 0, false); // mov [rdi + k], eax
+  }
+}
+
+// Copy a record param (passed by pointer in ptr_reg) into its inline frame slot.
+static void elf_emit_copy_record_param(ZBuf *code, const IrFunction *fun, unsigned local_index, unsigned ptr_reg) {
+  unsigned size = local_index < fun->local_len ? fun->locals[local_index].byte_size : 0;
+  unsigned frame_off = elf_local_offset(fun, local_index);
+  unsigned k = 0;
+  while (k + 8 <= size) {
+    z_x64_emit_load_reg_ptr_reg_disp(code, 0, ptr_reg, k, true);   // mov rax, [ptr_reg + k]
+    z_x64_emit_rbp_disp_reg(code, 0x89, 0, frame_off - k, true);
+    k += 8;
+  }
+  if (k + 4 <= size) {
+    z_x64_emit_load_reg_ptr_reg_disp(code, 0, ptr_reg, k, false);  // mov eax, [ptr_reg + k]
+    z_x64_emit_rbp_disp_reg(code, 0x89, 0, frame_off - k, false);
+  }
 }
 
 static void elf_emit_scale_index_into_rax(ZBuf *code, IrTypeKind element_type) {
@@ -158,6 +294,41 @@ static unsigned elf_setcc_opcode(IrCompareOp op, bool uns) {
     case IR_CMP_GE: return uns ? 0x93 : 0x9d;
   }
   return 0x94;
+}
+
+// Map IR_CMP_* to its primary unsigned SETcc opcode after UCOMISS/UCOMISD.
+// UCOMIS sets EFLAGS like an unsigned compare; on unordered (NaN) ZF=PF=CF=1.
+static unsigned elf_xmm_setcc_opcode(IrCompareOp op) {
+  switch (op) {
+    case IR_CMP_EQ: return 0x94; // SETE
+    case IR_CMP_NE: return 0x95; // SETNE
+    case IR_CMP_LT: return 0x92; // SETB
+    case IR_CMP_LE: return 0x96; // SETBE
+    case IR_CMP_GT: return 0x97; // SETA  (CF=1 on NaN => false, no fixup)
+    case IR_CMP_GE: return 0x93; // SETAE (no fixup)
+  }
+  return 0x94;
+}
+
+// >, >= read false on NaN via SETA/SETAE; ==,!=,<,<= need a PF-based fixup so NaN
+// matches IEEE (false everywhere except !=, which is true on unordered).
+static bool elf_xmm_compare_needs_parity_fixup(IrCompareOp op) {
+  return op == IR_CMP_EQ || op == IR_CMP_NE || op == IR_CMP_LT || op == IR_CMP_LE;
+}
+
+// UCOMIS xmm0,xmm1 then materialize the boolean result into eax with NaN handling.
+static void elf_emit_xmm_compare_to_bool(ZBuf *code, IrCompareOp op, bool is64) {
+  z_x64_emit_ucomis(code, 0, 1, is64);
+  if (elf_xmm_compare_needs_parity_fixup(op)) {
+    bool is_ne = op == IR_CMP_NE;
+    z_x64_emit_setcc_al(code, elf_xmm_setcc_opcode(op));
+    z_x64_emit_setcc_cl(code, is_ne ? 0x9a : 0x9b); // SETP for !=, SETNP otherwise
+    if (is_ne) z_x64_emit_or_al_cl(code);
+    else z_x64_emit_and_al_cl(code);
+    z_x64_emit_movzx_eax_al(code);
+  } else {
+    z_x64_emit_setcc_al_to_bool(code, elf_xmm_setcc_opcode(op));
+  }
 }
 
 static ElfRuntimeHelper elf_runtime_helper_for_value(IrValueKind kind) {
@@ -196,9 +367,17 @@ static unsigned elf_base_stack_size(const IrFunction *fun) {
   return (unsigned)z_elf_align(fun ? fun->frame_bytes : 0, 16);
 }
 
+// Frame slot (rbp-relative) holding the caller-provided sret pointer for a record-returning
+// function. Such functions never seed process args, so the slot just past the locals is free.
+static unsigned elf_sret_slot_offset(const IrFunction *fun) {
+  return elf_base_stack_size(fun) + 8u;
+}
+
 static unsigned elf_total_stack_size(const IrFunction *fun, const ElfEmitContext *ctx) {
   unsigned base = elf_base_stack_size(fun);
-  return base + (elf_function_seeds_process_args(fun, ctx) ? 32u : 0u);
+  unsigned extra = elf_function_seeds_process_args(fun, ctx) ? 32u : 0u;
+  if (fun && fun->return_type == IR_TYPE_RECORD) extra = 16u;  // reserve sret slot (16 for alignment)
+  return base + extra;
 }
 
 static void elf_emit_epilogue(ZBuf *code, const IrFunction *fun, const ElfEmitContext *ctx) {
@@ -217,6 +396,7 @@ static void elf_emit_push_rax(ZBuf *code) {
 
 static void elf_emit_store_local_slot_reg(ZBuf *code, const IrLocal *local, unsigned slot_offset, unsigned reg, bool wide);
 static void elf_emit_store_local_slot_rax(ZBuf *code, const IrLocal *local, unsigned slot_offset);
+static void elf_emit_load_local_slot_rax(ZBuf *code, const IrLocal *local, unsigned slot_offset);
 static bool elf_emit_byte_view_ptr(ZBuf *code, const IrFunction *fun, const IrValue *view, ElfEmitContext *ctx, ZDiag *diag);
 
 static void elf_emit_strlen_rax_to_ecx(ZBuf *code) {
@@ -277,9 +457,27 @@ static void elf_emit_close_rax_fd(ZBuf *code) {
   z_x64_emit_syscall(code);
 }
 
+// Compute the element address (base + index * sizeof(T)) into rax, trapping (ud2) when the index is
+// out of bounds. Supports fixed arrays (compile-time array_len) and typed spans (runtime span.len at
+// slot +8); for a span the base is span.ptr at slot +0. The index lands in rcx for the scaling LEA.
 static bool elf_emit_bounds_checked_address(ZBuf *code, const IrFunction *fun, const IrLocal *local, const IrValue *index, ElfEmitContext *ctx, ZDiag *diag) {
-  if (!local || !local->is_array) return elf_diag(diag, "direct ELF64 indexed access requires fixed array local", index ? index->line : 1, index ? index->column : 1, "non-array local");
+  if (!local) return elf_diag(diag, "direct ELF64 indexed access requires a local", index ? index->line : 1, index ? index->column : 1, "missing local");
+  bool is_byte_view = local->type == IR_TYPE_BYTE_VIEW;
+  if (!local->is_array && !is_byte_view) return elf_diag(diag, "direct ELF64 indexed access requires fixed array or span local", index ? index->line : 1, index ? index->column : 1, "non-indexable local");
   if (!elf_emit_value(code, fun, index, ctx, diag)) return false;
+  if (is_byte_view) {
+    // Span bounds check: compare the index (rcx) against the runtime element count (span.len at +8).
+    // JB (0x82) is taken when index < len, so the ud2 trap fires only on an out-of-range index.
+    z_x64_emit_mov_rcx_from_rax(code, false);
+    elf_emit_load_local_slot_rax(code, local, 8);
+    z_x64_emit_cmp_reg_reg(code, 1, 0, true);
+    size_t ok_patch = z_x64_emit_jcc32_placeholder(code, 0x82);
+    z_x64_emit_ud2(code);
+    z_x64_patch_rel32(code, ok_patch, code->len);
+    elf_emit_load_local_slot_rax(code, local, 0);
+    elf_emit_scale_index_into_rax(code, local->element_type);
+    return true;
+  }
   z_x64_append_u8(code, 0x3d);
   z_x64_append_u32(code, local->array_len);
   size_t ok_patch = z_x64_emit_jcc32_placeholder(code, 0x82);
@@ -325,6 +523,13 @@ static bool elf_byte_view_const_len(const IrFunction *fun, const IrValue *view, 
     if (view->right && !elf_const_u32_value(view->right, &end)) return false;
     if (start > end || end > base_len) return false;
     if (out) *out = end - start;
+    return true;
+  }
+  if (view->kind == IR_VALUE_BYTE_VIEW_REINTERPRET && view->left) {
+    unsigned base_len = 0;
+    if (!elf_byte_view_const_len(fun, view->left, &base_len)) return false;
+    // Reinterpreted element count = underlying byte length / sizeof(target element).
+    if (out) *out = base_len / elf_type_byte_size(view->element_type);
     return true;
   }
   if (view->kind == IR_VALUE_LOCAL && view->local_index < fun->local_len && fun->locals[view->local_index].type == IR_TYPE_BYTE_VIEW) {
@@ -411,6 +616,14 @@ static bool elf_emit_byte_view_len(ZBuf *code, const IrFunction *fun, const IrVa
     z_x64_emit_mov_eax_u32(code, len);
     return true;
   }
+  if (view && view->kind == IR_VALUE_BYTE_VIEW_REINTERPRET && view->left) {
+    // Reinterpreted element count = underlying byte length >> log2(sizeof(T)). A 1-byte element (i8)
+    // needs no shift: the byte length already is the element count.
+    if (!elf_emit_byte_view_len(code, fun, view->left, ctx, diag)) return false;
+    unsigned size = elf_type_byte_size(view->element_type);
+    if (size > 1) z_x64_emit_shr_reg_imm8(code, 0, size == 8 ? 3 : 2, true);
+    return true;
+  }
   if (view && view->kind == IR_VALUE_BYTE_SLICE && !view->right) {
     if (!elf_emit_byte_view_len(code, fun, view->left, ctx, diag)) return false;
     if (!view->index) return true;
@@ -448,8 +661,19 @@ static bool elf_emit_byte_view_len(ZBuf *code, const IrFunction *fun, const IrVa
     elf_emit_load_local_slot_rax(code, &fun->locals[view->local_index], 8);
     return true;
   }
+  if (view && view->kind == IR_VALUE_FIELD_LOAD && view->type == IR_TYPE_BYTE_VIEW && view->local_index < fun->local_len && fun->locals[view->local_index].is_record) {
+    // Span field length lives 8 bytes past the field's ptr, as a 64-bit byte/element count.
+    // ref<Record> — deref the stashed ptr into rcx then load len at [rcx+field_offset+8].
+    if (fun->locals[view->local_index].is_ref) {
+      elf_emit_load_ref_record_ptr(code, &fun->locals[view->local_index], 1);
+      z_x64_emit_load_reg_ptr_reg_disp(code, 0, 1, view->field_offset + 8, true);
+      return true;
+    }
+    elf_emit_load_local_slot_reg(code, &fun->locals[view->local_index], view->field_offset + 8, 0, true);
+    return true;
+  }
   if (view && view->kind == IR_VALUE_MAYBE_VALUE && view->local_index < fun->local_len && fun->locals[view->local_index].type == IR_TYPE_MAYBE_BYTE_VIEW) {
-    elf_emit_load_local_slot_reg(code, &fun->locals[view->local_index], 16, 0, false);
+    elf_emit_load_local_slot_reg(code, &fun->locals[view->local_index], 16, 0, true);
     return true;
   }
   (void)ctx;
@@ -462,6 +686,18 @@ static bool elf_emit_byte_view_ptr(ZBuf *code, const IrFunction *fun, const IrVa
     elf_emit_load_local_slot_rax(code, &fun->locals[view->local_index], 0);
     return true;
   }
+  if (view->kind == IR_VALUE_FIELD_LOAD && view->type == IR_TYPE_BYTE_VIEW && view->local_index < fun->local_len && fun->locals[view->local_index].is_record) {
+    // Span field: the 8-byte pointer lives at the field offset within the record local.
+    // ref<Record> — deref the stashed ptr into rcx then load the span ptr from
+    // [rcx + field_offset].
+    if (fun->locals[view->local_index].is_ref) {
+      elf_emit_load_ref_record_ptr(code, &fun->locals[view->local_index], 1);
+      z_x64_emit_load_reg_ptr_reg_disp(code, 0, 1, view->field_offset, true);
+      return true;
+    }
+    elf_emit_load_local_slot_rax(code, &fun->locals[view->local_index], view->field_offset);
+    return true;
+  }
   if (view->kind == IR_VALUE_MAYBE_VALUE && view->local_index < fun->local_len && fun->locals[view->local_index].type == IR_TYPE_MAYBE_BYTE_VIEW) {
     elf_emit_load_local_slot_rax(code, &fun->locals[view->local_index], 8);
     return true;
@@ -471,9 +707,15 @@ static bool elf_emit_byte_view_ptr(ZBuf *code, const IrFunction *fun, const IrVa
   }
   if (view->kind == IR_VALUE_ARRAY_BYTE_VIEW && view->array_index < fun->local_len) {
     const IrLocal *local = &fun->locals[view->array_index];
-    if (!local->is_array || local->element_type != IR_TYPE_U8) return elf_diag(diag, "direct ELF64 byte-view array requires [N]u8", view->line, view->column, "non-u8 array view");
+    // Any value-typed array binds as a typed span — ptr = LEA of &arr[0]. Element scaling
+    // for INDEX_LOAD/STORE / BYTE_SLICE rides on the carrying IR_VALUE's element_type.
+    if (!local->is_array) return elf_diag(diag, "direct ELF64 byte-view array source must be a fixed array local", view->line, view->column, "non-array byte view");
     elf_emit_lea_array_base_rax(code, local);
     return true;
+  }
+  if (view->kind == IR_VALUE_BYTE_VIEW_REINTERPRET && view->left) {
+    // A reinterpret keeps the same base pointer (zero-copy); only the element count changes.
+    return elf_emit_byte_view_ptr(code, fun, view->left, ctx, diag);
   }
   if (view->kind == IR_VALUE_BYTE_SLICE) {
     if (!elf_emit_byte_view_ptr(code, fun, view->left, ctx, diag)) return false;
@@ -483,6 +725,10 @@ static bool elf_emit_byte_view_ptr(ZBuf *code, const IrFunction *fun, const IrVa
     } else {
       z_x64_emit_mov_eax_u32(code, 0);
     }
+    // Slice bounds are element indices, so scale the start by sizeof(T) to get a byte offset before
+    // advancing the base pointer. For u8 (size 1) this is a no-op.
+    unsigned elem_size = elf_type_byte_size(view->element_type);
+    if (elem_size == 8 || elem_size == 4) z_x64_emit_shl_reg_imm8(code, 0, elem_size == 8 ? 3 : 2, true);
     z_x64_emit_pop_reg64(code, 1);
     z_x64_emit_add_rax_rcx(code, true);
     return true;
@@ -514,6 +760,19 @@ static bool elf_emit_fs_basic_value(ZBuf *code, const IrFunction *fun, const IrV
       elf_emit_load_local_rax(code, fun, value->local_index);
       elf_emit_close_rax_fd(code);
       return true;
+    case IR_VALUE_FS_MUNMAP: {
+      // std.fs.munmap(&mut m): release a mapping via the raw munmap(addr, len) syscall (num 11). The
+      // Mapping local stores ptr@0 (64-bit) and len@8 (64-bit byte count, matching the byte-view
+      // store); the full 64-bit len is loaded into rsi so >4 GiB mappings unmap correctly.
+      if (value->local_index >= fun->local_len || fun->locals[value->local_index].type != IR_TYPE_BYTE_VIEW) return elf_diag(diag, "direct ELF64 std.fs.munmap requires a Mapping local", value->line, value->column, "invalid Mapping");
+      const IrLocal *mapping = &fun->locals[value->local_index];
+      elf_emit_load_local_slot_rax(code, mapping, 0); // addr
+      z_x64_emit_mov_rdi_from_rax(code);
+      elf_emit_load_local_slot_reg(code, mapping, 8, 6, true); // rsi = len (64-bit byte count)
+      z_x64_emit_mov_eax_u32(code, 11); // munmap
+      z_x64_emit_syscall(code);
+      return true;
+    }
     case IR_VALUE_FS_EXISTS: case IR_VALUE_FS_IS_DIR: {
       unsigned flags = value->kind == IR_VALUE_FS_IS_DIR ? 65536u : 0u;
       if (!elf_emit_openat_path(code, fun, value->left, flags, 0, ctx, diag)) return false;
@@ -869,8 +1128,163 @@ static bool elf_emit_http_value(ZBuf *code, const IrFunction *fun, const IrValue
   }
 }
 
+// Forward declaration: call a record-returning function and direct its sret pointer to a local
+// (dest_local >= 0) or to the caller's own sret pointer (dest_local < 0).
+static bool elf_emit_record_call_with_dest(ZBuf *code, const IrFunction *fun, int dest_local, const IrValue *value, ElfEmitContext *ctx, ZDiag *diag);
+
+static bool elf_emit_call_value(ZBuf *code, const IrFunction *fun, const IrValue *value, ElfEmitContext *ctx, ZDiag *diag) {
+  const IrFunction *callee = ctx && ctx->ir && value->callee_index < ctx->ir->function_len ? &ctx->ir->functions[value->callee_index] : NULL;
+  if (!callee) return elf_diag(diag, "direct ELF64 call target is unavailable", value->line, value->column, "invalid callee");
+  // System V splits args between the GPR bank (param_regs) and SSE bank (xmm0..7),
+  // counted independently. Push all args left-to-right, then pop right-to-left.
+  size_t int_slots = 0, float_slots = 0;
+  for (size_t i = 0; i < value->arg_len; i++) {
+    if (i >= callee->param_count) return elf_diag(diag, "direct ELF64 call parameter metadata is unavailable", value->line, value->column, "invalid callee parameter");
+    IrTypeKind ptype = callee->locals[i].type;
+    if (elf_type_is_float(ptype)) float_slots++;
+    else if (ptype == IR_TYPE_BYTE_VIEW) int_slots += 2;
+    else int_slots++;
+  }
+  if (int_slots > 6) return elf_diag(diag, "direct ELF64 call supports at most six integer ABI argument slots", value->line, value->column, "too many integer arguments");
+  if (float_slots > 8) return elf_diag(diag, "direct ELF64 call supports at most eight float arguments", value->line, value->column, "too many float arguments");
+  for (size_t i = 0; i < value->arg_len; i++) {
+    IrTypeKind ptype = callee->locals[i].type;
+    if (ptype == IR_TYPE_BYTE_VIEW) {
+      if (!elf_emit_byte_view_ptr(code, fun, value->args[i], ctx, diag)) return false;
+      elf_emit_push_rax(code);
+      if (!elf_emit_byte_view_len(code, fun, value->args[i], ctx, diag)) return false;
+      elf_emit_push_rax(code);
+    } else if (ptype == IR_TYPE_RECORD) {
+      // Record arg: pass by pointer (caller spill stays valid for the call).
+      if (value->args[i]->kind != IR_VALUE_LOCAL) return elf_diag(diag, "direct ELF64 record argument must be a local", value->line, value->column, "non-local record arg");
+      elf_emit_lea_local_addr_rax(code, fun, value->args[i]->local_index);
+      elf_emit_push_rax(code);
+    } else if (elf_type_is_float(ptype)) {
+      if (!elf_emit_value(code, fun, value->args[i], ctx, diag)) return false;
+      z_x64_emit_xmm_push(code, 0);
+    } else {
+      if (!elf_emit_value(code, fun, value->args[i], ctx, diag)) return false;
+      elf_emit_push_rax(code);
+    }
+  }
+  size_t int_remaining = int_slots, float_remaining = float_slots;
+  for (size_t i = value->arg_len; i > 0; i--) {
+    IrTypeKind ptype = callee->locals[i - 1].type;
+    if (ptype == IR_TYPE_BYTE_VIEW) {
+      z_x64_emit_pop_reg64(code, elf_param_regs[--int_remaining]);
+      z_x64_emit_pop_reg64(code, elf_param_regs[--int_remaining]);
+    } else if (ptype == IR_TYPE_RECORD) {
+      z_x64_emit_pop_reg64(code, elf_param_regs[--int_remaining]);
+    } else if (elf_type_is_float(ptype)) {
+      z_x64_emit_xmm_pop(code, (unsigned)(--float_remaining));
+    } else {
+      z_x64_emit_pop_reg64(code, elf_param_regs[--int_remaining]);
+    }
+  }
+  size_t patch = z_x64_emit_call32_placeholder(code);
+  return z_elf_record_call_patch(ctx, patch, value->callee_index, diag, value);
+}
+
+// Emit a call to a record-returning function: push args, then put the sret pointer in rdi (param0)
+// pointing to dest_local (own local) or the saved sret slot (if dest_local < 0).
+static bool elf_emit_record_call_with_dest(ZBuf *code, const IrFunction *fun, int dest_local, const IrValue *value, ElfEmitContext *ctx, ZDiag *diag) {
+  const IrFunction *callee = ctx && ctx->ir && value->callee_index < ctx->ir->function_len ? &ctx->ir->functions[value->callee_index] : NULL;
+  if (!callee) return elf_diag(diag, "direct ELF64 call target is unavailable", value->line, value->column, "invalid callee");
+  size_t int_count = 1, float_count = 0;  // int_count starts at 1 because rdi is reserved for sret
+  for (size_t i = 0; i < value->arg_len; i++) {
+    IrTypeKind ptype = i < callee->param_count ? callee->locals[i].type : value->args[i]->type;
+    if (elf_type_is_float(ptype)) float_count++;
+    else if (ptype == IR_TYPE_BYTE_VIEW) int_count += 2;
+    else int_count++;
+  }
+  if (int_count > 6) return elf_diag(diag, "direct ELF64 record-returning call supports at most five integer arguments", value->line, value->column, "too many integer arguments");
+  if (float_count > 8) return elf_diag(diag, "direct ELF64 call supports at most eight float arguments", value->line, value->column, "too many float arguments");
+  for (size_t i = 0; i < value->arg_len; i++) {
+    IrTypeKind ptype = i < callee->param_count ? callee->locals[i].type : value->args[i]->type;
+    if (ptype == IR_TYPE_BYTE_VIEW) {
+      if (!elf_emit_byte_view_ptr(code, fun, value->args[i], ctx, diag)) return false;
+      elf_emit_push_rax(code);
+      if (!elf_emit_byte_view_len(code, fun, value->args[i], ctx, diag)) return false;
+      elf_emit_push_rax(code);
+    } else if (ptype == IR_TYPE_RECORD) {
+      if (value->args[i]->kind != IR_VALUE_LOCAL) return elf_diag(diag, "direct ELF64 record argument must be a local", value->line, value->column, "non-local record arg");
+      elf_emit_lea_local_addr_rax(code, fun, value->args[i]->local_index);
+      elf_emit_push_rax(code);
+    } else if (elf_type_is_float(ptype)) {
+      if (!elf_emit_value(code, fun, value->args[i], ctx, diag)) return false;
+      z_x64_emit_xmm_push(code, 0);
+    } else {
+      if (!elf_emit_value(code, fun, value->args[i], ctx, diag)) return false;
+      elf_emit_push_rax(code);
+    }
+  }
+  size_t int_remaining = int_count, float_remaining = float_count;
+  for (size_t i = value->arg_len; i > 0; i--) {
+    IrTypeKind ptype = (i - 1) < callee->param_count ? callee->locals[i - 1].type : value->args[i - 1]->type;
+    if (ptype == IR_TYPE_BYTE_VIEW) {
+      z_x64_emit_pop_reg64(code, elf_param_regs[--int_remaining]);
+      z_x64_emit_pop_reg64(code, elf_param_regs[--int_remaining]);
+    } else if (ptype == IR_TYPE_RECORD) {
+      z_x64_emit_pop_reg64(code, elf_param_regs[--int_remaining]);
+    } else if (elf_type_is_float(ptype)) {
+      z_x64_emit_xmm_pop(code, (unsigned)(--float_remaining));
+    } else {
+      z_x64_emit_pop_reg64(code, elf_param_regs[--int_remaining]);
+    }
+  }
+  // rdi (param0) = destination sret pointer
+  if (dest_local >= 0) {
+    elf_emit_lea_local_addr_reg(code, fun, (unsigned)dest_local, 7);
+  } else {
+    z_x64_emit_rbp_disp_reg(code, 0x8b, 7, elf_sret_slot_offset(fun), true);
+  }
+  size_t patch = z_x64_emit_call32_placeholder(code);
+  return z_elf_record_call_patch(ctx, patch, value->callee_index, diag, value);
+}
+
+// Single-arg libm call (System V FP ABI): argument in xmm0, result in xmm0. All std.math libm
+// helpers operate on f32. The undefined GLOBAL|FUNC external + R_X86_64_PLT32 relocation are
+// resolved by the host link step against libm (-lm).
+static bool elf_emit_math_unary_value(ZBuf *code, const IrFunction *fun, const IrValue *value, ElfEmitContext *ctx, ZDiag *diag) {
+  if (!value->left) return elf_diag(diag, "direct ELF64 math call requires an argument", value->line, value->column, "missing argument");
+  if (!elf_emit_value(code, fun, value->left, ctx, diag)) return false;
+  size_t patch = z_x64_emit_call32_placeholder(code);
+  return z_elf_record_math_patch(ctx, z_elf_math_symbol_for_value(value->kind), patch, diag, value);
+}
+
+// Two-arg libm call (powf): arg0 in xmm0, arg1 in xmm1. Evaluate arg0 into xmm0 and spill it across
+// arg1's evaluation (which itself may call libm), then place arg1 in xmm1 and reload arg0 into xmm0.
+static bool elf_emit_math_powf_value(ZBuf *code, const IrFunction *fun, const IrValue *value, ElfEmitContext *ctx, ZDiag *diag) {
+  if (!value->left || !value->right) return elf_diag(diag, "direct ELF64 powf requires two arguments", value->line, value->column, "missing argument");
+  if (!elf_emit_value(code, fun, value->left, ctx, diag)) return false;
+  z_x64_emit_xmm_push(code, 0);
+  if (!elf_emit_value(code, fun, value->right, ctx, diag)) return false;
+  z_x64_emit_movaps(code, 1, 0);
+  z_x64_emit_xmm_pop(code, 0);
+  size_t patch = z_x64_emit_call32_placeholder(code);
+  return z_elf_record_math_patch(ctx, Z_ELF_MATH_POWF, patch, diag, value);
+}
+
+// isNaNf is inline (no libm symbol): NaN is the only value where x != x. UCOMIS sets PF=1 on an
+// unordered compare, so SETP yields 1 exactly for NaN. Result goes to eax as a Bool.
+static bool elf_emit_math_isnanf_value(ZBuf *code, const IrFunction *fun, const IrValue *value, ElfEmitContext *ctx, ZDiag *diag) {
+  if (!value->left) return elf_diag(diag, "direct ELF64 isNaNf requires an argument", value->line, value->column, "missing argument");
+  if (!elf_emit_value(code, fun, value->left, ctx, diag)) return false;
+  z_x64_emit_ucomis(code, 0, 0, elf_type_is_f64(value->left->type));
+  z_x64_emit_setcc_al_to_bool(code, 0x9a); // SETP
+  return true;
+}
+
 static bool elf_emit_core_value(ZBuf *code, const IrFunction *fun, const IrValue *value, ElfEmitContext *ctx, ZDiag *diag) {
   switch (value->kind) {
+    case IR_VALUE_FLOAT: {
+      // Materialize the IEEE bit pattern in a GPR, then MOVD/MOVQ it into xmm0.
+      bool is64 = elf_type_is_f64(value->type);
+      if (is64) z_x64_emit_mov_rax_u64(code, (uint64_t)value->int_value);
+      else z_x64_emit_mov_eax_u32(code, (uint32_t)value->int_value);
+      z_x64_emit_movd_xmm_from_gpr(code, 0, 0, is64);
+      return true;
+    }
     case IR_VALUE_BOOL:
     case IR_VALUE_INT:
       if (elf_type_is_i64(value->type)) z_x64_emit_mov_rax_u64(code, (uint64_t)value->int_value);
@@ -879,13 +1293,42 @@ static bool elf_emit_core_value(ZBuf *code, const IrFunction *fun, const IrValue
     case IR_VALUE_LOCAL:
       if (value->local_index >= fun->local_len) return elf_diag(diag, "direct ELF64 local index is out of range", value->line, value->column, "invalid local");
       if (fun->locals[value->local_index].is_array) return elf_diag(diag, "direct ELF64 cannot use fixed array locals as scalar values", value->line, value->column, "array local");
-      elf_emit_load_local_rax(code, fun, value->local_index);
+      if (elf_type_is_float(value->type)) elf_emit_load_local_xmm0(code, fun, value->local_index);
+      else elf_emit_load_local_rax(code, fun, value->local_index);
       return true;
-    case IR_VALUE_CAST:
+    case IR_VALUE_CAST: {
+      if (!value->left) return elf_diag(diag, "direct ELF64 cast missing inner expression", value->line, value->column, "missing cast operand");
+      IrTypeKind src = value->left->type;
+      IrTypeKind dst = value->type;
       if (!elf_emit_value(code, fun, value->left, ctx, diag)) return false;
-      elf_emit_cast_normalize_rax(code, value->left ? value->left->type : IR_TYPE_UNSUPPORTED, value->type);
+      bool src_float = elf_type_is_float(src);
+      bool dst_float = elf_type_is_float(dst);
+      if (src_float && dst_float) {
+        if (src != dst) z_x64_emit_cvts2s(code, 0, 0, elf_type_is_f64(src)); // float<->float
+      } else if (!src_float && dst_float) {
+        z_x64_emit_cvtsi2s(code, 0, 0, elf_type_is_f64(dst), elf_type_is_i64(src)); // int->float
+      } else if (src_float && !dst_float) {
+        z_x64_emit_cvtts2si(code, 0, 0, elf_type_is_f64(src), elf_type_is_i64(dst)); // float->int (trunc)
+      } else {
+        elf_emit_cast_normalize_rax(code, src, dst);
+      }
       return true;
+    }
     case IR_VALUE_BINARY: {
+      if (elf_type_is_float(value->type)) {
+        bool is64 = elf_type_is_f64(value->type);
+        if (!elf_emit_value(code, fun, value->left, ctx, diag)) return false;
+        z_x64_emit_xmm_push(code, 0);
+        if (!elf_emit_value(code, fun, value->right, ctx, diag)) return false;
+        z_x64_emit_movaps(code, 1, 0);
+        z_x64_emit_xmm_pop(code, 0);
+        if (value->binary_op == IR_BIN_ADD) z_x64_emit_sse_add(code, 0, 1, is64);
+        else if (value->binary_op == IR_BIN_SUB) z_x64_emit_sse_sub(code, 0, 1, is64);
+        else if (value->binary_op == IR_BIN_MUL) z_x64_emit_sse_mul(code, 0, 1, is64);
+        else if (value->binary_op == IR_BIN_DIV) z_x64_emit_sse_div(code, 0, 1, is64);
+        else return elf_diag(diag, "direct ELF64 float binary operator is unsupported", value->line, value->column, "unsupported operator");
+        return true;
+      }
       bool wide = elf_type_is_i64(value->type);
       if (!elf_emit_value(code, fun, value->left, ctx, diag)) return false;
       z_x64_emit_push_rax(code);
@@ -912,7 +1355,17 @@ static bool elf_emit_core_value(ZBuf *code, const IrFunction *fun, const IrValue
       return true;
     }
     case IR_VALUE_COMPARE: {
-      if (!value->left || !value->right || !elf_type_is_supported_scalar(value->left->type) || value->left->type != value->right->type) return elf_diag(diag, "direct ELF64 comparison operands must have the same supported integer type", value->line, value->column, "unsupported comparison");
+      if (!value->left || !value->right || (!elf_type_is_supported_scalar(value->left->type) && !elf_type_is_float(value->left->type)) || value->left->type != value->right->type) return elf_diag(diag, "direct ELF64 comparison operands must have the same supported numeric type", value->line, value->column, "unsupported comparison");
+      if (elf_type_is_float(value->left->type)) {
+        bool is64 = elf_type_is_f64(value->left->type);
+        if (!elf_emit_value(code, fun, value->left, ctx, diag)) return false;
+        z_x64_emit_xmm_push(code, 0);
+        if (!elf_emit_value(code, fun, value->right, ctx, diag)) return false;
+        z_x64_emit_movaps(code, 1, 0);
+        z_x64_emit_xmm_pop(code, 0);
+        elf_emit_xmm_compare_to_bool(code, value->compare_op, is64);
+        return true;
+      }
       bool wide = elf_type_is_i64(value->left->type);
       if (!elf_emit_value(code, fun, value->left, ctx, diag)) return false;
       z_x64_emit_push_rax(code);
@@ -922,30 +1375,7 @@ static bool elf_emit_core_value(ZBuf *code, const IrFunction *fun, const IrValue
       z_x64_emit_cmp_rax_rcx_to_bool(code, elf_setcc_opcode(value->compare_op, elf_type_is_unsigned(value->left->type)), wide);
       return true;
     }
-    case IR_VALUE_CALL: {
-      const IrFunction *callee = ctx && ctx->ir && value->callee_index < ctx->ir->function_len ? &ctx->ir->functions[value->callee_index] : NULL;
-      if (!callee) return elf_diag(diag, "direct ELF64 call target is unavailable", value->line, value->column, "invalid callee");
-      size_t abi_slots = 0;
-      for (size_t i = 0; i < value->arg_len; i++) {
-        if (i >= callee->param_count) return elf_diag(diag, "direct ELF64 call parameter metadata is unavailable", value->line, value->column, "invalid callee parameter");
-        const IrLocal *param = &callee->locals[i];
-        unsigned slots = param->type == IR_TYPE_BYTE_VIEW ? 2 : 1;
-        if (abi_slots + slots > 6) return elf_diag(diag, "direct ELF64 call supports at most six ABI argument slots", value->line, value->column, "too many arguments");
-        if (param->type == IR_TYPE_BYTE_VIEW) {
-          if (!elf_emit_byte_view_ptr(code, fun, value->args[i], ctx, diag)) return false;
-          elf_emit_push_rax(code);
-          if (!elf_emit_byte_view_len(code, fun, value->args[i], ctx, diag)) return false;
-          elf_emit_push_rax(code);
-        } else {
-          if (!elf_emit_value(code, fun, value->args[i], ctx, diag)) return false;
-          elf_emit_push_rax(code);
-        }
-        abi_slots += slots;
-      }
-      for (size_t i = abi_slots; i > 0; i--) z_x64_emit_pop_reg64(code, elf_param_regs[i - 1]);
-      size_t patch = z_x64_emit_call32_placeholder(code);
-      return z_elf_record_call_patch(ctx, patch, value->callee_index, diag, value);
-    }
+    case IR_VALUE_CALL: return elf_emit_call_value(code, fun, value, ctx, diag);
     default: return elf_diag(diag, "direct ELF64 core value kind is invalid for this helper", value->line, value->column, "invalid core value");
   }
 }
@@ -1040,7 +1470,7 @@ static bool elf_emit_stateful_value(ZBuf *code, const IrFunction *fun, const IrV
       return true;
     }
     case IR_VALUE_CHECK: {
-      if (!value->left || value->left->type != IR_TYPE_I64) return elf_diag(diag, "direct ELF64 check requires a packed fallible call result", value->line, value->column, "non-fallible value");
+      if (!value->left || (value->left->type != IR_TYPE_I64 && !elf_type_is_float(value->left->type))) return elf_diag(diag, "direct ELF64 check requires a fallible call result", value->line, value->column, "non-fallible value");
       if (!elf_emit_value(code, fun, value->left, ctx, diag)) return false;
       elf_emit_error_condition_from_rax(code);
       size_t ok_patch = z_x64_emit_jcc32_placeholder(code, 0x84);
@@ -1051,14 +1481,16 @@ static bool elf_emit_stateful_value(ZBuf *code, const IrFunction *fun, const IrV
         elf_emit_epilogue(code, fun, ctx);
       }
       z_x64_patch_rel32(code, ok_patch, code->len);
-      if (!elf_type_is_i64(value->type)) {
+      // OK path: an int payload shares rax's low 32 bits with the tag, so drop the tag with a
+      // 32-bit self-move. A float payload already sits untouched in xmm0 — leave rax alone.
+      if (!elf_type_is_i64(value->type) && !elf_type_is_float(value->type)) {
         z_x64_emit_mov_reg_from_reg(code, 0, 0, false);
       }
       return true;
     }
     case IR_VALUE_RESCUE: {
-      if (!value->left || !value->right || value->left->type != IR_TYPE_I64) {
-        return elf_diag(diag, "direct ELF64 rescue requires a packed fallible call and fallback", value->line, value->column, "unsupported rescue");
+      if (!value->left || !value->right || (value->left->type != IR_TYPE_I64 && !elf_type_is_float(value->left->type))) {
+        return elf_diag(diag, "direct ELF64 rescue requires a fallible call and fallback", value->line, value->column, "unsupported rescue");
       }
       if (!elf_emit_value(code, fun, value->left, ctx, diag)) return false;
       elf_emit_error_condition_from_rax(code);
@@ -1066,7 +1498,8 @@ static bool elf_emit_stateful_value(ZBuf *code, const IrFunction *fun, const IrV
       if (!elf_emit_value(code, fun, value->right, ctx, diag)) return false;
       size_t end_patch = z_x64_emit_jmp32_placeholder(code, 0xe9);
       z_x64_patch_rel32(code, success_patch, code->len);
-      if (!elf_type_is_i64(value->type)) {
+      // Success: drop the tag from an int payload's rax; a float payload is already in xmm0.
+      if (!elf_type_is_i64(value->type) && !elf_type_is_float(value->type)) {
         z_x64_emit_mov_reg_from_reg(code, 0, 0, false);
       }
       z_x64_patch_rel32(code, end_patch, code->len);
@@ -1082,8 +1515,15 @@ static bool elf_emit_memory_access_value(ZBuf *code, const IrFunction *fun, cons
       if (value->array_index >= fun->local_len) return elf_diag(diag, "direct ELF64 indexed load array is out of range", value->line, value->column, "invalid array local");
       const IrLocal *local = &fun->locals[value->array_index];
       if (!elf_emit_bounds_checked_address(code, fun, local, value->index, ctx, diag)) return false;
+      // The element address is in rax. Load by element width: u8/Bool zero-extend (movzbl), i8
+      // sign-extend (movsbl), 8-byte via 64-bit mov, float via movss/movsd into xmm0 (the value's
+      // type is f32/f64 so callers read xmm0), else 32-bit mov.
       if (local->element_type == IR_TYPE_BOOL || local->element_type == IR_TYPE_U8) {
         z_x64_emit_movzx_reg32_ptr_reg_u8(code, 0, 0);
+      } else if (local->element_type == IR_TYPE_I8) {
+        z_x64_emit_movsx_reg32_ptr_reg_i8(code, 0, 0);
+      } else if (elf_type_is_float(local->element_type)) {
+        z_x64_emit_movs_xmm_ptr_reg(code, 0, 0, elf_type_is_f64(local->element_type), true);
       } else if (elf_type_is_i64(local->element_type)) {
         z_x64_emit_load_reg_ptr_reg(code, 0, 0, true);
       } else {
@@ -1095,7 +1535,8 @@ static bool elf_emit_memory_access_value(ZBuf *code, const IrFunction *fun, cons
       if (value->local_index >= fun->local_len) return elf_diag(diag, "direct ELF64 field load record is out of range", value->line, value->column, "invalid record local");
       const IrLocal *local = &fun->locals[value->local_index];
       if (!local->is_record) return elf_diag(diag, "direct ELF64 field load requires record local", value->line, value->column, "non-record local");
-      elf_emit_load_field_rax(code, local, value->field_offset, value->type);
+      if (elf_type_is_float(value->type)) elf_emit_load_field_xmm0(code, local, value->field_offset, value->type);
+      else elf_emit_load_field_rax(code, local, value->field_offset, value->type);
       return true;
     }
     case IR_VALUE_BYTE_VIEW_LEN: {
@@ -1205,9 +1646,9 @@ static bool elf_emit_byte_index_value(ZBuf *code, const IrFunction *fun, const I
       if (!value->index || !elf_emit_value(code, fun, value->index, ctx, diag)) return false;
       z_x64_emit_push_rax(code);
       if (!elf_emit_byte_view_len(code, fun, value->left, ctx, diag)) return false;
-      z_x64_emit_mov_rcx_from_rax(code, false);
+      z_x64_emit_mov_rcx_from_rax(code, true);
       z_x64_emit_pop_rax(code);
-      z_x64_emit_cmp_rax_rcx(code, false);
+      z_x64_emit_cmp_rax_rcx(code, true);
       size_t ok_patch = z_x64_emit_jcc32_placeholder(code, 0x82);
       z_x64_emit_ud2(code);
       z_x64_patch_rel32(code, ok_patch, code->len);
@@ -1222,15 +1663,53 @@ static bool elf_emit_byte_index_value(ZBuf *code, const IrFunction *fun, const I
   }
 }
 
+static bool elf_emit_byte_le_read_value(ZBuf *code, const IrFunction *fun, const IrValue *value, ElfEmitContext *ctx, ZDiag *diag) {
+  // std.codec.readU16Le / readI32Le / readU32Le / readI64Le / readU64Le / readF32Le / readF64Le:
+  // read a 2/4/8-byte little-endian scalar at a byte offset. x86-64 is little-endian and tolerates
+  // unaligned loads, so a load at ptr+offset already yields the value; same-width signed/unsigned
+  // share the raw load. Bounds-check that offset+size fits the span length first: with the 64-bit
+  // add and unsigned compare, offset+(size-1) < len is equivalent to offset+size <= len and rejects
+  // offset overflow.
+  bool is_float = value->kind == IR_VALUE_BYTE_VIEW_READ_FLOAT_LE;
+  bool is_f64 = is_float && elf_type_is_f64(value->type);
+  if (!value->left) return elf_diag(diag, is_float ? "direct ELF64 readF*Le requires a byte view" : "direct ELF64 read*Le requires a byte view", value->line, value->column, "missing byte view");
+  if (!value->index) return elf_diag(diag, is_float ? "direct ELF64 readF*Le requires an offset" : "direct ELF64 read*Le requires an offset", value->line, value->column, "missing offset");
+  unsigned scalar_size = is_float ? (is_f64 ? 8u : 4u) : elf_type_byte_size(value->type);
+  if (!elf_emit_value(code, fun, value->index, ctx, diag)) return false; // rax = offset
+  z_x64_emit_push_rax(code); // preserve true offset across the length evaluation
+  if (!elf_emit_byte_view_len(code, fun, value->left, ctx, diag)) return false; // rax = len
+  z_x64_emit_mov_rcx_from_rax(code, true); // rcx = len
+  z_x64_emit_pop_rax(code); // rax = offset
+  z_x64_emit_push_rax(code); // re-save the true offset for the address computation
+  z_x64_emit_add_rax_u32(code, scalar_size - 1u, true); // rax = offset + (size - 1)
+  z_x64_emit_cmp_rax_rcx(code, true);
+  size_t ok_patch = z_x64_emit_jcc32_placeholder(code, 0x82); // JB: offset+(size-1) < len
+  z_x64_emit_ud2(code);
+  z_x64_patch_rel32(code, ok_patch, code->len);
+  if (!elf_emit_byte_view_ptr(code, fun, value->left, ctx, diag)) return false; // rax = ptr
+  z_x64_emit_pop_reg64(code, 1); // rcx = offset
+  z_x64_emit_add_rax_rcx(code, true); // rax = ptr + offset
+  if (is_float) z_x64_emit_movs_xmm_ptr_reg(code, 0, 0, is_f64, true); // movss/movsd xmm0, [rax]
+  else if (scalar_size == 8) z_x64_emit_load_reg_ptr_reg(code, 0, 0, true); // mov rax, [rax]
+  else if (scalar_size == 2) z_x64_emit_movzx_reg32_ptr_reg_disp_u16(code, 0, 0, 0); // movzx eax, word [rax]
+  else z_x64_emit_load_reg_ptr_reg(code, 0, 0, false); // mov eax, [rax]
+  return true;
+}
+
 static bool elf_emit_value(ZBuf *code, const IrFunction *fun, const IrValue *value, ElfEmitContext *ctx, ZDiag *diag) {
   if (!value) return elf_diag(diag, "direct ELF64 expression is missing", 1, 1, "missing expression");
-  if (!elf_type_is_supported_scalar(value->type) && !((value->kind == IR_VALUE_CALL || value->kind == IR_VALUE_CHECK) && value->type == IR_TYPE_VOID) &&
+  // A span-returning call yields a fat pointer (rax=ptr, rdx=len); allow it here so LOCAL_SET /
+  // FIELD_STORE / RETURN can consume the pair directly.
+  bool span_call = value->kind == IR_VALUE_CALL && value->type == IR_TYPE_BYTE_VIEW;
+  if (!elf_type_is_supported_scalar(value->type) && !elf_type_is_float(value->type) && !((value->kind == IR_VALUE_CALL || value->kind == IR_VALUE_CHECK) && value->type == IR_TYPE_VOID) &&
       value->kind != IR_VALUE_MAYBE_HAS && value->kind != IR_VALUE_VEC_LEN && value->kind != IR_VALUE_VEC_CAPACITY &&
       value->kind != IR_VALUE_VEC_PUSH && value->kind != IR_VALUE_ARGS_LEN &&
-      value->type != IR_TYPE_MAYBE_SCALAR && value->kind != IR_VALUE_FS_CLOSE_FILE) {
-    return elf_diag(diag, "direct ELF64 object backend currently supports only primitive integer values", value->line, value->column, elf_type_name(value->type));
+      value->type != IR_TYPE_MAYBE_SCALAR && value->kind != IR_VALUE_FS_CLOSE_FILE && value->kind != IR_VALUE_FS_MUNMAP &&
+      !span_call) {
+    return elf_diag(diag, "direct ELF64 object backend currently supports only primitive numeric values", value->line, value->column, elf_type_name(value->type));
   }
   switch (value->kind) {
+    case IR_VALUE_FLOAT:
     case IR_VALUE_BOOL: case IR_VALUE_INT: case IR_VALUE_LOCAL: case IR_VALUE_CAST: case IR_VALUE_BINARY: case IR_VALUE_COMPARE: case IR_VALUE_CALL:
       return elf_emit_core_value(code, fun, value, ctx, diag);
     case IR_VALUE_JSON_PARSE_BYTES: case IR_VALUE_JSON_VALIDATE_BYTES: case IR_VALUE_JSON_STREAM_TOKENS_BYTES:
@@ -1244,6 +1723,7 @@ static bool elf_emit_value(ZBuf *code, const IrFunction *fun, const IrValue *val
       return elf_emit_host_value(code, fun, value, ctx, diag);
     case IR_VALUE_FS_HOST: case IR_VALUE_FS_OPEN: case IR_VALUE_FS_CREATE: case IR_VALUE_FS_CLOSE_FILE: case IR_VALUE_FS_EXISTS:
     case IR_VALUE_FS_IS_DIR: case IR_VALUE_FS_REMOVE: case IR_VALUE_FS_REMOVE_DIR: case IR_VALUE_FS_MAKE_DIR: case IR_VALUE_FS_RENAME:
+    case IR_VALUE_FS_MUNMAP:
       return elf_emit_fs_basic_value(code, fun, value, ctx, diag);
     case IR_VALUE_FS_DIR_ENTRY_COUNT:
       return elf_emit_fs_dir_entry_count_value(code, fun, value, ctx, diag);
@@ -1262,17 +1742,39 @@ static bool elf_emit_value(ZBuf *code, const IrFunction *fun, const IrValue *val
       return elf_emit_byte_bulk_value(code, fun, value, ctx, diag);
     case IR_VALUE_BYTE_VIEW_INDEX_LOAD:
       return elf_emit_byte_index_value(code, fun, value, ctx, diag);
+    case IR_VALUE_BYTE_VIEW_READ_INT_LE: case IR_VALUE_BYTE_VIEW_READ_FLOAT_LE:
+      return elf_emit_byte_le_read_value(code, fun, value, ctx, diag);
+    case IR_VALUE_MATH_SQRTF: case IR_VALUE_MATH_EXPF: case IR_VALUE_MATH_COSF: case IR_VALUE_MATH_SINF:
+    case IR_VALUE_MATH_FABSF: case IR_VALUE_MATH_FLOORF:
+      return elf_emit_math_unary_value(code, fun, value, ctx, diag);
+    case IR_VALUE_MATH_POWF: return elf_emit_math_powf_value(code, fun, value, ctx, diag);
+    case IR_VALUE_MATH_ISNANF: return elf_emit_math_isnanf_value(code, fun, value, ctx, diag);
     default:
       return elf_diag(diag, "direct ELF64 value kind is unsupported", value->line, value->column, "unsupported value");
   }
 }
 
 static bool elf_validate_function(const IrFunction *fun, ZDiag *diag) {
-  size_t abi_slots = 0;
-  for (size_t i = 0; i < fun->param_count; i++) abi_slots += fun->locals[i].type == IR_TYPE_BYTE_VIEW ? 2 : 1;
-  if (abi_slots > 6) return elf_diag(diag, "direct ELF64 object backend supports at most six ABI argument slots", fun->line, fun->column, fun->name);
-  if (fun->return_type != IR_TYPE_VOID && !elf_type_is_supported_scalar(fun->return_type)) {
-    return elf_diag(diag, "direct ELF64 object backend currently supports only Void and primitive integer returns", fun->line, fun->column, elf_type_name(fun->return_type));
+  // System V x64 splits int and float into separate register pools: floats go into XMM0-7, not GPRs.
+  size_t int_slots = 0;
+  for (size_t i = 0; i < fun->param_count; i++) {
+    IrTypeKind t = fun->locals[i].type;
+    if (t == IR_TYPE_BYTE_VIEW) int_slots += 2;
+    else if (t == IR_TYPE_F32 || t == IR_TYPE_F64) { /* XMM, no int slot */ }
+    else int_slots += 1;
+  }
+  if (int_slots > 6) return elf_diag(diag, "direct ELF64 object backend supports at most six ABI argument slots", fun->line, fun->column, fun->name);
+  // Returns: Void, primitive integer, float, a record (via rdi sret pointer), or a span (ptr in rax,
+  // len in rdx). A raising function CAN return a record — the record flows via sret as
+  // usual (rdi → rax), and the error tag rides in the low 32 bits of rdx (the second-return
+  // register, free for record returns since rax already carries the sret pointer back per SysV).
+  // A span-returning raising function is still rejected since rdx IS the span len carrier.
+  if (fun->return_type != IR_TYPE_VOID && fun->return_type != IR_TYPE_RECORD && fun->return_type != IR_TYPE_BYTE_VIEW &&
+      !elf_type_is_supported_scalar(fun->return_type) && !elf_type_is_float(fun->return_type)) {
+    return elf_diag(diag, "direct ELF64 object backend currently supports only Void, primitive numeric, record, and span returns", fun->line, fun->column, elf_type_name(fun->return_type));
+  }
+  if (fun->raises && fun->return_type == IR_TYPE_BYTE_VIEW) {
+    return elf_diag(diag, "direct ELF64 object backend cannot return a span from a raising function", fun->line, fun->column, fun->name);
   }
   for (size_t i = 0; i < fun->local_len; i++) {
     if (fun->locals[i].is_array) {
@@ -1287,8 +1789,8 @@ static bool elf_validate_function(const IrFunction *fun, ZDiag *diag) {
     }
     if (fun->locals[i].type == IR_TYPE_ALLOC || fun->locals[i].type == IR_TYPE_VEC ||
         fun->locals[i].type == IR_TYPE_MAYBE_BYTE_VIEW || fun->locals[i].type == IR_TYPE_MAYBE_SCALAR) continue;
-    if (!elf_type_is_supported_scalar(fun->locals[i].type)) {
-      return elf_diag(diag, "direct ELF64 object backend currently supports only primitive integer locals", fun->locals[i].line, fun->locals[i].column, elf_type_name(fun->locals[i].type));
+    if (!elf_type_is_supported_scalar(fun->locals[i].type) && !elf_type_is_float(fun->locals[i].type)) {
+      return elf_diag(diag, "direct ELF64 object backend currently supports only primitive numeric locals", fun->locals[i].line, fun->locals[i].column, elf_type_name(fun->locals[i].type));
     }
   }
   return true;
@@ -1340,7 +1842,7 @@ static bool elf_emit_args_get_to_local(ZBuf *text, const IrFunction *fun, const 
   elf_emit_store_local_slot_reg(text, local, 0, 0, false);
   z_x64_emit_pop_rax(text);
   elf_emit_store_local_slot_rax(text, local, 8);
-  elf_emit_store_local_slot_reg(text, local, 16, 1, false);
+  elf_emit_store_local_slot_reg(text, local, 16, 1, true);
   z_x64_patch_rel32(text, end, text->len);
   return true;
 }
@@ -1388,7 +1890,7 @@ static bool elf_emit_env_get_to_local(ZBuf *text, const IrFunction *fun, const I
   elf_emit_store_local_slot_reg(text, local, 0, 0, false);
   z_x64_emit_pop_rax(text);
   elf_emit_store_local_slot_rax(text, local, 8);
-  elf_emit_store_local_slot_reg(text, local, 16, 1, false);
+  elf_emit_store_local_slot_reg(text, local, 16, 1, true);
   size_t end = z_x64_emit_jmp32_placeholder(text, 0xe9);
 
   z_x64_patch_rel32(text, next, text->len);
@@ -1398,6 +1900,93 @@ static bool elf_emit_env_get_to_local(ZBuf *text, const IrFunction *fun, const I
   z_x64_patch_rel32(text, loop_back, env_loop);
 
   z_x64_patch_rel32(text, none, text->len);
+  elf_emit_maybe_clear(text, local);
+  z_x64_patch_rel32(text, end, text->len);
+  return true;
+}
+
+// Emits openat(AT_FDCWD, path, O_RDONLY) -> lseek(SEEK_END) -> mmap(PROT_READ, MAP_PRIVATE, fd) ->
+// close(fd), all via raw Linux x86_64 syscalls (no libc). On exit: rax = mapping address on success,
+// or a negative errno/-1 on any failure path; rdx = file size (valid only on success). The machine
+// stack is balanced on every path, and the file descriptor is always closed (the mapping survives
+// the close). Linux syscall ABI: num in eax, args rdi/rsi/rdx/r10/r8/r9. openat=257, lseek=8,
+// mmap=9, close=3.
+static bool elf_emit_mmap_file_addr_size(ZBuf *text, const IrFunction *fun, const IrValue *path, ElfEmitContext *ctx, ZDiag *diag) {
+  if (!elf_emit_openat_path(text, fun, path, 0, 0, ctx, diag)) return false; // O_RDONLY -> rax = fd
+  z_x64_emit_test_rax_rax(text, true);
+  size_t open_fail = elf_emit_js_placeholder(text); // negative fd: open failure (rax already negative)
+  z_x64_emit_push_rax(text);                         // [rsp+0] = fd
+  z_x64_emit_mov_rdi_from_rax(text);
+  z_x64_emit_xor_reg_reg(text, 6, true);             // rsi = 0 (offset)
+  z_x64_emit_mov_reg_u32(text, 2, 2);                // rdx = SEEK_END
+  z_x64_emit_mov_eax_u32(text, 8);                   // lseek
+  z_x64_emit_syscall(text);                          // rax = file size
+  z_x64_emit_test_rax_rax(text, true);
+  size_t seek_fail = elf_emit_js_placeholder(text);
+  z_x64_emit_push_rax(text);                         // [rsp+0] = size, [rsp+8] = fd
+  z_x64_emit_mov_rsi_from_rax(text);                 // rsi = len = size
+  z_x64_emit_xor_reg_reg(text, 7, true);             // rdi = NULL (kernel chooses addr)
+  z_x64_emit_mov_reg_u32(text, 2, 1);                // rdx = PROT_READ
+  z_x64_emit_mov_reg_u32(text, 10, 2);               // r10 = MAP_PRIVATE
+  z_x64_emit_load_rsp_offset_reg(text, 8, 8, true);  // r8 = fd
+  z_x64_emit_xor_reg_reg(text, 9, true);             // r9 = 0 (offset)
+  z_x64_emit_mov_eax_u32(text, 9);                   // mmap
+  z_x64_emit_syscall(text);                          // rax = addr (negative/-1 on MAP_FAILED)
+  z_x64_emit_load_rsp_offset_reg(text, 7, 8, true);  // rdi = fd
+  z_x64_emit_push_rax(text);                         // [rsp+0]=addr, [rsp+8]=size, [rsp+16]=fd
+  z_x64_emit_mov_eax_u32(text, 3);                   // close
+  z_x64_emit_syscall(text);
+  z_x64_emit_pop_rax(text);                          // rax = addr; [rsp+0]=size, [rsp+8]=fd
+  z_x64_emit_pop_reg64(text, 2);                     // rdx = size; [rsp+0]=fd
+  z_x64_emit_add_rsp(text, 8);                       // drop fd
+  size_t done = z_x64_emit_jmp32_placeholder(text, 0xe9);
+  // Seek failure: stack holds [rsp+0]=fd, rax = negative lseek result. Close the fd, preserving the
+  // negative result across the close, then return it in rax.
+  z_x64_patch_rel32(text, seek_fail, text->len);
+  z_x64_emit_load_rsp_offset_reg(text, 7, 0, true);  // rdi = fd
+  z_x64_emit_push_rax(text);                         // preserve negative result; [rsp+0]=result,[rsp+8]=fd
+  z_x64_emit_mov_eax_u32(text, 3);                   // close
+  z_x64_emit_syscall(text);
+  z_x64_emit_pop_rax(text);                          // rax = negative result; [rsp+0]=fd
+  z_x64_emit_add_rsp(text, 8);                       // drop fd
+  size_t seek_done = z_x64_emit_jmp32_placeholder(text, 0xe9);
+  // open_fail lands here with rax already holding the negative open result (stack already balanced).
+  z_x64_patch_rel32(text, open_fail, text->len);
+  z_x64_patch_rel32(text, done, text->len);
+  z_x64_patch_rel32(text, seek_done, text->len);
+  return true;
+}
+
+// Anonymous std.mem.pageAlloc allocation: a fresh kernel-zeroed region via a raw mmap syscall
+// (calloc semantics, the Linux analog of MAP_ANON). The size value is evaluated then spilled so it
+// survives nothing here (no call), the syscall args are set up, and the result populates the
+// Maybe<MutSpan<u8>> dest local: on success has=1@0, ptr@8, len@16 (64-bit byte count); on failure
+// (MAP_FAILED, a negative return) the Maybe is cleared. Linux map flags: MAP_ANON|MAP_PRIVATE=0x22
+// (Linux MAP_ANON=0x20, not Darwin's 0x1000); PROT_READ|PROT_WRITE=3; fd=-1; offset=0.
+static bool elf_emit_anon_mmap_to_local(ZBuf *text, const IrFunction *fun, const IrValue *size, const IrLocal *local, ElfEmitContext *ctx, ZDiag *diag) {
+  if (!size) return elf_diag(diag, "direct ELF64 page allocation requires a byte length", local ? local->line : 1, local ? local->column : 1, "missing length");
+  if (!elf_emit_value(text, fun, size, ctx, diag)) return false; // rax = len
+  z_x64_emit_push_rax(text);                         // [rsp+0] = len (survives the syscall)
+  z_x64_emit_mov_rsi_from_rax(text);                 // rsi = len
+  z_x64_emit_xor_reg_reg(text, 7, true);             // rdi = NULL
+  z_x64_emit_mov_reg_u32(text, 2, 3);                // rdx = PROT_READ|PROT_WRITE
+  z_x64_emit_mov_reg_u32(text, 10, 0x22);            // r10 = MAP_ANON|MAP_PRIVATE (Linux)
+  z_x64_emit_mov_reg_u64(text, 8, 0xffffffffffffffffULL); // r8 = fd = -1
+  z_x64_emit_xor_reg_reg(text, 9, true);             // r9 = 0 (offset)
+  z_x64_emit_mov_eax_u32(text, 9);                   // mmap
+  z_x64_emit_syscall(text);                          // rax = addr (negative/-1 on MAP_FAILED)
+  z_x64_emit_test_rax_rax(text, true);
+  size_t fail = elf_emit_js_placeholder(text);       // negative -> failure
+  z_x64_emit_push_rax(text);                         // [rsp+0]=addr, [rsp+8]=len
+  z_x64_emit_mov_eax_u32(text, 1);
+  elf_emit_store_local_slot_reg(text, local, 0, 0, false); // has = 1
+  z_x64_emit_pop_rax(text);                          // rax = addr; [rsp+0]=len
+  elf_emit_store_local_slot_rax(text, local, 8);     // ptr
+  z_x64_emit_pop_rax(text);                          // rax = len
+  elf_emit_store_local_slot_reg(text, local, 16, 0, true); // len (64-bit byte count)
+  size_t end = z_x64_emit_jmp32_placeholder(text, 0xe9);
+  z_x64_patch_rel32(text, fail, text->len);
+  z_x64_emit_add_rsp(text, 8);                        // drop the pushed len before clearing the Maybe
   elf_emit_maybe_clear(text, local);
   z_x64_patch_rel32(text, end, text->len);
   return true;
@@ -1505,6 +2094,13 @@ static bool elf_emit_read_all_or_raise_to_local(ZBuf *text, const IrFunction *fu
 
 static bool elf_emit_byte_view_local_set(ZBuf *text, const IrFunction *fun, const IrInstr *instr, const IrLocal *local, ElfEmitContext *ctx, ZDiag *diag) {
   if (instr->value && instr->value->kind == IR_VALUE_CHECK && instr->value->left && instr->value->left->kind == IR_VALUE_FS_READ_ALL) return elf_emit_read_all_or_raise_to_local(text, fun, instr, ctx, diag);
+  // A span-returning call leaves ptr in rax and len in rdx (SysV second-return).
+  if (instr->value && instr->value->kind == IR_VALUE_CALL) {
+    if (!elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
+    elf_emit_store_local_slot_rax(text, local, 0);
+    elf_emit_store_local_slot_reg(text, local, 8, 2, true);
+    return true;
+  }
   if (!elf_emit_byte_view_ptr(text, fun, instr->value, ctx, diag)) return false;
   elf_emit_store_local_slot_rax(text, local, 0);
   if (!elf_emit_byte_view_len(text, fun, instr->value, ctx, diag)) return false;
@@ -1513,6 +2109,14 @@ static bool elf_emit_byte_view_local_set(ZBuf *text, const IrFunction *fun, cons
 }
 
 static bool elf_emit_alloc_local_set(ZBuf *text, const IrFunction *fun, const IrInstr *instr, const IrLocal *local, ElfEmitContext *ctx, ZDiag *diag) {
+  if (instr->value && instr->value->kind == IR_VALUE_PAGE_ALLOC) {
+    // A PageAlloc carries no pre-reserved buffer — each std.mem.allocBytes performs a fresh
+    // anonymous mmap (see elf_emit_anon_mmap_to_local). Zero the allocator slot so it holds no
+    // stale pointer/length; mirrors the Mach-O host page-alloc init.
+    z_x64_emit_xor_eax_eax(text);
+    elf_emit_store_local_slot_reg(text, local, 0, 0, true);
+    return true;
+  }
   if (!instr->value || instr->value->kind != IR_VALUE_FIXED_BUF_ALLOC) return elf_diag(diag, "direct ELF64 FixedBufAlloc local requires std.mem.fixedBufAlloc", instr->line, instr->column, "unsupported allocator initializer");
   if (!elf_emit_byte_view_ptr(text, fun, instr->value->left, ctx, diag)) return false;
   elf_emit_store_local_slot_rax(text, local, 0);
@@ -1563,7 +2167,7 @@ static bool elf_emit_temp_name_to_local(ZBuf *text, const IrFunction *fun, const
   z_x64_emit_pop_rax(text);
   elf_emit_store_local_slot_rax(text, local, 8);
   z_x64_emit_mov_eax_u32(text, total_len);
-  elf_emit_store_local_slot_reg(text, local, 16, 0, false);
+  elf_emit_store_local_slot_reg(text, local, 16, 0, true);
   return true;
 }
 
@@ -1593,7 +2197,7 @@ static bool elf_emit_fs_read_all_to_local(ZBuf *text, const IrFunction *fun, con
   elf_emit_load_local_slot_reg(text, alloc, 0, 0, true);
   elf_emit_store_local_slot_reg(text, local, 8, 0, true);
   z_x64_emit_pop_rax(text);
-  elf_emit_store_local_slot_reg(text, local, 16, 0, false);
+  elf_emit_store_local_slot_reg(text, local, 16, 0, true);
   elf_emit_store_local_slot_reg(text, alloc, 12, 0, false);
   size_t end = z_x64_emit_jmp32_placeholder(text, 0xe9);
   z_x64_patch_rel32(text, open_fail, text->len);
@@ -1603,10 +2207,34 @@ static bool elf_emit_fs_read_all_to_local(ZBuf *text, const IrFunction *fun, con
   return true;
 }
 
+// `let m = std.fs.mmap(fs, path)` -> Maybe<owned<Mapping>> (has@0, ptr@8, len@16 byte count). The
+// helper lands addr in rax and the 64-bit byte length in rdx; a negative addr is the not-found
+// /failure path, which clears the Maybe. The length is stored 64-bit so mappings >4 GiB (e.g. the
+// 110M llama2 weights) round-trip without truncation.
+static bool elf_emit_fs_mmap_to_local(ZBuf *text, const IrFunction *fun, const IrInstr *instr, const IrLocal *local, ElfEmitContext *ctx, ZDiag *diag) {
+  if (!elf_emit_mmap_file_addr_size(text, fun, instr->value->left, ctx, diag)) return false;
+  z_x64_emit_test_rax_rax(text, true);
+  size_t fail = elf_emit_js_placeholder(text);       // MAP_FAILED / open failure
+  z_x64_emit_push_rax(text);                          // [rsp+0]=addr (rdx=len survives the has store)
+  z_x64_emit_mov_eax_u32(text, 1);
+  elf_emit_store_local_slot_reg(text, local, 0, 0, false); // has = 1
+  z_x64_emit_pop_rax(text);                           // rax = addr
+  elf_emit_store_local_slot_rax(text, local, 8);     // ptr
+  elf_emit_store_local_slot_reg(text, local, 16, 2, true); // len (64-bit byte count, from rdx)
+  size_t end = z_x64_emit_jmp32_placeholder(text, 0xe9);
+  z_x64_patch_rel32(text, fail, text->len);
+  elf_emit_maybe_clear(text, local);
+  z_x64_patch_rel32(text, end, text->len);
+  return true;
+}
+
 static bool elf_emit_alloc_bytes_to_local(ZBuf *text, const IrFunction *fun, const IrInstr *instr, const IrLocal *local, ElfEmitContext *ctx, ZDiag *diag) {
   const IrValue *value = instr->value;
   if (!value || value->kind != IR_VALUE_ALLOC_BYTES || value->local_index >= fun->local_len || fun->locals[value->local_index].type != IR_TYPE_ALLOC) return elf_diag(diag, "direct ELF64 allocation source is invalid", instr->line, instr->column, "invalid allocation");
   const IrLocal *alloc = &fun->locals[value->local_index];
+  // PageAlloc: each allocation is a fresh kernel-zeroed anonymous mmap (calloc semantics), rather
+  // than a bump out of a pre-reserved buffer.
+  if (alloc->is_page_alloc) return elf_emit_anon_mmap_to_local(text, fun, value->left, local, ctx, diag);
   if (!elf_emit_value(text, fun, value->left, ctx, diag)) return false;
   z_x64_emit_push_rax(text);
   elf_emit_load_local_slot_reg(text, alloc, 12, 1, false);
@@ -1616,7 +2244,7 @@ static bool elf_emit_alloc_bytes_to_local(ZBuf *text, const IrFunction *fun, con
   elf_emit_store_local_slot_reg(text, local, 0, 0, false);
   elf_emit_store_local_slot_reg(text, local, 8, 2, true);
   z_x64_emit_pop_rax(text);
-  elf_emit_store_local_slot_reg(text, local, 16, 0, false);
+  elf_emit_store_local_slot_reg(text, local, 16, 0, true);
   z_x64_emit_add_reg_reg(text, 1, 0, false);
   elf_emit_store_local_slot_reg(text, alloc, 12, 1, false);
   return true;
@@ -1627,6 +2255,7 @@ static bool elf_emit_maybe_byte_view_local_set(ZBuf *text, const IrFunction *fun
   if (instr->value && instr->value->kind == IR_VALUE_ARGS_GET) return elf_emit_args_get_to_local(text, fun, instr->value, local, ctx, diag);
   if (instr->value && instr->value->kind == IR_VALUE_ENV_GET) return elf_emit_env_get_to_local(text, fun, instr->value, local, ctx, diag);
   if (instr->value && instr->value->kind == IR_VALUE_FS_READ_ALL) return elf_emit_fs_read_all_to_local(text, fun, instr, local, ctx, diag);
+  if (instr->value && instr->value->kind == IR_VALUE_FS_MMAP) return elf_emit_fs_mmap_to_local(text, fun, instr, local, ctx, diag);
   return elf_emit_alloc_bytes_to_local(text, fun, instr, local, ctx, diag);
 }
 
@@ -1673,15 +2302,111 @@ static bool elf_emit_maybe_scalar_local_set(ZBuf *text, const IrFunction *fun, c
   return true;
 }
 
+// `let q = check f()` where f returns a record and raises. Issue the record-returning
+// call (writes the record via sret into q's slot AND writes the tag to rdx: 0 on success, error
+// code on failure). Then test edx: on success fall through; on failure propagate. The record
+// buffer is undefined on failure — the caller's CHECK semantics ensure it isn't read.
+//
+// Mirrors the macho64 `macho_emit_local_set_record_check` helper, with rdx in place of x1 and
+// the SysV epilogue propagation paths.
+static bool elf_emit_local_set_record_check(ZBuf *text, const IrFunction *fun, const IrInstr *instr, ElfEmitContext *ctx, ZDiag *diag) {
+  const IrValue *check = instr->value;
+  if (!check->left || check->left->kind != IR_VALUE_CALL || check->left->type != IR_TYPE_RECORD) {
+    return elf_diag(diag, "direct ELF64 record check requires a record-returning fallible call", check->line, check->column, "unsupported record check");
+  }
+  if (!elf_emit_record_call_with_dest(text, fun, (int)fun->locals[instr->local_index].index, check->left, ctx, diag)) return false;
+  // Test the tag in edx (low 32 bits of rdx carry the error code). On zero fall through.
+  z_x64_emit_test_reg_reg(text, 2, false);
+  size_t ok_patch = z_x64_emit_jcc32_placeholder(text, 0x84); // je ok (ZF=1 → tag was 0)
+  if (elf_function_propagates_to_process_exit(fun)) {
+    // Propagation by caller-return shape:
+    //  - We return a record AND raise: rdx already carries the callee's tag; reload rax from the
+    //    sret slot so the caller sees its valid pointer alongside non-zero rdx. The epilogue
+    //    doesn't touch rdx so the tag survives.
+    //  - We are hosted-main (Void return mapped to I32 exit code): main has no sret; route the
+    //    tag from edx into eax (low 32) so the OS reads the error code as the exit code.
+    //  - We are a non-record raising fn: the packed-tag ABI puts the tag in rax's HIGH 32 bits.
+    //    Compose rax = (rdx << 32) so the standard error-condition extract still works.
+    if (fun->return_type == IR_TYPE_RECORD) {
+      z_x64_emit_rbp_disp_reg(text, 0x8b, 0, elf_sret_slot_offset(fun), true);
+    } else if (fun->return_type == IR_TYPE_I32 && fun->value_return_type == IR_TYPE_VOID) {
+      // Hosted main: mov eax, edx (32-bit move, zero-extends rax low 32 already since the high 32
+      // of an exit-code register is ignored by the OS).
+      z_x64_emit_mov_reg_from_reg(text, 0, 2, false);
+    } else {
+      // Other raising fn: pack the tag into the high 32 bits of rax. shl rdx, 32 ; mov rax, rdx.
+      z_x64_emit_shl_reg_imm8(text, 2, 32, true);
+      z_x64_emit_mov_reg_from_reg(text, 0, 2, true);
+    }
+    elf_emit_epilogue(text, fun, ctx);
+  } else {
+    // Non-propagating context shouldn't reach here (CHECK is illegal in a non-fallible context).
+    z_x64_emit_mov_eax_u32(text, 1);
+    elf_emit_epilogue(text, fun, ctx);
+  }
+  z_x64_patch_rel32(text, ok_patch, text->len);
+  return true;
+}
+
+// `let q = f() rescue r0` where f returns a record and raises. Issue the call with q as
+// sret target; on success (edx == 0) the record is already in q. On failure, materialize the
+// fallback record into q — either by record_copy_to (fallback is a record local) or another
+// record-returning call (fallback is itself a call). Mirrors the macho64 sibling helper.
+static bool elf_emit_local_set_record_rescue(ZBuf *text, const IrFunction *fun, const IrInstr *instr, ElfEmitContext *ctx, ZDiag *diag) {
+  const IrValue *rescue = instr->value;
+  const IrLocal *dest = &fun->locals[instr->local_index];
+  if (!rescue->left || rescue->left->kind != IR_VALUE_CALL || rescue->left->type != IR_TYPE_RECORD) {
+    return elf_diag(diag, "direct ELF64 record rescue requires a record-returning fallible call", rescue->line, rescue->column, "unsupported record rescue");
+  }
+  if (!rescue->right || (rescue->right->kind != IR_VALUE_LOCAL && rescue->right->kind != IR_VALUE_CALL)) {
+    return elf_diag(diag, "direct ELF64 record rescue fallback must be a record local or call", rescue->line, rescue->column, "unsupported rescue fallback");
+  }
+  if (!elf_emit_record_call_with_dest(text, fun, (int)dest->index, rescue->left, ctx, diag)) return false;
+  z_x64_emit_test_reg_reg(text, 2, false);
+  size_t fallback_patch = z_x64_emit_jcc32_placeholder(text, 0x85); // jne fallback
+  size_t end_patch = z_x64_emit_jmp32_placeholder(text, 0xe9);      // success: skip fallback
+  z_x64_patch_rel32(text, fallback_patch, text->len);
+  if (rescue->right->kind == IR_VALUE_LOCAL) {
+    if (rescue->right->local_index >= fun->local_len) {
+      return elf_diag(diag, "direct ELF64 record rescue fallback local is out of range", rescue->right->line, rescue->right->column, "invalid fallback local");
+    }
+    elf_emit_record_copy_to(text, fun, dest->index, rescue->right->local_index);
+  } else {
+    if (!elf_emit_record_call_with_dest(text, fun, (int)dest->index, rescue->right, ctx, diag)) return false;
+  }
+  z_x64_patch_rel32(text, end_patch, text->len);
+  return true;
+}
+
 static bool elf_emit_local_set_instr(ZBuf *text, const IrFunction *fun, const IrInstr *instr, ElfEmitContext *ctx, ZDiag *diag) {
   const IrLocal *local = instr->local_index < fun->local_len ? &fun->locals[instr->local_index] : NULL;
+  if (local && local->is_record) {
+    // `let q = check f()` and `let q = f() rescue r0` — fallible record-returning calls.
+    if (instr->value && instr->value->kind == IR_VALUE_CHECK) {
+      return elf_emit_local_set_record_check(text, fun, instr, ctx, diag);
+    }
+    if (instr->value && instr->value->kind == IR_VALUE_RESCUE) {
+      return elf_emit_local_set_record_rescue(text, fun, instr, ctx, diag);
+    }
+    // `let q = f()` — bind a record-returning call straight into q's slot via sret (no copy).
+    if (instr->value && instr->value->kind == IR_VALUE_CALL) {
+      return elf_emit_record_call_with_dest(text, fun, (int)local->index, instr->value, ctx, diag);
+    }
+    // `let q = p` / `q = p` — record-to-record value copy.
+    if (instr->value && instr->value->kind == IR_VALUE_LOCAL) {
+      elf_emit_record_copy_to(text, fun, local->index, instr->value->local_index);
+      return true;
+    }
+    return elf_diag(diag, "direct ELF64 record local assignment requires a record value", instr->line, instr->column, "unsupported record set");
+  }
   if (local && local->type == IR_TYPE_BYTE_VIEW) return elf_emit_byte_view_local_set(text, fun, instr, local, ctx, diag);
   if (local && local->type == IR_TYPE_ALLOC) return elf_emit_alloc_local_set(text, fun, instr, local, ctx, diag);
   if (local && local->type == IR_TYPE_VEC) return elf_emit_vec_local_set(text, fun, instr, local, ctx, diag);
   if (local && local->type == IR_TYPE_MAYBE_BYTE_VIEW) return elf_emit_maybe_byte_view_local_set(text, fun, instr, local, ctx, diag);
   if (local && local->type == IR_TYPE_MAYBE_SCALAR) return elf_emit_maybe_scalar_local_set(text, fun, instr, local, ctx, diag);
   if (!elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
-  elf_emit_store_local_from_reg(text, fun, instr->local_index, 0);
+  if (local && elf_type_is_float(local->type)) elf_emit_store_local_xmm0(text, fun, instr->local_index);
+  else elf_emit_store_local_from_reg(text, fun, instr->local_index, 0);
   return true;
 }
 
@@ -1693,16 +2418,99 @@ static bool elf_emit_store_instr(ZBuf *text, const IrFunction *fun, const IrInst
     z_x64_emit_push_rax(text);
     if (!elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
     z_x64_emit_pop_reg64(text, 1);
-    if (local->element_type == IR_TYPE_BOOL || local->element_type == IR_TYPE_U8) z_x64_emit_store_ptr_reg8_from_reg(text, 1, 0);
+    // Address is in rcx; the value sits in rax (integer) or xmm0 (float), both surviving the pop.
+    // Store by element width: u8/i8/Bool write the low byte, 8-byte via 64-bit mov, float via
+    // movss/movsd, else 32-bit mov.
+    if (local->element_type == IR_TYPE_BOOL || local->element_type == IR_TYPE_U8 || local->element_type == IR_TYPE_I8) z_x64_emit_store_ptr_reg8_from_reg(text, 1, 0);
+    else if (elf_type_is_float(local->element_type)) z_x64_emit_movs_xmm_ptr_reg(text, 0, 1, elf_type_is_f64(local->element_type), false);
     else if (elf_type_is_i64(local->element_type)) z_x64_emit_store_ptr_reg_from_reg(text, 1, 0, true);
     else z_x64_emit_store_ptr_reg_from_reg(text, 1, 0, false);
+    return true;
+  }
+  // local_index == UINT_MAX targets the record being returned, written through the saved sret
+  // pointer (the `return <shape literal>` lowering stores its fields this way).
+  if (instr->local_index == UINT_MAX) {
+    IrTypeKind value_type = instr->value ? instr->value->type : IR_TYPE_I32;
+    unsigned slot = elf_sret_slot_offset(fun);
+    if (value_type == IR_TYPE_BYTE_VIEW) {
+      if (instr->value->kind == IR_VALUE_CALL) {
+        if (!elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
+        // mov rdi, [rbp - sret_slot]; mov [rdi + off], rax; mov [rdi + off+8], rdx
+        z_x64_emit_rbp_disp_reg(text, 0x8b, 7, slot, true);
+        z_x64_emit_store_ptr_reg_disp_from_reg(text, 7, instr->field_offset, 0, true);     // mov [rdi + off], rax
+        z_x64_emit_store_ptr_reg_disp_from_reg(text, 7, instr->field_offset + 8u, 2, true); // mov [rdi + off+8], rdx
+        return true;
+      }
+      if (!elf_emit_byte_view_ptr(text, fun, instr->value, ctx, diag)) return false;
+      z_x64_emit_push_rax(text);
+      if (!elf_emit_byte_view_len(text, fun, instr->value, ctx, diag)) return false;
+      z_x64_emit_mov_reg_from_reg(text, 2, 0, true);  // mov rdx, rax (len)
+      z_x64_emit_pop_reg64(text, 0);                  // pop rax (ptr)
+      z_x64_emit_rbp_disp_reg(text, 0x8b, 7, slot, true);
+      z_x64_emit_store_ptr_reg_disp_from_reg(text, 7, instr->field_offset, 0, true);     // mov [rdi + off], rax
+      z_x64_emit_store_ptr_reg_disp_from_reg(text, 7, instr->field_offset + 8u, 2, true); // mov [rdi + off+8], rdx
+      return true;
+    }
+    // Primitive (or float) field via sret. Materialize the value, then mov through saved sret ptr.
+    if (!elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
+    z_x64_emit_rbp_disp_reg(text, 0x8b, 7, slot, true);
+    if (elf_type_is_float(value_type)) {
+      bool is64 = elf_type_is_f64(value_type);
+      // movss/sd [rdi + off], xmm0
+      z_x64_emit_movs_xmm_ptr_reg_disp(text, 0, 7, instr->field_offset, is64, false);
+    } else {
+      bool wide = elf_type_is_i64(value_type);
+      z_x64_emit_store_ptr_reg_disp_from_reg(text, 7, instr->field_offset, 0, wide);  // mov [rdi + off], (r|e)ax
+    }
     return true;
   }
   if (instr->local_index >= fun->local_len) return elf_diag(diag, "direct ELF64 field store record is out of range", instr->line, instr->column, "invalid record local");
   const IrLocal *local = &fun->locals[instr->local_index];
   if (!local->is_record) return elf_diag(diag, "direct ELF64 field store requires record local", instr->line, instr->column, "non-record local");
+  // Field store through a ref<Record> (immutable) is rejected — `set p.x …` requires mutref.
+  if (local->is_ref && !local->is_mutable) {
+    return elf_diag(diag, "direct ELF64 field store through ref<Record> requires mutref", instr->line, instr->column, local->name ? local->name : "ref-record");
+  }
+  IrTypeKind value_type = instr->value ? instr->value->type : IR_TYPE_I32;
+  if (value_type == IR_TYPE_BYTE_VIEW) {
+    // Span field: store ptr at the field offset and len 8 bytes higher. A span-returning call
+    // leaves ptr in rax and len in rdx; any other byte view materializes ptr-then-len.
+    // mutref<Record> — deref the stashed ptr into rcx then store ptr/len at
+    // [rcx+field_offset] / [rcx+field_offset+8] (one deref per store; the ptr survives a single
+    // store but we reload between the two for clarity since the value materialization between
+    // them may scribble rcx via the byte-view-ptr/len helpers above).
+    bool target_is_ref = local->is_ref;
+    if (instr->value->kind == IR_VALUE_CALL) {
+      if (!elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
+      if (target_is_ref) {
+        elf_emit_load_ref_record_ptr(text, local, 1);
+        z_x64_emit_store_ptr_reg_disp_from_reg(text, 1, instr->field_offset, 0, true);
+        z_x64_emit_store_ptr_reg_disp_from_reg(text, 1, instr->field_offset + 8, 2, true);
+      } else {
+        elf_emit_store_local_slot_rax(text, local, instr->field_offset);
+        elf_emit_store_local_slot_reg(text, local, instr->field_offset + 8, 2, true);
+      }
+    } else {
+      if (!elf_emit_byte_view_ptr(text, fun, instr->value, ctx, diag)) return false;
+      if (target_is_ref) {
+        elf_emit_load_ref_record_ptr(text, local, 1);
+        z_x64_emit_store_ptr_reg_disp_from_reg(text, 1, instr->field_offset, 0, true);
+      } else {
+        elf_emit_store_local_slot_rax(text, local, instr->field_offset);
+      }
+      if (!elf_emit_byte_view_len(text, fun, instr->value, ctx, diag)) return false;
+      if (target_is_ref) {
+        elf_emit_load_ref_record_ptr(text, local, 1);
+        z_x64_emit_store_ptr_reg_disp_from_reg(text, 1, instr->field_offset + 8, 0, true);
+      } else {
+        elf_emit_store_local_slot_rax(text, local, instr->field_offset + 8);
+      }
+    }
+    return true;
+  }
   if (!elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
-  elf_emit_store_field_from_rax(text, local, instr->field_offset, instr->value ? instr->value->type : IR_TYPE_I32);
+  if (elf_type_is_float(value_type)) elf_emit_store_field_xmm0(text, local, instr->field_offset, value_type);
+  else elf_emit_store_field_from_rax(text, local, instr->field_offset, value_type);
   return true;
 }
 
@@ -1711,12 +2519,105 @@ static bool elf_emit_terminal_instr(ZBuf *text, const IrFunction *fun, const IrI
     case IR_INSTR_EXPR:
       if (instr->value && !elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
       return true;
-    case IR_INSTR_RAISE:
+    case IR_INSTR_RAISE: {
       if (!elf_function_propagates_to_process_exit(fun)) return elf_diag(diag, "direct ELF64 raise requires a fallible function context", instr->line, instr->column, "non-fallible context");
-      elf_emit_packed_error_rax(text, instr->error_code ? instr->error_code : IR_ERROR_UNKNOWN);
+      unsigned code_value = instr->error_code ? instr->error_code : IR_ERROR_UNKNOWN;
+      // A raising record-returning function carries the error tag in the low 32 bits of rdx
+      // (rax is reserved for the sret pointer per SysV). Every other raising function packs the tag
+      // into the high 32 bits of rax via the packed-tag scheme.
+      if (fun->return_type == IR_TYPE_RECORD) {
+        z_x64_emit_mov_reg_u32(text, 2, code_value);                                 // mov edx, code
+        z_x64_emit_rbp_disp_reg(text, 0x8b, 0, elf_sret_slot_offset(fun), true);      // mov rax, [rbp - sret]
+      } else {
+        elf_emit_packed_error_rax(text, code_value);
+      }
       elf_emit_epilogue(text, fun, ctx);
       return true;
+    }
     case IR_INSTR_RETURN:
+      if (fun->return_type == IR_TYPE_RECORD) {
+        // `ret check f()` / `ret rescue (f()) err fb` route the inner call's sret straight into our
+        // own sret target (no temp local), with the CHECK/RESCUE tag testing rdx between the call
+        // and the return.
+        const IrValue *call_for_check = NULL;
+        const IrValue *rescue_fallback = NULL;
+        if (instr->value && instr->value->kind == IR_VALUE_CHECK && instr->value->left && instr->value->left->kind == IR_VALUE_CALL) {
+          call_for_check = instr->value->left;
+        } else if (instr->value && instr->value->kind == IR_VALUE_RESCUE && instr->value->left && instr->value->left->kind == IR_VALUE_CALL) {
+          call_for_check = instr->value->left;
+          rescue_fallback = instr->value->right;
+        }
+        if (call_for_check) {
+          if (!elf_emit_record_call_with_dest(text, fun, -1, call_for_check, ctx, diag)) return false;
+          if (!rescue_fallback) {
+            // CHECK path: rdx carries inner call's tag. Reload rax (sret pointer) and epilogue —
+            // on success rdx is 0 (set by inner callee), on failure rdx propagates.
+            z_x64_emit_rbp_disp_reg(text, 0x8b, 0, elf_sret_slot_offset(fun), true);
+            elf_emit_epilogue(text, fun, ctx);
+            return true;
+          }
+          // RESCUE path: on success (rdx==0), reload rax and return. On failure, materialize
+          // fallback into our sret target, clear rdx (we're succeeding now), then return.
+          z_x64_emit_test_reg_reg(text, 2, false);
+          size_t fallback_patch = z_x64_emit_jcc32_placeholder(text, 0x85); // jne fallback
+          z_x64_emit_rbp_disp_reg(text, 0x8b, 0, elf_sret_slot_offset(fun), true);
+          if (fun->raises) z_x64_emit_xor_reg_reg(text, 2, false);
+          elf_emit_epilogue(text, fun, ctx);
+          z_x64_patch_rel32(text, fallback_patch, text->len);
+          if (rescue_fallback->kind == IR_VALUE_LOCAL) {
+            if (rescue_fallback->local_index >= fun->local_len) {
+              return elf_diag(diag, "direct ELF64 record return rescue fallback local is out of range", rescue_fallback->line, rescue_fallback->column, "invalid fallback local");
+            }
+            elf_emit_record_copy_to(text, fun, UINT_MAX, rescue_fallback->local_index);
+          } else if (rescue_fallback->kind == IR_VALUE_CALL) {
+            if (!elf_emit_record_call_with_dest(text, fun, -1, rescue_fallback, ctx, diag)) return false;
+          } else {
+            return elf_diag(diag, "direct ELF64 record return rescue fallback must be a record local or call", rescue_fallback->line, rescue_fallback->column, "unsupported rescue fallback");
+          }
+          z_x64_emit_rbp_disp_reg(text, 0x8b, 0, elf_sret_slot_offset(fun), true);
+          if (fun->raises) z_x64_emit_xor_reg_reg(text, 2, false);
+          elf_emit_epilogue(text, fun, ctx);
+          return true;
+        }
+        // `return f()` — the callee writes through our sret pointer and returns it in rax.
+        if (instr->value && instr->value->kind == IR_VALUE_CALL) {
+          if (!elf_emit_record_call_with_dest(text, fun, -1, instr->value, ctx, diag)) return false;
+          // A raising record-returning fn uses rdx as the error tag carrier; the callee's
+          // rdx already reflects the right value (0 on success, code on failure) and we propagate
+          // it unchanged. Reload rax (sret) and epilogue (which doesn't touch rdx).
+          z_x64_emit_rbp_disp_reg(text, 0x8b, 0, elf_sret_slot_offset(fun), true);
+          elf_emit_epilogue(text, fun, ctx);
+          return true;
+        }
+        // `return p` — copy a record local/param through the sret pointer.
+        if (instr->value && instr->value->kind == IR_VALUE_LOCAL) {
+          elf_emit_record_copy_to(text, fun, UINT_MAX, instr->value->local_index);
+        }
+        // `return <shape literal>` had its fields already stored through sret. Hand the sret pointer
+        // back in rax either way.
+        z_x64_emit_rbp_disp_reg(text, 0x8b, 0, elf_sret_slot_offset(fun), true);
+        // A raising record-returning function uses rdx as the error tag carrier; clear it
+        // on a successful return so callers see tag=0. (RAISE writes the error code to rdx directly.)
+        if (fun->raises) z_x64_emit_xor_reg_reg(text, 2, false);
+        elf_emit_epilogue(text, fun, ctx);
+        return true;
+      }
+      if (instr->value && instr->value->type == IR_TYPE_BYTE_VIEW) {
+        // Span return: ptr in rax, len in rdx. A span-returning call already lands both there;
+        // any other byte view is materialized ptr-then-len.
+        if (instr->value->kind == IR_VALUE_CALL) {
+          if (!elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
+        } else {
+          if (!elf_emit_byte_view_ptr(text, fun, instr->value, ctx, diag)) return false;
+          z_x64_emit_push_rax(text);
+          if (!elf_emit_byte_view_len(text, fun, instr->value, ctx, diag)) return false;
+          // mov rdx, rax
+          z_x64_emit_mov_reg_from_reg(text, 2, 0, true);
+          z_x64_emit_pop_reg64(text, 0);
+        }
+        elf_emit_epilogue(text, fun, ctx);
+        return true;
+      }
       if (instr->value && !elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
       if (fun->raises && !instr->value) z_x64_emit_xor_rax_rax(text);
       else if (fun->raises && instr->value && !elf_type_is_i64(instr->value->type)) z_x64_emit_mov_reg_from_reg(text, 0, 0, false);
@@ -1788,9 +2689,36 @@ static bool elf_emit_function_text(ZBuf *text, const IrFunction *fun, ElfEmitCon
     z_x64_emit_push_reg64(text, 2);
     z_x64_emit_pop_reg64(text, 13);
   }
-  size_t abi_slot = 0;
+  size_t abi_slot = 0;   // GPR bank index (param_regs)
+  size_t float_idx = 0;  // SSE bank index (xmm0..7), counted independently
+  if (fun->return_type == IR_TYPE_RECORD) {
+    // Save the caller's sret pointer (rdi) and reserve param_regs[0] for it.
+    z_x64_emit_rbp_disp_reg(text, 0x89, 7, elf_sret_slot_offset(fun), true);
+    abi_slot = 1;
+  }
   for (size_t i = 0; i < fun->param_count; i++) {
     const IrLocal *local = &fun->locals[i];
+    if (elf_type_is_float(local->type)) {
+      // System V: a float param consumes an XMM register, not a GPR slot. Spill it home.
+      if (float_idx >= 8) return elf_diag(diag, "direct ELF64 function has too many float ABI arguments", fun->line, fun->column, fun->name);
+      z_x64_emit_movs_xmm_rbp_disp(text, (unsigned)float_idx, -(int32_t)elf_local_offset(fun, (unsigned)i), elf_type_is_f64(local->type), false);
+      float_idx++;
+      continue;
+    }
+    if (local->type == IR_TYPE_RECORD) {
+      // Record arg: passed by pointer in one GPR slot; copy the slot contents into the inline frame.
+      // ref<Record> / mutref<Record> param. SysV passes a pointer in one int reg; store it
+      // in the first 8 bytes of the local's slot. Field load/store go through the pointer (no
+      // inline copy — that's what differentiates ref-record from by-value record).
+      if (abi_slot >= 6) return elf_diag(diag, "direct ELF64 function has too many ABI argument slots", fun->line, fun->column, fun->name);
+      if (local->is_ref) {
+        elf_emit_store_local_slot_reg(text, local, 0, elf_param_regs[abi_slot], true);
+      } else {
+        elf_emit_copy_record_param(text, fun, (unsigned)i, elf_param_regs[abi_slot]);
+      }
+      abi_slot += 1;
+      continue;
+    }
     unsigned slots = local->type == IR_TYPE_BYTE_VIEW ? 2 : 1;
     if (abi_slot + slots > 6) return elf_diag(diag, "direct ELF64 function has too many ABI argument slots", fun->line, fun->column, fun->name);
     if (local->type == IR_TYPE_BYTE_VIEW) {
@@ -1826,7 +2754,7 @@ static void elf_append_rodata(ZBuf *rodata, const IrProgram *ir, unsigned base_o
 typedef struct {
   ZBuf text, rodata, rela_text, strtab, symtab;
   size_t *function_offsets, *function_sizes;
-  uint32_t *symbol_names, runtime_names[ELF_RUNTIME_HELPER_COUNT];
+  uint32_t *symbol_names, runtime_names[ELF_RUNTIME_HELPER_COUNT], math_names[Z_ELF_MATH_COUNT];
   ElfEmitContext ctx;
   bool has_rodata;
   unsigned rodata_base_offset;
@@ -1891,6 +2819,12 @@ static void elf_append_object_runtime_names(ElfObjectBuild *build) {
     build->runtime_names[helper] = (uint32_t)build->strtab.len;
     zbuf_append(&build->strtab, z_elf_runtime_helper_symbol(runtime_helper)); z_elf_append_u8(&build->strtab, 0);
   }
+  for (unsigned m = 0; m < Z_ELF_MATH_COUNT; m++) {
+    ElfMathSymbol symbol = (ElfMathSymbol)m;
+    if (!z_elf_math_symbol_used(&build->ctx, symbol)) continue;
+    build->math_names[m] = (uint32_t)build->strtab.len;
+    zbuf_append(&build->strtab, z_elf_math_symbol_name(symbol)); z_elf_append_u8(&build->strtab, 0);
+  }
 }
 
 static void elf_finish_object_symbols(ElfObjectBuild *build, const IrProgram *ir) {
@@ -1905,11 +2839,30 @@ static void elf_finish_object_symbols(ElfObjectBuild *build, const IrProgram *ir
     runtime_symbols[helper] = next_runtime_symbol++;
     z_elf_append_runtime_relocations(&build->rela_text, &build->ctx, runtime_helper, runtime_symbols[helper]);
   }
-  for (size_t i = 0; i < ir->function_len; i++) z_elf_append_symbol(&build->symtab, build->symbol_names[i], ir->functions[i].is_exported ? 0x12 : 0x02, 1, build->function_offsets[i], build->function_sizes[i]);
+  // libm externals follow the runtime helpers in symbol-index order; the symtab append below reuses
+  // the same Z_ELF_MATH_* order so indices stay consistent with these relocations.
+  uint32_t math_symbols[Z_ELF_MATH_COUNT] = {0};
+  for (unsigned m = 0; m < Z_ELF_MATH_COUNT; m++) {
+    ElfMathSymbol symbol = (ElfMathSymbol)m;
+    if (!z_elf_math_symbol_used(&build->ctx, symbol)) continue;
+    math_symbols[m] = next_runtime_symbol++;
+    z_elf_append_math_relocations(&build->rela_text, &build->ctx, symbol, math_symbols[m]);
+  }
+  // All program functions are emitted as STB_GLOBAL|STT_FUNC (0x12). ELF requires LOCAL symbols
+  // to precede GLOBAL/WEAK ones; the section-header sh_info boundary is set from local_symbol_count,
+  // and a non-exported callee with STB_LOCAL after that boundary triggers lld "invalid binding: 0".
+  // Marking every program symbol GLOBAL keeps the ordering invariant intact.
+  for (size_t i = 0; i < ir->function_len; i++) z_elf_append_symbol(&build->symtab, build->symbol_names[i], 0x12, 1, build->function_offsets[i], build->function_sizes[i]);
   for (unsigned helper = 0; helper < ELF_RUNTIME_HELPER_COUNT; helper++) {
     ElfRuntimeHelper runtime_helper = (ElfRuntimeHelper)helper;
     if (z_elf_runtime_patch_count(&build->ctx, runtime_helper) == 0) continue;
     z_elf_append_symbol(&build->symtab, build->runtime_names[helper], 0x12, 0, 0, 0);
+  }
+  // Undefined GLOBAL|FUNC libm symbols (sqrtf/expf/...), emitted in symbol-index order.
+  for (unsigned m = 0; m < Z_ELF_MATH_COUNT; m++) {
+    ElfMathSymbol symbol = (ElfMathSymbol)m;
+    if (!z_elf_math_symbol_used(&build->ctx, symbol)) continue;
+    z_elf_append_symbol(&build->symtab, build->math_names[m], 0x12, 0, 0, 0);
   }
 }
 

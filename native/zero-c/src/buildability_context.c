@@ -8,12 +8,15 @@ const char *z_build_type_name(IrTypeKind type) {
     case IR_TYPE_VOID: return "Void";
     case IR_TYPE_BOOL: return "Bool";
     case IR_TYPE_U8: return "u8";
+    case IR_TYPE_I8: return "i8";
     case IR_TYPE_U16: return "u16";
     case IR_TYPE_USIZE: return "usize";
     case IR_TYPE_I32: return "i32";
     case IR_TYPE_U32: return "u32";
     case IR_TYPE_I64: return "i64";
     case IR_TYPE_U64: return "u64";
+    case IR_TYPE_F32: return "f32";
+    case IR_TYPE_F64: return "f64";
     case IR_TYPE_BYTE_VIEW: return "Span<u8>";
     case IR_TYPE_ALLOC: return "FixedBufAlloc";
     case IR_TYPE_VEC: return "Vec";
@@ -27,6 +30,7 @@ const char *z_build_type_name(IrTypeKind type) {
 const char *z_build_value_kind_name(IrValueKind kind) {
   switch (kind) {
     case IR_VALUE_INT: return "IR_VALUE_INT";
+    case IR_VALUE_FLOAT: return "IR_VALUE_FLOAT";
     case IR_VALUE_BOOL: return "IR_VALUE_BOOL";
     case IR_VALUE_LOCAL: return "IR_VALUE_LOCAL";
     case IR_VALUE_CAST: return "IR_VALUE_CAST";
@@ -40,10 +44,14 @@ const char *z_build_value_kind_name(IrValueKind kind) {
     case IR_VALUE_BYTE_VIEW_LEN: return "IR_VALUE_BYTE_VIEW_LEN";
     case IR_VALUE_BYTE_VIEW_INDEX_LOAD: return "IR_VALUE_BYTE_VIEW_INDEX_LOAD";
     case IR_VALUE_BYTE_VIEW_EQ: return "IR_VALUE_BYTE_VIEW_EQ";
+    case IR_VALUE_BYTE_VIEW_REINTERPRET: return "IR_VALUE_BYTE_VIEW_REINTERPRET";
+    case IR_VALUE_BYTE_VIEW_READ_INT_LE: return "IR_VALUE_BYTE_VIEW_READ_INT_LE";
+    case IR_VALUE_BYTE_VIEW_READ_FLOAT_LE: return "IR_VALUE_BYTE_VIEW_READ_FLOAT_LE";
     case IR_VALUE_BYTE_COPY: return "IR_VALUE_BYTE_COPY";
     case IR_VALUE_BYTE_FILL: return "IR_VALUE_BYTE_FILL";
     case IR_VALUE_CRC32_BYTES: return "IR_VALUE_CRC32_BYTES";
     case IR_VALUE_FIXED_BUF_ALLOC: return "IR_VALUE_FIXED_BUF_ALLOC";
+    case IR_VALUE_PAGE_ALLOC: return "IR_VALUE_PAGE_ALLOC";
     case IR_VALUE_VEC_INIT: return "IR_VALUE_VEC_INIT";
     case IR_VALUE_VEC_PUSH: return "IR_VALUE_VEC_PUSH";
     case IR_VALUE_VEC_LEN: return "IR_VALUE_VEC_LEN";
@@ -81,6 +89,8 @@ const char *z_build_value_kind_name(IrValueKind kind) {
     case IR_VALUE_FS_DIR_ENTRY_COUNT: return "IR_VALUE_FS_DIR_ENTRY_COUNT";
     case IR_VALUE_FS_TEMP_NAME: return "IR_VALUE_FS_TEMP_NAME";
     case IR_VALUE_FS_ATOMIC_WRITE: return "IR_VALUE_FS_ATOMIC_WRITE";
+    case IR_VALUE_FS_MMAP: return "IR_VALUE_FS_MMAP";
+    case IR_VALUE_FS_MUNMAP: return "IR_VALUE_FS_MUNMAP";
     case IR_VALUE_JSON_PARSE_BYTES: return "IR_VALUE_JSON_PARSE_BYTES";
     case IR_VALUE_JSON_VALIDATE_BYTES: return "IR_VALUE_JSON_VALIDATE_BYTES";
     case IR_VALUE_JSON_STREAM_TOKENS_BYTES: return "IR_VALUE_JSON_STREAM_TOKENS_BYTES";
@@ -99,6 +109,14 @@ const char *z_build_value_kind_name(IrValueKind kind) {
     case IR_VALUE_FIELD_LOAD: return "IR_VALUE_FIELD_LOAD";
     case IR_VALUE_CHECK: return "IR_VALUE_CHECK";
     case IR_VALUE_RESCUE: return "IR_VALUE_RESCUE";
+    case IR_VALUE_MATH_SQRTF: return "IR_VALUE_MATH_SQRTF";
+    case IR_VALUE_MATH_EXPF: return "IR_VALUE_MATH_EXPF";
+    case IR_VALUE_MATH_COSF: return "IR_VALUE_MATH_COSF";
+    case IR_VALUE_MATH_SINF: return "IR_VALUE_MATH_SINF";
+    case IR_VALUE_MATH_POWF: return "IR_VALUE_MATH_POWF";
+    case IR_VALUE_MATH_FABSF: return "IR_VALUE_MATH_FABSF";
+    case IR_VALUE_MATH_FLOORF: return "IR_VALUE_MATH_FLOORF";
+    case IR_VALUE_MATH_ISNANF: return "IR_VALUE_MATH_ISNANF";
   }
   return "IR_VALUE_UNKNOWN";
 }

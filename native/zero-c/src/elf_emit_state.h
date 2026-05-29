@@ -22,6 +22,21 @@ typedef enum {
   ELF_RUNTIME_HELPER_COUNT
 } ElfRuntimeHelper;
 
+// The libm symbols std.math lowers to. One undefined GLOBAL|FUNC external is emitted per symbol
+// actually called, each resolved by the host link step against libm (-lm). Bare (non-underscored)
+// ELF symbol names. Kept separate from ElfRuntimeHelper: libm is linked via the system math library,
+// not the zero runtime object, so it must not interact with runtime-object accounting.
+typedef enum {
+  Z_ELF_MATH_SQRTF = 0,
+  Z_ELF_MATH_EXPF,
+  Z_ELF_MATH_COSF,
+  Z_ELF_MATH_SINF,
+  Z_ELF_MATH_POWF,
+  Z_ELF_MATH_FABSF,
+  Z_ELF_MATH_FLOORF,
+  Z_ELF_MATH_COUNT
+} ElfMathSymbol;
+
 typedef struct {
   size_t patch_offset;
 } ElfPatch;
@@ -53,6 +68,7 @@ typedef struct {
   size_t rodata_patch_len;
   size_t rodata_patch_cap;
   ElfPatchList runtime_patches[ELF_RUNTIME_HELPER_COUNT];
+  ElfPatchList math_patches[Z_ELF_MATH_COUNT];
   bool emit_rodata_relocations;
   bool seed_main_process_args;
   unsigned rodata_base_offset;
@@ -70,5 +86,11 @@ void z_elf_patch_call_patches(ZBuf *code, const ElfEmitContext *ctx);
 void z_elf_patch_rodata_patches(ZBuf *code, const ElfEmitContext *ctx);
 void z_elf_append_rodata_relocations(ZBuf *rela_text, const ElfEmitContext *ctx, uint32_t rodata_symbol);
 void z_elf_append_runtime_relocations(ZBuf *rela_text, const ElfEmitContext *ctx, ElfRuntimeHelper helper, uint32_t runtime_symbol);
+const char *z_elf_math_symbol_name(ElfMathSymbol symbol);
+ElfMathSymbol z_elf_math_symbol_for_value(IrValueKind kind);
+bool z_elf_record_math_patch(ElfEmitContext *ctx, ElfMathSymbol symbol, size_t patch_offset, ZDiag *diag, const IrValue *value);
+bool z_elf_math_symbol_used(const ElfEmitContext *ctx, ElfMathSymbol symbol);
+size_t z_elf_math_patch_count(const ElfEmitContext *ctx);
+void z_elf_append_math_relocations(ZBuf *rela_text, const ElfEmitContext *ctx, ElfMathSymbol symbol, uint32_t math_symbol);
 
 #endif

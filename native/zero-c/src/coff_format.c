@@ -169,42 +169,105 @@ static void coff_patch_rel32_to_va(ZBuf *text, size_t patch_offset, uint64_t tex
   z_coff_patch_u32(text, patch_offset, (uint32_t)(int32_t)rel);
 }
 
+typedef struct {
+  const char *dll;
+  const char *name;
+} CoffImportSpec;
+
+// Imports are grouped by DLL (consecutive entries with the same `dll` form one IMAGE_IMPORT_DESCRIPTOR).
+// Order here defines the Z_COFF_IMPORT_* enum indices in coff_format.h — keep them in sync.
+static const CoffImportSpec coff_imports[Z_COFF_IMPORT_COUNT] = {
+  {"KERNEL32.dll", "ExitProcess"},
+  {"KERNEL32.dll", "GetStdHandle"},
+  {"KERNEL32.dll", "WriteFile"},
+  {"KERNEL32.dll", "CreateFileA"},
+  {"KERNEL32.dll", "GetFileSizeEx"},
+  {"KERNEL32.dll", "CreateFileMappingA"},
+  {"KERNEL32.dll", "MapViewOfFile"},
+  {"KERNEL32.dll", "UnmapViewOfFile"},
+  {"KERNEL32.dll", "CloseHandle"},
+  {"KERNEL32.dll", "VirtualAlloc"},
+  {"msvcrt.dll", "sqrtf"},
+  {"msvcrt.dll", "expf"},
+  {"msvcrt.dll", "cosf"},
+  {"msvcrt.dll", "sinf"},
+  {"msvcrt.dll", "powf"},
+  {"msvcrt.dll", "fabsf"},
+  {"msvcrt.dll", "floorf"},
+};
+
 static void coff_append_import_table(ZBuf *rdata, uint32_t rdata_rva, CoffImportLayout *layout) {
-  static const char *names[Z_COFF_IMPORT_COUNT] = {"ExitProcess", "GetStdHandle", "WriteFile"};
+  // Find the DLL group boundaries (one IMAGE_IMPORT_DESCRIPTOR per DLL, all-zero terminator at end).
+  unsigned dll_starts[Z_COFF_IMPORT_COUNT];
+  unsigned dll_count = 0;
+  for (unsigned i = 0; i < Z_COFF_IMPORT_COUNT; i++) {
+    if (i == 0 || strcmp(coff_imports[i].dll, coff_imports[i - 1].dll) != 0) {
+      dll_starts[dll_count++] = i;
+    }
+  }
+
   z_coff_pad_to(rdata, z_coff_align(rdata->len, 4));
   uint32_t descriptor_offset = (uint32_t)rdata->len;
-  z_coff_append_zeros(rdata, 40);
-  z_coff_pad_to(rdata, z_coff_align(rdata->len, 8));
-  uint32_t int_offset = (uint32_t)rdata->len;
-  z_coff_append_zeros(rdata, (Z_COFF_IMPORT_COUNT + 1) * 8);
-  z_coff_pad_to(rdata, z_coff_align(rdata->len, 8));
-  uint32_t iat_offset = (uint32_t)rdata->len;
-  z_coff_append_zeros(rdata, (Z_COFF_IMPORT_COUNT + 1) * 8);
-  uint32_t dll_name_offset = (uint32_t)rdata->len;
-  z_coff_append_bytes(rdata, "KERNEL32.dll", strlen("KERNEL32.dll") + 1);
+  z_coff_append_zeros(rdata, 20 * (dll_count + 1));
 
+  // Reserve INT + IAT per DLL (each followed by a NULL terminator entry).
+  uint32_t dll_int_offsets[Z_COFF_IMPORT_COUNT];
+  uint32_t dll_iat_offsets[Z_COFF_IMPORT_COUNT];
+  for (unsigned d = 0; d < dll_count; d++) {
+    unsigned start = dll_starts[d];
+    unsigned end = d + 1 < dll_count ? dll_starts[d + 1] : Z_COFF_IMPORT_COUNT;
+    z_coff_pad_to(rdata, z_coff_align(rdata->len, 8));
+    dll_int_offsets[d] = (uint32_t)rdata->len;
+    z_coff_append_zeros(rdata, (end - start + 1) * 8);
+  }
+  for (unsigned d = 0; d < dll_count; d++) {
+    unsigned start = dll_starts[d];
+    unsigned end = d + 1 < dll_count ? dll_starts[d + 1] : Z_COFF_IMPORT_COUNT;
+    z_coff_pad_to(rdata, z_coff_align(rdata->len, 8));
+    dll_iat_offsets[d] = (uint32_t)rdata->len;
+    z_coff_append_zeros(rdata, (end - start + 1) * 8);
+  }
+  uint32_t iat_block_end = (uint32_t)rdata->len;
+
+  // Emit DLL name strings.
+  uint32_t dll_name_offsets[Z_COFF_IMPORT_COUNT];
+  for (unsigned d = 0; d < dll_count; d++) {
+    dll_name_offsets[d] = (uint32_t)rdata->len;
+    z_coff_append_bytes(rdata, coff_imports[dll_starts[d]].dll, strlen(coff_imports[dll_starts[d]].dll) + 1);
+  }
+
+  // Emit hint/name pairs per import.
   uint32_t hint_name_offsets[Z_COFF_IMPORT_COUNT];
   for (unsigned i = 0; i < Z_COFF_IMPORT_COUNT; i++) {
     z_coff_pad_to(rdata, z_coff_align(rdata->len, 2));
     hint_name_offsets[i] = (uint32_t)rdata->len;
     z_coff_append_u16(rdata, 0);
-    z_coff_append_bytes(rdata, names[i], strlen(names[i]) + 1);
+    z_coff_append_bytes(rdata, coff_imports[i].name, strlen(coff_imports[i].name) + 1);
   }
 
-  z_coff_patch_u32(rdata, descriptor_offset + 0, rdata_rva + int_offset);
-  z_coff_patch_u32(rdata, descriptor_offset + 12, rdata_rva + dll_name_offset);
-  z_coff_patch_u32(rdata, descriptor_offset + 16, rdata_rva + iat_offset);
-  for (unsigned i = 0; i < Z_COFF_IMPORT_COUNT; i++) {
-    uint64_t thunk = rdata_rva + hint_name_offsets[i];
-    z_coff_patch_u64(rdata, int_offset + i * 8, thunk);
-    z_coff_patch_u64(rdata, iat_offset + i * 8, thunk);
-    if (layout) layout->iat_offsets[i] = iat_offset + i * 8;
+  // Fill descriptors + INT/IAT entries.
+  uint32_t iat_first = 0;
+  for (unsigned d = 0; d < dll_count; d++) {
+    unsigned start = dll_starts[d];
+    unsigned end = d + 1 < dll_count ? dll_starts[d + 1] : Z_COFF_IMPORT_COUNT;
+    z_coff_patch_u32(rdata, descriptor_offset + d * 20 + 0, rdata_rva + dll_int_offsets[d]);
+    z_coff_patch_u32(rdata, descriptor_offset + d * 20 + 12, rdata_rva + dll_name_offsets[d]);
+    z_coff_patch_u32(rdata, descriptor_offset + d * 20 + 16, rdata_rva + dll_iat_offsets[d]);
+    if (d == 0) iat_first = dll_iat_offsets[d];
+    for (unsigned i = start; i < end; i++) {
+      uint64_t thunk = rdata_rva + hint_name_offsets[i];
+      unsigned slot = i - start;
+      z_coff_patch_u64(rdata, dll_int_offsets[d] + slot * 8, thunk);
+      z_coff_patch_u64(rdata, dll_iat_offsets[d] + slot * 8, thunk);
+      if (layout) layout->iat_offsets[i] = dll_iat_offsets[d] + slot * 8;
+    }
   }
+
   if (layout) {
     layout->import_directory_rva = rdata_rva + descriptor_offset;
-    layout->import_directory_size = 40;
-    layout->iat_rva = rdata_rva + iat_offset;
-    layout->iat_size = (Z_COFF_IMPORT_COUNT + 1) * 8;
+    layout->import_directory_size = 20 * (dll_count + 1);
+    layout->iat_rva = rdata_rva + iat_first;
+    layout->iat_size = iat_block_end - iat_first;
   }
 }
 

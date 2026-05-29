@@ -32,7 +32,7 @@ static const char *fallback_manifest =
 "libcMode = \"sysroot\"\n"
 "exeSuffix = \"\"\n"
 "zigTarget = \"x86_64-macos\"\n"
-"capabilities = [\"memory\", \"stdio\", \"fs\", \"time\", \"rand\"]\n"
+"capabilities = [\"memory\", \"stdio\", \"args\", \"fs\", \"time\", \"rand\"]\n"
 "[[target]]\n"
 "name = \"linux-musl-x64\"\n"
 "aliases = [\"x86_64-linux-musl\"]\n"
@@ -58,7 +58,7 @@ static const char *fallback_manifest =
 "libcMode = \"bundled-libc\"\n"
 "exeSuffix = \"\"\n"
 "zigTarget = \"aarch64-linux-musl\"\n"
-"capabilities = [\"memory\", \"stdio\", \"time\", \"rand\"]\n"
+"capabilities = [\"memory\", \"stdio\", \"args\", \"fs\", \"time\", \"rand\"]\n"
 "[[target]]\n"
 "name = \"linux-x64\"\n"
 "aliases = [\"x86_64-linux-gnu\"]\n"
@@ -97,7 +97,7 @@ static const char *fallback_manifest =
 "libcMode = \"sysroot\"\n"
 "exeSuffix = \".exe\"\n"
 "zigTarget = \"x86_64-windows-msvc\"\n"
-"capabilities = [\"memory\", \"stdio\", \"time\", \"rand\"]\n"
+"capabilities = [\"memory\", \"stdio\", \"fs\", \"time\", \"rand\"]\n"
 "[[target]]\n"
 "name = \"win32-arm64.exe\"\n"
 "aliases = [\"aarch64-windows-msvc\"]\n"
@@ -110,7 +110,7 @@ static const char *fallback_manifest =
 "libcMode = \"sysroot\"\n"
 "exeSuffix = \".exe\"\n"
 "zigTarget = \"aarch64-windows-msvc\"\n"
-"capabilities = [\"memory\", \"stdio\", \"time\", \"rand\"]\n";
+"capabilities = [\"memory\", \"stdio\", \"fs\", \"time\", \"rand\"]\n";
 
 static ZTargetInfo *targets = NULL;
 static size_t target_count = 0;
@@ -389,6 +389,35 @@ void z_append_http_runtime_json(ZBuf *buf, const ZTargetInfo *target) {
   zbuf_appendf(
     buf,
     "{\"status\":\"unsupported\",\"provider\":null,\"providerLink\":\"none\",\"tlsBoundary\":\"none\",\"caSource\":\"none\",\"tlsVerification\":false,\"customCa\":{\"supported\":false,\"mode\":\"none\",\"env\":\"\"},\"insecureMode\":false,\"protocols\":[],\"staticLibraries\":[],\"systemLibraries\":[],\"reason\":\"%s\"}",
+    reason
+  );
+}
+
+static bool target_math_runtime_supported(const ZTargetInfo *target) {
+  ZDirectBackend object_backend = z_direct_object_backend(target);
+  return target &&
+         z_direct_backend_supports_runtime_object(object_backend) &&
+         z_direct_exe_backend(target) != Z_DIRECT_BACKEND_NONE &&
+         ((target->os && strcmp(target->os, "macos") == 0) ||
+          (target->os && strcmp(target->os, "linux") == 0));
+}
+
+void z_append_math_runtime_json(ZBuf *buf, const ZTargetInfo *target) {
+  if (target_math_runtime_supported(target)) {
+    if (target->os && strcmp(target->os, "macos") == 0) {
+      zbuf_append(buf, "{\"status\":\"supported\",\"provider\":\"libm\",\"providerLink\":\"system-library\",\"capabilityGate\":\"none\",\"staticLibraries\":[],\"systemLibraries\":[\"System\"],\"reason\":\"macOS Mach-O direct link plan resolves std.math through libSystem (libm)\"}");
+      return;
+    }
+    zbuf_append(buf, "{\"status\":\"supported\",\"provider\":\"libm\",\"providerLink\":\"system-library\",\"capabilityGate\":\"none\",\"staticLibraries\":[],\"systemLibraries\":[\"m\"],\"reason\":\"linux ELF direct link plan resolves std.math through libm\"}");
+    return;
+  }
+  const char *reason = "target has no audited math runtime provider";
+  if (target && z_direct_exe_backend(target) == Z_DIRECT_BACKEND_NONE) reason = "math runtime currently requires a direct executable link plan";
+  else if (target && !z_direct_backend_supports_runtime_object(z_direct_object_backend(target))) reason = "math runtime currently requires the ELF or Mach-O direct object link plan";
+  else if (target && (!target->os || (strcmp(target->os, "linux") != 0 && strcmp(target->os, "macos") != 0))) reason = "math runtime is available on linux (ELF) and macOS (Mach-O) in this phase";
+  zbuf_appendf(
+    buf,
+    "{\"status\":\"unsupported\",\"provider\":null,\"providerLink\":\"none\",\"capabilityGate\":\"none\",\"staticLibraries\":[],\"systemLibraries\":[],\"reason\":\"%s\"}",
     reason
   );
 }

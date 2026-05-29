@@ -4848,8 +4848,13 @@ static const char *expr_type(CheckContext *ctx, const Program *program, const Ex
     case EXPR_SLICE: {
       static char slice_type[128];
       char element_type[96];
-      if (index_element_type(expr_type(ctx, program, expr->left, scope), element_type, sizeof(element_type))) {
-        snprintf(slice_type, sizeof(slice_type), "Span<%s>", element_type);
+      const char *base_type = expr_type(ctx, program, expr->left, scope);
+      if (index_element_type(base_type, element_type, sizeof(element_type))) {
+        // Slicing a mutable span yields a mutable span; arrays, strings, and immutable spans yield
+        // an immutable Span. This keeps PROT_READ byte views un-writable while letting a MutSpan<u8>
+        // region be sub-sliced and reinterpreted (bytesAsMut*) for writes.
+        const char *span_kind = type_is_named_generic(base_type, "MutSpan") ? "MutSpan" : "Span";
+        snprintf(slice_type, sizeof(slice_type), "%s<%s>", span_kind, element_type);
         return slice_type;
       }
       return "Unknown";
@@ -6321,7 +6326,10 @@ static bool check_expr_expected(CheckContext *ctx, const Program *program, const
         }
       }
       char slice_type[160];
-      snprintf(slice_type, sizeof(slice_type), "Span<%s>", element_type);
+      // A slice of a mutable span stays mutable; arrays/strings/immutable spans yield an immutable
+      // Span (see expr_type's EXPR_SLICE case for rationale).
+      const char *span_kind = type_is_named_generic(base_type, "MutSpan") ? "MutSpan" : "Span";
+      snprintf(slice_type, sizeof(slice_type), "%s<%s>", span_kind, element_type);
       set_expr_resolved_type(expr, slice_type);
       return true;
     }
@@ -8884,7 +8892,7 @@ static bool is_builtin_type_name(const char *name) {
   if (!name) return false;
   const char *names[] = {
     "Void", "Bool", "bool", "String", "char", "Type",
-    "World", "WorldStream", "Fs", "File", "ByteBuf", "NullAlloc", "FixedBufAlloc", "PageAlloc", "GeneralAlloc",
+    "World", "WorldStream", "Fs", "File", "ByteBuf", "Mapping", "NullAlloc", "FixedBufAlloc", "PageAlloc", "GeneralAlloc",
     "Vec", "Map", "Set", "Duration", "RandSource", "ProcStatus", "Address", "Net", "Conn", "Listener",
     "HttpMethod", "HttpClient", "HttpServer", "HttpResult", "HttpError", "HttpHeaderValue", "JsonDoc", "BufferedReader", "BufferedWriter",
     "Env", "Args", "Clock", "Rand", "Proc", "Alloc",

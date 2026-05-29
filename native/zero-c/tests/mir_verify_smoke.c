@@ -265,15 +265,19 @@ static void array_load_type_mismatch_fails(void) {
 }
 
 static void array_byte_view_contract_fails(void) {
+  // The u8-only restriction on IR_VALUE_ARRAY_BYTE_VIEW was lifted; the verifier now demands
+  // that the view's element_type matches the underlying local's element_type. A mismatched
+  // pair (i32 array bound under a u8 byte view) is the new failure mode.
   IrLocal locals[] = {array_local("numbers", IR_TYPE_I32, 0)};
   IrValue view = value(IR_VALUE_ARRAY_BYTE_VIEW, IR_TYPE_BYTE_VIEW);
   view.array_index = 0;
   view.data_len = 4;
+  view.element_type = IR_TYPE_U8;
   IrInstr write = {.kind = IR_INSTR_WORLD_WRITE, .value = &view, .line = 1, .column = 1};
   IrFunction fun = function("main", IR_TYPE_VOID, IR_TYPE_VOID, locals, 1, 0, &write, 1, 16, false);
   IrProgram ir = program(&fun, 1);
   ir.direct_runtime_helper_count = 1;
-  expect_fail("array byte view from non-byte array", &ir, "array byte view from a non-byte array local");
+  expect_fail("array byte view element-type mismatch", &ir, "array byte view element-type mismatch");
 }
 
 static void array_byte_view_length_mismatch_fails(void) {
@@ -281,6 +285,7 @@ static void array_byte_view_length_mismatch_fails(void) {
   IrValue view = value(IR_VALUE_ARRAY_BYTE_VIEW, IR_TYPE_BYTE_VIEW);
   view.array_index = 0;
   view.data_len = 3;
+  view.element_type = IR_TYPE_U8;
   IrInstr write = {.kind = IR_INSTR_WORLD_WRITE, .value = &view, .line = 1, .column = 1};
   IrFunction fun = function("main", IR_TYPE_VOID, IR_TYPE_VOID, locals, 1, 0, &write, 1, 16, false);
   IrProgram ir = program(&fun, 1);
@@ -940,6 +945,208 @@ static void world_write_stream_contract_fails(void) {
   expect_fail("world write stream contract", &ir, "invalid world write stream");
 }
 
+static void float_literal_passes(void) {
+  IrValue number = value(IR_VALUE_FLOAT, IR_TYPE_F32);
+  IrInstr ret = {.kind = IR_INSTR_RETURN, .value = &number, .line = 1, .column = 1};
+  IrFunction fun = function("main", IR_TYPE_F32, IR_TYPE_F32, NULL, 0, 0, &ret, 1, 0, false);
+  IrProgram ir = program(&fun, 1);
+  expect_ok("float literal", &ir);
+}
+
+static void float_literal_type_mismatch_fails(void) {
+  IrValue number = value(IR_VALUE_FLOAT, IR_TYPE_I32);
+  IrInstr ret = {.kind = IR_INSTR_RETURN, .value = &number, .line = 1, .column = 1};
+  IrFunction fun = function("main", IR_TYPE_I32, IR_TYPE_I32, NULL, 0, 0, &ret, 1, 0, false);
+  IrProgram ir = program(&fun, 1);
+  expect_fail("float literal type mismatch", &ir, "float literal type mismatch");
+}
+
+static void math_f32_passes(void) {
+  IrValue arg = value(IR_VALUE_FLOAT, IR_TYPE_F32);
+  IrValue sqrt = value(IR_VALUE_MATH_SQRTF, IR_TYPE_F32);
+  sqrt.left = &arg;
+  IrInstr ret = {.kind = IR_INSTR_RETURN, .value = &sqrt, .line = 1, .column = 1};
+  IrFunction fun = function("main", IR_TYPE_F32, IR_TYPE_F32, NULL, 0, 0, &ret, 1, 0, false);
+  IrProgram ir = program(&fun, 1);
+  expect_ok("math f32 sqrt", &ir);
+}
+
+static void math_non_f32_argument_fails(void) {
+  // std.math.* lowers through the single-precision libm entry points, so an f64 (non-f32)
+  // argument must be rejected even though it is a float.
+  IrValue arg = value(IR_VALUE_FLOAT, IR_TYPE_F64);
+  IrValue sqrt = value(IR_VALUE_MATH_SQRTF, IR_TYPE_F32);
+  sqrt.left = &arg;
+  IrInstr ret = {.kind = IR_INSTR_RETURN, .value = &sqrt, .line = 1, .column = 1};
+  IrFunction fun = function("main", IR_TYPE_F32, IR_TYPE_F32, NULL, 0, 0, &ret, 1, 0, false);
+  IrProgram ir = program(&fun, 1);
+  expect_fail("math non-f32 argument", &ir, "invalid math argument");
+}
+
+static void math_non_f32_result_fails(void) {
+  IrValue arg = value(IR_VALUE_FLOAT, IR_TYPE_F32);
+  IrValue sqrt = value(IR_VALUE_MATH_SQRTF, IR_TYPE_F64);
+  sqrt.left = &arg;
+  IrInstr ret = {.kind = IR_INSTR_RETURN, .value = &sqrt, .line = 1, .column = 1};
+  IrFunction fun = function("main", IR_TYPE_F64, IR_TYPE_F64, NULL, 0, 0, &ret, 1, 0, false);
+  IrProgram ir = program(&fun, 1);
+  expect_fail("math non-f32 result", &ir, "math result type mismatch");
+}
+
+static void math_isnanf_passes(void) {
+  IrValue arg = value(IR_VALUE_FLOAT, IR_TYPE_F32);
+  IrValue is_nan = value(IR_VALUE_MATH_ISNANF, IR_TYPE_BOOL);
+  is_nan.left = &arg;
+  IrInstr ret = {.kind = IR_INSTR_RETURN, .value = &is_nan, .line = 1, .column = 1};
+  IrFunction fun = function("main", IR_TYPE_BOOL, IR_TYPE_BOOL, NULL, 0, 0, &ret, 1, 0, false);
+  IrProgram ir = program(&fun, 1);
+  expect_ok("math isNaNf", &ir);
+}
+
+static void reinterpret_value_element_passes(void) {
+  IrValue bytes = byte_view_value();
+  IrValue view = value(IR_VALUE_BYTE_VIEW_REINTERPRET, IR_TYPE_BYTE_VIEW);
+  view.left = &bytes;
+  view.element_type = IR_TYPE_F32;
+  IrInstr write = {.kind = IR_INSTR_WORLD_WRITE, .field_offset = 1, .value = &view, .line = 1, .column = 1};
+  IrFunction fun = function("main", IR_TYPE_VOID, IR_TYPE_VOID, NULL, 0, 0, &write, 1, 0, false);
+  IrProgram ir = program(&fun, 1);
+  ir.direct_runtime_helper_count = 1;
+  expect_ok("reinterpret value element", &ir);
+}
+
+static void reinterpret_unsupported_element_fails(void) {
+  IrValue bytes = byte_view_value();
+  IrValue view = value(IR_VALUE_BYTE_VIEW_REINTERPRET, IR_TYPE_BYTE_VIEW);
+  view.left = &bytes;
+  view.element_type = IR_TYPE_BYTE_VIEW;
+  IrInstr write = {.kind = IR_INSTR_WORLD_WRITE, .field_offset = 1, .value = &view, .line = 1, .column = 1};
+  IrFunction fun = function("main", IR_TYPE_VOID, IR_TYPE_VOID, NULL, 0, 0, &write, 1, 0, false);
+  IrProgram ir = program(&fun, 1);
+  ir.direct_runtime_helper_count = 1;
+  expect_fail("reinterpret unsupported element", &ir, "byte-view reinterpret with an unsupported element type");
+}
+
+static void read_int_le_passes(void) {
+  IrValue bytes = byte_view_value();
+  IrValue offset = value(IR_VALUE_INT, IR_TYPE_USIZE);
+  IrValue read = value(IR_VALUE_BYTE_VIEW_READ_INT_LE, IR_TYPE_U32);
+  read.left = &bytes;
+  read.index = &offset;
+  IrInstr ret = {.kind = IR_INSTR_RETURN, .value = &read, .line = 1, .column = 1};
+  IrFunction fun = function("main", IR_TYPE_U32, IR_TYPE_U32, NULL, 0, 0, &ret, 1, 0, false);
+  IrProgram ir = program(&fun, 1);
+  expect_ok("read u32 little-endian", &ir);
+}
+
+static void read_int_le_input_mismatch_fails(void) {
+  IrValue bytes = value(IR_VALUE_INT, IR_TYPE_I32);
+  IrValue offset = value(IR_VALUE_INT, IR_TYPE_USIZE);
+  IrValue read = value(IR_VALUE_BYTE_VIEW_READ_INT_LE, IR_TYPE_U32);
+  read.left = &bytes;
+  read.index = &offset;
+  IrInstr ret = {.kind = IR_INSTR_RETURN, .value = &read, .line = 1, .column = 1};
+  IrFunction fun = function("main", IR_TYPE_U32, IR_TYPE_U32, NULL, 0, 0, &ret, 1, 0, false);
+  IrProgram ir = program(&fun, 1);
+  expect_fail("read little-endian integer input mismatch", &ir, "invalid little-endian integer read input");
+}
+
+static void read_float_le_passes(void) {
+  IrValue bytes = byte_view_value();
+  IrValue offset = value(IR_VALUE_INT, IR_TYPE_USIZE);
+  IrValue read = value(IR_VALUE_BYTE_VIEW_READ_FLOAT_LE, IR_TYPE_F32);
+  read.left = &bytes;
+  read.index = &offset;
+  IrInstr ret = {.kind = IR_INSTR_RETURN, .value = &read, .line = 1, .column = 1};
+  IrFunction fun = function("main", IR_TYPE_F32, IR_TYPE_F32, NULL, 0, 0, &ret, 1, 0, false);
+  IrProgram ir = program(&fun, 1);
+  expect_ok("read f32 little-endian", &ir);
+}
+
+static void read_float_le_result_mismatch_fails(void) {
+  IrValue bytes = byte_view_value();
+  IrValue offset = value(IR_VALUE_INT, IR_TYPE_USIZE);
+  IrValue read = value(IR_VALUE_BYTE_VIEW_READ_FLOAT_LE, IR_TYPE_U32);
+  read.left = &bytes;
+  read.index = &offset;
+  IrInstr ret = {.kind = IR_INSTR_RETURN, .value = &read, .line = 1, .column = 1};
+  IrFunction fun = function("main", IR_TYPE_U32, IR_TYPE_U32, NULL, 0, 0, &ret, 1, 0, false);
+  IrProgram ir = program(&fun, 1);
+  expect_fail("read little-endian float result mismatch", &ir, "little-endian float read result type mismatch");
+}
+
+static void fs_mmap_passes(void) {
+  IrLocal locals[] = {scalar_local("mapping", IR_TYPE_MAYBE_BYTE_VIEW, 0, false)};
+  locals[0].byte_size = 24;
+  locals[0].frame_offset = 24;
+  IrValue path = byte_view_value();
+  IrValue mmap = value(IR_VALUE_FS_MMAP, IR_TYPE_MAYBE_BYTE_VIEW);
+  mmap.left = &path;
+  IrInstr set = {.kind = IR_INSTR_LOCAL_SET, .local_index = 0, .value = &mmap, .line = 1, .column = 1};
+  IrFunction fun = function("main", IR_TYPE_VOID, IR_TYPE_VOID, locals, 1, 0, &set, 1, 32, false);
+  IrProgram ir = program(&fun, 1);
+  expect_ok("filesystem mmap", &ir);
+}
+
+static void fs_mmap_path_mismatch_fails(void) {
+  IrLocal locals[] = {scalar_local("mapping", IR_TYPE_MAYBE_BYTE_VIEW, 0, false)};
+  locals[0].byte_size = 24;
+  locals[0].frame_offset = 24;
+  IrValue path = value(IR_VALUE_INT, IR_TYPE_I32);
+  IrValue mmap = value(IR_VALUE_FS_MMAP, IR_TYPE_MAYBE_BYTE_VIEW);
+  mmap.left = &path;
+  IrInstr set = {.kind = IR_INSTR_LOCAL_SET, .local_index = 0, .value = &mmap, .line = 1, .column = 1};
+  IrFunction fun = function("main", IR_TYPE_VOID, IR_TYPE_VOID, locals, 1, 0, &set, 1, 32, false);
+  IrProgram ir = program(&fun, 1);
+  expect_fail("filesystem mmap path mismatch", &ir, "invalid filesystem mmap path");
+}
+
+static void fs_munmap_passes(void) {
+  IrLocal locals[] = {scalar_local("mapping", IR_TYPE_BYTE_VIEW, 0, false)};
+  IrValue munmap = value(IR_VALUE_FS_MUNMAP, IR_TYPE_VOID);
+  munmap.local_index = 0;
+  IrInstr expr = {.kind = IR_INSTR_EXPR, .value = &munmap, .line = 1, .column = 1};
+  IrFunction fun = function("main", IR_TYPE_VOID, IR_TYPE_VOID, locals, 1, 0, &expr, 1, 16, false);
+  IrProgram ir = program(&fun, 1);
+  expect_ok("filesystem munmap", &ir);
+}
+
+static void fs_munmap_non_mapping_local_fails(void) {
+  IrLocal locals[] = {scalar_local("x", IR_TYPE_I32, 0, false)};
+  IrValue munmap = value(IR_VALUE_FS_MUNMAP, IR_TYPE_VOID);
+  munmap.local_index = 0;
+  IrInstr expr = {.kind = IR_INSTR_EXPR, .value = &munmap, .line = 1, .column = 1};
+  IrFunction fun = function("main", IR_TYPE_VOID, IR_TYPE_VOID, locals, 1, 0, &expr, 1, 16, false);
+  IrProgram ir = program(&fun, 1);
+  expect_fail("filesystem munmap non-Mapping local", &ir, "invalid filesystem munmap target");
+}
+
+static void page_alloc_bytes_passes(void) {
+  // A PageAlloc handle is a stateless (immutable) allocator: each allocBytes is an independent
+  // anonymous mmap, so allocBytes against it does not require the allocator local to be mutable.
+  IrLocal locals[] = {
+    scalar_local("alloc", IR_TYPE_ALLOC, 0, false),
+    scalar_local("bytes", IR_TYPE_MAYBE_BYTE_VIEW, 1, false)
+  };
+  locals[0].is_page_alloc = true;
+  locals[1].byte_size = 24;
+  locals[1].frame_offset = 48;
+  IrValue page = value(IR_VALUE_PAGE_ALLOC, IR_TYPE_ALLOC);
+  IrValue length = value(IR_VALUE_INT, IR_TYPE_USIZE);
+  length.int_value = 4096;
+  IrValue bytes = value(IR_VALUE_ALLOC_BYTES, IR_TYPE_MAYBE_BYTE_VIEW);
+  bytes.local_index = 0;
+  bytes.left = &length;
+  IrInstr instrs[] = {
+    {.kind = IR_INSTR_LOCAL_SET, .local_index = 0, .value = &page, .line = 1, .column = 1},
+    {.kind = IR_INSTR_LOCAL_SET, .local_index = 1, .value = &bytes, .line = 1, .column = 1}
+  };
+  IrFunction fun = function("main", IR_TYPE_VOID, IR_TYPE_VOID, locals, 2, 0, instrs, 2, 64, false);
+  IrProgram ir = program(&fun, 1);
+  ir.direct_allocator_helper_count = 2;
+  expect_ok("page alloc allocBytes", &ir);
+}
+
 int main(void) {
   valid_direct_call_passes();
   local_value_out_of_range_fails();
@@ -997,6 +1204,23 @@ int main(void) {
   http_runtime_import_contract_fails();
   world_write_helper_contract_fails();
   world_write_stream_contract_fails();
+  float_literal_passes();
+  float_literal_type_mismatch_fails();
+  math_f32_passes();
+  math_non_f32_argument_fails();
+  math_non_f32_result_fails();
+  math_isnanf_passes();
+  reinterpret_value_element_passes();
+  reinterpret_unsupported_element_fails();
+  read_int_le_passes();
+  read_int_le_input_mismatch_fails();
+  read_float_le_passes();
+  read_float_le_result_mismatch_fails();
+  fs_mmap_passes();
+  fs_mmap_path_mismatch_fails();
+  fs_munmap_passes();
+  fs_munmap_non_mapping_local_fails();
+  page_alloc_bytes_passes();
   puts("mir verifier smoke ok");
   return 0;
 }

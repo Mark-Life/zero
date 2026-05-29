@@ -86,6 +86,12 @@ void z_aarch64_emit_movz_x(ZBuf *text, unsigned reg, uint64_t literal) {
   }
 }
 
+// MOVN Xd, #imm16 : Xd = ~(imm16). Used to materialize small negative constants in a 64-bit
+// register (e.g. fd = -1 for an anonymous mmap) in a single instruction.
+void z_aarch64_emit_movn_x(ZBuf *text, unsigned reg, uint16_t literal) {
+  z_aarch64_append_u32(text, 0x92800000u | ((uint32_t)literal << 5) | (reg & 31u));
+}
+
 void z_aarch64_emit_mov_w(ZBuf *text, unsigned dst, unsigned src) {
   z_aarch64_append_u32(text, 0x2a0003e0u | ((src & 31u) << 16) | (dst & 31u));
 }
@@ -150,6 +156,10 @@ void z_aarch64_emit_sub_w_imm(ZBuf *text, unsigned dst, unsigned src, unsigned i
   z_aarch64_append_u32(text, 0x51000000u | ((imm & 0xfffu) << 10) | ((src & 31u) << 5) | (dst & 31u));
 }
 
+void z_aarch64_emit_sub_x_imm(ZBuf *text, unsigned dst, unsigned src, unsigned imm) {
+  z_aarch64_append_u32(text, 0xd1000000u | ((imm & 0xfffu) << 10) | ((src & 31u) << 5) | (dst & 31u));
+}
+
 void z_aarch64_emit_load_w_sp(ZBuf *text, unsigned reg, unsigned offset) {
   z_aarch64_append_u32(text, 0xb9400000u | ((offset / 4u) << 10) | (31u << 5) | (reg & 31u));
 }
@@ -186,8 +196,22 @@ void z_aarch64_emit_load_b_imm(ZBuf *text, unsigned dst, unsigned base, unsigned
   z_aarch64_append_u32(text, 0x39400000u | ((byte_offset & 0xfffu) << 10) | ((base & 31u) << 5) | (dst & 31u));
 }
 
+void z_aarch64_emit_load_h_imm(ZBuf *text, unsigned dst, unsigned base, unsigned byte_offset) {
+  // LDRH Wt, [Xn, #off] — load one halfword and zero-extend to 32 bits (u16 codec reads).
+  z_aarch64_append_u32(text, 0x79400000u | (((byte_offset / 2u) & 0xfffu) << 10) | ((base & 31u) << 5) | (dst & 31u));
+}
+
+void z_aarch64_emit_load_sb_imm(ZBuf *text, unsigned dst, unsigned base, unsigned byte_offset) {
+  // LDRSB Wt, [Xn, #off] — load one byte and sign-extend to 32 bits (signed i8 span/array elements).
+  z_aarch64_append_u32(text, 0x39c00000u | ((byte_offset & 0xfffu) << 10) | ((base & 31u) << 5) | (dst & 31u));
+}
+
 void z_aarch64_emit_store_w_imm(ZBuf *text, unsigned src, unsigned base, unsigned byte_offset) {
   z_aarch64_append_u32(text, 0xb9000000u | (((byte_offset / 4u) & 0xfffu) << 10) | ((base & 31u) << 5) | (src & 31u));
+}
+
+void z_aarch64_emit_store_x_imm(ZBuf *text, unsigned src, unsigned base, unsigned byte_offset) {
+  z_aarch64_append_u32(text, 0xf9000000u | (((byte_offset / 8u) & 0xfffu) << 10) | ((base & 31u) << 5) | (src & 31u));
 }
 
 void z_aarch64_emit_store_b_imm(ZBuf *text, unsigned src, unsigned base, unsigned byte_offset) {
@@ -242,6 +266,79 @@ void z_aarch64_emit_cmp_w(ZBuf *text, unsigned lhs, unsigned rhs) {
 
 void z_aarch64_emit_cmp_x(ZBuf *text, unsigned lhs, unsigned rhs) {
   z_aarch64_append_u32(text, 0xeb00001fu | ((rhs & 31u) << 16) | ((lhs & 31u) << 5));
+}
+
+/* ---- Scalar floating-point (S/D registers) ---- */
+
+void z_aarch64_emit_fmov_reg(ZBuf *text, unsigned dst, unsigned src, bool is64) {
+  uint32_t base = is64 ? 0x1e604000u : 0x1e204000u;
+  z_aarch64_append_u32(text, base | ((src & 31u) << 5) | (dst & 31u));
+}
+
+void z_aarch64_emit_fmov_from_gpr(ZBuf *text, unsigned vdst, unsigned gpr, bool is64) {
+  uint32_t base = is64 ? 0x9e670000u : 0x1e270000u;
+  z_aarch64_append_u32(text, base | ((gpr & 31u) << 5) | (vdst & 31u));
+}
+
+void z_aarch64_emit_fadd(ZBuf *text, unsigned dst, unsigned lhs, unsigned rhs, bool is64) {
+  uint32_t base = 0x1e202800u;
+  if (is64) base |= (1u << 22);
+  z_aarch64_append_u32(text, base | ((rhs & 31u) << 16) | ((lhs & 31u) << 5) | (dst & 31u));
+}
+
+void z_aarch64_emit_fsub(ZBuf *text, unsigned dst, unsigned lhs, unsigned rhs, bool is64) {
+  uint32_t base = 0x1e203800u;
+  if (is64) base |= (1u << 22);
+  z_aarch64_append_u32(text, base | ((rhs & 31u) << 16) | ((lhs & 31u) << 5) | (dst & 31u));
+}
+
+void z_aarch64_emit_fmul(ZBuf *text, unsigned dst, unsigned lhs, unsigned rhs, bool is64) {
+  uint32_t base = 0x1e200800u;
+  if (is64) base |= (1u << 22);
+  z_aarch64_append_u32(text, base | ((rhs & 31u) << 16) | ((lhs & 31u) << 5) | (dst & 31u));
+}
+
+void z_aarch64_emit_fdiv(ZBuf *text, unsigned dst, unsigned lhs, unsigned rhs, bool is64) {
+  uint32_t base = 0x1e201800u;
+  if (is64) base |= (1u << 22);
+  z_aarch64_append_u32(text, base | ((rhs & 31u) << 16) | ((lhs & 31u) << 5) | (dst & 31u));
+}
+
+void z_aarch64_emit_fcmp(ZBuf *text, unsigned lhs, unsigned rhs, bool is64) {
+  uint32_t base = is64 ? 0x1e602000u : 0x1e202000u;
+  z_aarch64_append_u32(text, base | ((rhs & 31u) << 16) | ((lhs & 31u) << 5));
+}
+
+void z_aarch64_emit_fcvt(ZBuf *text, unsigned dst, unsigned src, bool dst_is64) {
+  uint32_t base = dst_is64 ? 0x1e22c000u : 0x1e624000u;
+  z_aarch64_append_u32(text, base | ((src & 31u) << 5) | (dst & 31u));
+}
+
+void z_aarch64_emit_fcvtzs_w(ZBuf *text, unsigned gpr, unsigned vsrc, bool src_is64) {
+  uint32_t base = src_is64 ? 0x1e780000u : 0x1e380000u;
+  z_aarch64_append_u32(text, base | ((vsrc & 31u) << 5) | (gpr & 31u));
+}
+
+void z_aarch64_emit_scvtf_from_w(ZBuf *text, unsigned vdst, unsigned gpr, bool dst_is64) {
+  uint32_t base = dst_is64 ? 0x1e620000u : 0x1e220000u;
+  z_aarch64_append_u32(text, base | ((gpr & 31u) << 5) | (vdst & 31u));
+}
+
+void z_aarch64_emit_ucvtf_from_x(ZBuf *text, unsigned vdst, unsigned gpr, bool dst_is64) {
+  uint32_t base = dst_is64 ? 0x9e630000u : 0x9e230000u;
+  z_aarch64_append_u32(text, base | ((gpr & 31u) << 5) | (vdst & 31u));
+}
+
+void z_aarch64_emit_ldr_v_off(ZBuf *text, unsigned vreg, unsigned base_reg, unsigned offset, bool is64) {
+  uint32_t base = is64 ? 0xfd400000u : 0xbd400000u;
+  uint32_t scaled = is64 ? (offset / 8u) : (offset / 4u);
+  z_aarch64_append_u32(text, base | ((scaled & 0xfffu) << 10) | ((base_reg & 31u) << 5) | (vreg & 31u));
+}
+
+void z_aarch64_emit_str_v_off(ZBuf *text, unsigned vreg, unsigned base_reg, unsigned offset, bool is64) {
+  uint32_t base = is64 ? 0xfd000000u : 0xbd000000u;
+  uint32_t scaled = is64 ? (offset / 8u) : (offset / 4u);
+  z_aarch64_append_u32(text, base | ((scaled & 0xfffu) << 10) | ((base_reg & 31u) << 5) | (vreg & 31u));
 }
 
 void z_aarch64_emit_adrp_add_placeholder(ZBuf *text, unsigned reg) {

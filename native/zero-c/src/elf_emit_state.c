@@ -21,6 +21,10 @@ static const char *const runtime_helper_symbols[ELF_RUNTIME_HELPER_COUNT] = {
   "zero_http_header_len",
 };
 
+static const char *const math_symbol_names[Z_ELF_MATH_COUNT] = {
+  "sqrtf", "expf", "cosf", "sinf", "powf", "fabsf", "floorf"
+};
+
 static bool elf_emit_state_diag(ZDiag *diag, const char *message, int line, int column, const char *actual) {
   if (diag) {
     diag->code = 4004;
@@ -44,12 +48,37 @@ const char *z_elf_runtime_helper_symbol(ElfRuntimeHelper helper) {
   return runtime_helper_symbols[helper];
 }
 
+static bool elf_math_symbol_valid(ElfMathSymbol symbol) {
+  return symbol >= 0 && symbol < Z_ELF_MATH_COUNT;
+}
+
+const char *z_elf_math_symbol_name(ElfMathSymbol symbol) {
+  if (!elf_math_symbol_valid(symbol)) return "";
+  return math_symbol_names[symbol];
+}
+
+ElfMathSymbol z_elf_math_symbol_for_value(IrValueKind kind) {
+  switch (kind) {
+    case IR_VALUE_MATH_SQRTF: return Z_ELF_MATH_SQRTF;
+    case IR_VALUE_MATH_EXPF: return Z_ELF_MATH_EXPF;
+    case IR_VALUE_MATH_COSF: return Z_ELF_MATH_COSF;
+    case IR_VALUE_MATH_SINF: return Z_ELF_MATH_SINF;
+    case IR_VALUE_MATH_POWF: return Z_ELF_MATH_POWF;
+    case IR_VALUE_MATH_FABSF: return Z_ELF_MATH_FABSF;
+    case IR_VALUE_MATH_FLOORF: return Z_ELF_MATH_FLOORF;
+    default: abort();
+  }
+}
+
 void z_elf_emit_context_free(ElfEmitContext *ctx) {
   if (!ctx) return;
   free(ctx->call_patches);
   free(ctx->rodata_patches);
   for (unsigned i = 0; i < ELF_RUNTIME_HELPER_COUNT; i++) {
     free(ctx->runtime_patches[i].items);
+  }
+  for (unsigned i = 0; i < Z_ELF_MATH_COUNT; i++) {
+    free(ctx->math_patches[i].items);
   }
 }
 
@@ -129,5 +158,42 @@ void z_elf_append_runtime_relocations(ZBuf *rela_text, const ElfEmitContext *ctx
   const ElfPatchList *patches = &ctx->runtime_patches[helper];
   for (size_t i = 0; i < patches->len; i++) {
     z_elf_append_rela(rela_text, patches->items[i].patch_offset, runtime_symbol, 4, -4);
+  }
+}
+
+bool z_elf_record_math_patch(ElfEmitContext *ctx, ElfMathSymbol symbol, size_t patch_offset, ZDiag *diag, const IrValue *value) {
+  if (!ctx || !elf_math_symbol_valid(symbol)) {
+    return elf_emit_state_diag(diag, "direct ELF64 math relocation requires an emit context", value ? value->line : 1, value ? value->column : 1, "missing context");
+  }
+  ElfPatchList *list = &ctx->math_patches[symbol];
+  if (list->len + 1 > list->cap) {
+    list->cap = z_grow_capacity(list->cap, list->len + 1, 4);
+    list->items = z_checked_reallocarray(list->items, list->cap, sizeof(ElfPatch));
+  }
+  list->items[list->len++] = (ElfPatch){.patch_offset = patch_offset};
+  return true;
+}
+
+// True when at least one call site targets the given libm symbol. Drives which undefined externals
+// (and their relocations) are emitted into the object's symbol table.
+bool z_elf_math_symbol_used(const ElfEmitContext *ctx, ElfMathSymbol symbol) {
+  if (!ctx || !elf_math_symbol_valid(symbol)) return false;
+  return ctx->math_patches[symbol].len > 0;
+}
+
+size_t z_elf_math_patch_count(const ElfEmitContext *ctx) {
+  if (!ctx) return 0;
+  size_t count = 0;
+  for (unsigned i = 0; i < Z_ELF_MATH_COUNT; i++) count += ctx->math_patches[i].len;
+  return count;
+}
+
+// One R_X86_64_PLT32 relocation per `call rel32` site targeting `symbol`, against an undefined
+// GLOBAL|FUNC libm external. Same PLT32 shape as the runtime-helper externals.
+void z_elf_append_math_relocations(ZBuf *rela_text, const ElfEmitContext *ctx, ElfMathSymbol symbol, uint32_t math_symbol) {
+  if (!ctx || !elf_math_symbol_valid(symbol)) return;
+  const ElfPatchList *patches = &ctx->math_patches[symbol];
+  for (size_t i = 0; i < patches->len; i++) {
+    z_elf_append_rela(rela_text, patches->items[i].patch_offset, math_symbol, 4, -4);
   }
 }

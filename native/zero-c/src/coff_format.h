@@ -13,6 +13,7 @@ typedef enum {
 enum {
   Z_COFF_RELOC_AMD64_ADDR64 = 0x0001,
   Z_COFF_RELOC_AMD64_REL32 = 0x0004,
+  Z_COFF_RELOC_ARM64_BRANCH26 = 0x0003,
   Z_COFF_RELOC_ARM64_ADDR64 = 0x000e
 };
 
@@ -22,10 +23,28 @@ enum {
 };
 
 enum {
+  // KERNEL32.dll imports — process control + stdio (used by world.out.write + main exit).
   Z_COFF_IMPORT_EXIT_PROCESS = 0,
   Z_COFF_IMPORT_GET_STD_HANDLE = 1,
   Z_COFF_IMPORT_WRITE_FILE = 2,
-  Z_COFF_IMPORT_COUNT = 3
+  // KERNEL32.dll imports — mmap/munmap via Windows file mapping APIs + VirtualAlloc for
+  // anonymous page allocation.
+  Z_COFF_IMPORT_CREATE_FILE_A = 3,
+  Z_COFF_IMPORT_GET_FILE_SIZE_EX = 4,
+  Z_COFF_IMPORT_CREATE_FILE_MAPPING_A = 5,
+  Z_COFF_IMPORT_MAP_VIEW_OF_FILE = 6,
+  Z_COFF_IMPORT_UNMAP_VIEW_OF_FILE = 7,
+  Z_COFF_IMPORT_CLOSE_HANDLE = 8,
+  Z_COFF_IMPORT_VIRTUAL_ALLOC = 9,
+  // msvcrt.dll imports — libm transcendentals (used by std.math).
+  Z_COFF_IMPORT_SQRTF = 10,
+  Z_COFF_IMPORT_EXPF = 11,
+  Z_COFF_IMPORT_COSF = 12,
+  Z_COFF_IMPORT_SINF = 13,
+  Z_COFF_IMPORT_POWF = 14,
+  Z_COFF_IMPORT_FABSF = 15,
+  Z_COFF_IMPORT_FLOORF = 16,
+  Z_COFF_IMPORT_COUNT = 17
 };
 
 typedef struct {

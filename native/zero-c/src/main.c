@@ -627,7 +627,7 @@ static bool compile_zero_http_curl_object(const char *runtime_object_file, const
   return ok;
 }
 
-static bool link_zero_runtime_executable(const char *object_file, const char *runtime_object_file, const char *http_object_file, const char *exe_file, const ZToolchainPlan *plan, const ZTargetInfo *target, ZDiag *diag) {
+static bool link_zero_runtime_executable(const char *object_file, const char *runtime_object_file, const char *http_object_file, bool needs_math, const char *exe_file, const ZToolchainPlan *plan, const ZTargetInfo *target, ZDiag *diag) {
 #if defined(__linux__)
   const char *linux_no_pie = " -no-pie";
 #else
@@ -635,7 +635,12 @@ static bool link_zero_runtime_executable(const char *object_file, const char *ru
 #endif
   const char *object_files[3] = {object_file, runtime_object_file, http_object_file};
   size_t object_count = http_object_file && http_object_file[0] ? 3 : 2;
-  bool ok = z_toolchain_link_objects(plan, target, object_files, object_count, exe_file, linux_no_pie, http_object_file && http_object_file[0] ? "-lcurl 2>/dev/null" : "2>/dev/null");
+  bool has_curl = http_object_file && http_object_file[0];
+  const char *link_flags = "2>/dev/null";
+  if (has_curl && needs_math) link_flags = "-lcurl -lm 2>/dev/null";
+  else if (has_curl) link_flags = "-lcurl 2>/dev/null";
+  else if (needs_math) link_flags = "-lm 2>/dev/null";
+  bool ok = z_toolchain_link_objects(plan, target, object_files, object_count, exe_file, linux_no_pie, link_flags);
   if (!ok && diag) {
     diag->code = 2003;
     diag->line = 1;
@@ -4734,7 +4739,66 @@ static bool ir_instrs_need_zero_runtime_object(const IrInstr *instrs, size_t len
   return false;
 }
 
-static bool ir_needs_zero_runtime_object(const IrProgram *ir) {
+static bool ir_value_uses_libsystem_mmap(const IrValue *value) {
+  if (!value) return false;
+  if (value->kind == IR_VALUE_FS_MMAP ||
+      value->kind == IR_VALUE_FS_MUNMAP ||
+      value->kind == IR_VALUE_PAGE_ALLOC) return true;
+  if (ir_value_uses_libsystem_mmap(value->index) ||
+      ir_value_uses_libsystem_mmap(value->left) ||
+      ir_value_uses_libsystem_mmap(value->right)) {
+    return true;
+  }
+  for (size_t i = 0; i < value->arg_len; i++) {
+    if (ir_value_uses_libsystem_mmap(value->args[i])) return true;
+  }
+  return false;
+}
+
+static bool ir_instrs_use_libsystem_mmap(const IrInstr *instrs, size_t len) {
+  for (size_t i = 0; instrs && i < len; i++) {
+    const IrInstr *instr = &instrs[i];
+    if (ir_value_uses_libsystem_mmap(instr->value) ||
+        ir_value_uses_libsystem_mmap(instr->index) ||
+        ir_instrs_use_libsystem_mmap(instr->then_instrs, instr->then_len) ||
+        ir_instrs_use_libsystem_mmap(instr->else_instrs, instr->else_len)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// std.fs.mmap/munmap and std.mem.pageAlloc lower to libSystem externals (_mmap/_munmap/_open/
+// _lseek/_close) that only the host obj+link path can bind — the direct-exe path cannot. Mach-O
+// targets must therefore route through the runtime-object link when the program uses them. ELF and
+// other backends emit raw syscalls instead, so they stay on the direct-exe path (this predicate is
+// only consulted for Mach-O targets in ir_needs_zero_runtime_object).
+static bool ir_program_uses_libsystem_mmap(const IrProgram *ir) {
+  for (size_t i = 0; ir && i < ir->function_len; i++) {
+    if (ir_instrs_use_libsystem_mmap(ir->functions[i].instrs, ir->functions[i].instr_len)) return true;
+  }
+  return false;
+}
+
+static bool target_is_macho(const ZTargetInfo *target) {
+  return target && target->object_format && strcmp(target->object_format, "macho") == 0;
+}
+
+static bool target_is_coff(const ZTargetInfo *target) {
+  return target && target->object_format && strcmp(target->object_format, "coff") == 0;
+}
+
+static bool ir_needs_zero_runtime_object(const ZTargetInfo *target, const IrProgram *ir) {
+  // COFF resolves libm through msvcrt.dll via the PE .idata import directory inside the direct-exe
+  // emitter (emit_coff.c: coff_emit_math_call records a msvcrt IAT patch; isNaNf stays inline), so it
+  // must not be routed through the runtime-object link plan (which only the ELF + Mach-O backends
+  // carry — that path has no way to bind libm for a PE target). Math imports stay self-contained in
+  // the direct COFF emitter. INVARIANT: the `!target_is_coff(target)` guard below is load-bearing —
+  // dropping it would silently route COFF math through obj+link and break libm resolution. There is
+  // no IR/verifier gate enforcing this; COFF codegen is build-validated only (see PR notes), so keep
+  // this guard and the COFF math IAT path in emit_coff.c in sync.
+  if (ir && ir->direct_math_runtime_import_count > 0 && !target_is_coff(target)) return true;
+  if (target_is_macho(target) && ir_program_uses_libsystem_mmap(ir)) return true;
   for (size_t i = 0; ir && i < ir->function_len; i++) {
     if (ir_instrs_need_zero_runtime_object(ir->functions[i].instrs, ir->functions[i].instr_len)) return true;
   }
@@ -8348,6 +8412,7 @@ static void apply_ir_metrics_to_input(SourceInput *input, const IrProgram *ir, c
   input->direct_runtime_helper_count = ir->direct_runtime_helper_count;
   input->direct_host_runtime_import_count = ir->direct_host_runtime_import_count;
   input->direct_http_runtime_import_count = ir->direct_http_runtime_import_count;
+  input->direct_math_runtime_import_count = ir->direct_math_runtime_import_count;
 }
 
 static void init_lowering_backend_diag(ZDiag *diag, const SourceInput *input, const ZTargetInfo *target, const Command *command, const IrProgram *ir) {
@@ -8383,7 +8448,7 @@ static bool target_readiness_select_emit_target(const Command *command, const So
 
 static bool target_readiness_buildability_check(const Command *command, const ZTargetInfo *target, const IrProgram *ir, ZDiag *diag) {
   EmitKind emit = command ? command->emit : EMIT_EXE;
-  const char *emit_kind = (emit == EMIT_EXE && ir && ir_needs_zero_runtime_object(ir)) ? "obj" : emit_kind_name(emit);
+  const char *emit_kind = (emit == EMIT_EXE && ir && ir_needs_zero_runtime_object(target, ir)) ? "obj" : emit_kind_name(emit);
   if (z_direct_buildability_check(ir, target, emit_kind, diag)) return true;
   complete_backend_blocker_diag(diag, target, command, emit_kind, diag && diag->backend_blocker.present ? diag->backend_blocker.stage : "buildability");
   return false;
@@ -8398,7 +8463,7 @@ static bool target_readiness_select_diag(const Command *command, const SourceInp
     return false;
   }
 
-  if (ir && ir_needs_zero_runtime_object(ir)) {
+  if (ir && ir_needs_zero_runtime_object(target, ir)) {
     RuntimeImportAudit audit = runtime_import_audit_from_ir(ir);
     bool needs_http_runtime = runtime_import_audit_uses_http_provider(&audit);
     ZDirectRuntimeObjectFacts runtime_object = z_direct_runtime_object_facts(target, needs_http_runtime);
@@ -8645,6 +8710,8 @@ static void append_graph_json(ZBuf *buf, SourceInput *input, Program *program, c
   append_target_capability_facts_json(buf, target, &caps);
   zbuf_append(buf, ",\"httpRuntime\":");
   z_append_http_runtime_json(buf, target);
+  zbuf_append(buf, ",\"mathRuntime\":");
+  z_append_math_runtime_json(buf, target);
   zbuf_append(buf, "},\n");
   zbuf_append(buf, "  \"targetReadiness\": "); append_target_readiness_json(buf, input, program, target, command); zbuf_append(buf, ",\n");
   zbuf_append(buf, "  \"requiresCapabilities\": ");
@@ -9478,7 +9545,7 @@ int main(int argc, char **argv) {
   bool run_command = strcmp(command.command, "run") == 0;
   bool ship_command = strcmp(command.command, "ship") == 0;
   bool artifact_command = build_command || run_command || ship_command;
-  bool needs_zero_runtime = artifact_command && command.emit == EMIT_EXE && ir_needs_zero_runtime_object(&ir);
+  bool needs_zero_runtime = artifact_command && command.emit == EMIT_EXE && ir_needs_zero_runtime_object(target, &ir);
   if (needs_zero_runtime) {
     RuntimeImportAudit runtime_audit = runtime_import_audit_from_ir(&ir);
     bool needs_http_runtime = runtime_import_audit_uses_http_provider(&runtime_audit);
@@ -9541,7 +9608,8 @@ int main(int argc, char **argv) {
     }
 
     phase_started = now_ms();
-    bool linked = link_zero_runtime_executable(object_file, runtime_object_file, http_object_file, exe_file, &runtime_toolchain, target, &diag);
+    bool needs_math = ir.direct_math_runtime_import_count > 0;
+    bool linked = link_zero_runtime_executable(object_file, runtime_object_file, http_object_file, needs_math, exe_file, &runtime_toolchain, target, &diag);
     if (linked) chmod(exe_file, 0755);
     input.link_ms = now_ms() - phase_started;
     remove(object_file);

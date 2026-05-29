@@ -421,12 +421,15 @@ typedef enum {
   IR_TYPE_VOID,
   IR_TYPE_BOOL,
   IR_TYPE_U8,
+  IR_TYPE_I8,
   IR_TYPE_U16,
   IR_TYPE_USIZE,
   IR_TYPE_I32,
   IR_TYPE_U32,
   IR_TYPE_I64,
   IR_TYPE_U64,
+  IR_TYPE_F32,
+  IR_TYPE_F64,
   IR_TYPE_BYTE_VIEW,
   IR_TYPE_ALLOC,
   IR_TYPE_VEC,
@@ -445,6 +448,7 @@ typedef enum {
 
 typedef enum {
   IR_VALUE_INT,
+  IR_VALUE_FLOAT,
   IR_VALUE_BOOL,
   IR_VALUE_LOCAL,
   IR_VALUE_CAST,
@@ -458,10 +462,14 @@ typedef enum {
   IR_VALUE_BYTE_VIEW_LEN,
   IR_VALUE_BYTE_VIEW_INDEX_LOAD,
   IR_VALUE_BYTE_VIEW_EQ,
+  IR_VALUE_BYTE_VIEW_REINTERPRET,
+  IR_VALUE_BYTE_VIEW_READ_INT_LE,
+  IR_VALUE_BYTE_VIEW_READ_FLOAT_LE,
   IR_VALUE_BYTE_COPY,
   IR_VALUE_BYTE_FILL,
   IR_VALUE_CRC32_BYTES,
   IR_VALUE_FIXED_BUF_ALLOC,
+  IR_VALUE_PAGE_ALLOC,
   IR_VALUE_VEC_INIT,
   IR_VALUE_VEC_PUSH,
   IR_VALUE_VEC_LEN,
@@ -499,6 +507,8 @@ typedef enum {
   IR_VALUE_FS_DIR_ENTRY_COUNT,
   IR_VALUE_FS_TEMP_NAME,
   IR_VALUE_FS_ATOMIC_WRITE,
+  IR_VALUE_FS_MMAP,
+  IR_VALUE_FS_MUNMAP,
   IR_VALUE_JSON_PARSE_BYTES,
   IR_VALUE_JSON_VALIDATE_BYTES,
   IR_VALUE_JSON_STREAM_TOKENS_BYTES,
@@ -514,6 +524,14 @@ typedef enum {
   IR_VALUE_HTTP_HEADER_FOUND,
   IR_VALUE_HTTP_HEADER_OFFSET,
   IR_VALUE_HTTP_HEADER_LEN,
+  IR_VALUE_MATH_SQRTF,
+  IR_VALUE_MATH_EXPF,
+  IR_VALUE_MATH_COSF,
+  IR_VALUE_MATH_SINF,
+  IR_VALUE_MATH_POWF,
+  IR_VALUE_MATH_FABSF,
+  IR_VALUE_MATH_FLOORF,
+  IR_VALUE_MATH_ISNANF,
   IR_VALUE_FIELD_LOAD,
   IR_VALUE_CHECK,
   IR_VALUE_RESCUE
@@ -609,6 +627,8 @@ typedef struct {
   bool is_array;
   bool is_record;
   bool is_mutable;
+  bool is_page_alloc;
+  bool is_ref;
   char *shape_name;
   int line;
   int column;
@@ -668,6 +688,7 @@ typedef struct {
   size_t direct_runtime_helper_count;
   size_t direct_host_runtime_import_count;
   size_t direct_http_runtime_import_count;
+  size_t direct_math_runtime_import_count;
 } IrProgram;
 
 typedef struct {
@@ -738,6 +759,7 @@ typedef struct {
   size_t direct_runtime_helper_count;
   size_t direct_host_runtime_import_count;
   size_t direct_http_runtime_import_count;
+  size_t direct_math_runtime_import_count;
   bool parse_cache_hit;
   bool interface_cache_hit;
   bool check_cache_hit;
@@ -968,6 +990,7 @@ ZDirectExecutableTargetFacts z_direct_executable_target_facts(const ZTargetInfo 
 const char *z_direct_backend_expected(const ZTargetInfo *target);
 const char *z_direct_backend_help(const ZTargetInfo *target);
 void z_append_http_runtime_json(ZBuf *buf, const ZTargetInfo *target);
+void z_append_math_runtime_json(ZBuf *buf, const ZTargetInfo *target);
 void z_append_targets_json(ZBuf *buf);
 void z_append_target_names_json(ZBuf *buf);
 

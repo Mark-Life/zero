@@ -142,17 +142,49 @@ static Stmt *clone_stmt(const Stmt *stmt) {
   return copy;
 }
 
+static bool ir_parse_span_inner_type(const char *type, char **out_inner, bool *out_is_mut) {
+  if (!type) return false;
+  size_t type_len = strlen(type);
+  size_t prefix_len = 0;
+  bool is_mut = false;
+  if (type_len > 8 && strncmp(type, "MutSpan<", 8) == 0) {
+    prefix_len = 8;
+    is_mut = true;
+  } else if (type_len > 5 && strncmp(type, "Span<", 5) == 0) {
+    prefix_len = 5;
+  } else {
+    return false;
+  }
+  if (type[type_len - 1] != '>') return false;
+  const char *inner = type + prefix_len;
+  size_t inner_len = type_len - prefix_len - 1;
+  if (!is_mut && inner_len > 6 && strncmp(inner, "const ", 6) == 0) {
+    inner += 6;
+    inner_len -= 6;
+  }
+  if (inner_len == 0) return false;
+  for (size_t i = 0; i < inner_len; i++) {
+    if (inner[i] == '<' || inner[i] == '>' || inner[i] == ',') return false;
+  }
+  if (out_inner) *out_inner = z_strndup(inner, inner_len);
+  if (out_is_mut) *out_is_mut = is_mut;
+  return true;
+}
+
 static IrTypeKind ir_type_kind(const char *type) {
   if (!type) return IR_TYPE_UNSUPPORTED;
   if (strcmp(type, "Void") == 0) return IR_TYPE_VOID;
   if (strcmp(type, "Bool") == 0 || strcmp(type, "bool") == 0) return IR_TYPE_BOOL;
   if (strcmp(type, "u8") == 0) return IR_TYPE_U8;
+  if (strcmp(type, "i8") == 0) return IR_TYPE_I8;
   if (strcmp(type, "u16") == 0) return IR_TYPE_U16;
   if (strcmp(type, "usize") == 0) return IR_TYPE_USIZE;
   if (strcmp(type, "i32") == 0) return IR_TYPE_I32;
   if (strcmp(type, "u32") == 0) return IR_TYPE_U32;
   if (strcmp(type, "i64") == 0) return IR_TYPE_I64;
   if (strcmp(type, "u64") == 0) return IR_TYPE_U64;
+  if (strcmp(type, "f32") == 0) return IR_TYPE_F32;
+  if (strcmp(type, "f64") == 0) return IR_TYPE_F64;
   if (strcmp(type, "Duration") == 0) return IR_TYPE_I64;
   if (strcmp(type, "RandSource") == 0) return IR_TYPE_U32;
   if (strcmp(type, "ProcStatus") == 0) return IR_TYPE_I32;
@@ -162,17 +194,31 @@ static IrTypeKind ir_type_kind(const char *type) {
   if (strcmp(type, "HttpHeaderValue") == 0) return IR_TYPE_U64;
   if (strcmp(type, "Fs") == 0 || strcmp(type, "File") == 0 || strcmp(type, "owned<File>") == 0) return IR_TYPE_I32;
   if (strcmp(type, "String") == 0 ||
-      strcmp(type, "Span<u8>") == 0 ||
-      strcmp(type, "Span<const u8>") == 0 ||
-      strcmp(type, "MutSpan<u8>") == 0 ||
       strcmp(type, "ByteBuf") == 0 ||
-      strcmp(type, "owned<ByteBuf>") == 0) {
+      strcmp(type, "owned<ByteBuf>") == 0 ||
+      strcmp(type, "Mapping") == 0 ||
+      strcmp(type, "owned<Mapping>") == 0) {
     return IR_TYPE_BYTE_VIEW;
   }
-  if (strcmp(type, "FixedBufAlloc") == 0) return IR_TYPE_ALLOC;
+  {
+    // Span<T>/MutSpan<T> for any scalar element T lowers to a byte-view local; the element
+    // type rides separately (see ir_byte_view_element_type) and drives element-scaled indexing.
+    char *inner = NULL;
+    if (ir_parse_span_inner_type(type, &inner, NULL)) {
+      IrTypeKind element = ir_type_kind(inner);
+      free(inner);
+      if (element == IR_TYPE_U8 || element == IR_TYPE_I8 || element == IR_TYPE_I32 || element == IR_TYPE_U32 ||
+          element == IR_TYPE_I64 || element == IR_TYPE_U64 ||
+          element == IR_TYPE_F32 || element == IR_TYPE_F64) {
+        return IR_TYPE_BYTE_VIEW;
+      }
+      return IR_TYPE_UNSUPPORTED;
+    }
+  }
+  if (strcmp(type, "FixedBufAlloc") == 0 || strcmp(type, "PageAlloc") == 0) return IR_TYPE_ALLOC;
   if (strcmp(type, "Vec") == 0) return IR_TYPE_VEC;
   if (strcmp(type, "BufferedReader") == 0 || strcmp(type, "BufferedWriter") == 0) return IR_TYPE_BYTE_VIEW;
-  if (strcmp(type, "Maybe<MutSpan<u8>>") == 0 || strcmp(type, "Maybe<String>") == 0 || strcmp(type, "Maybe<owned<ByteBuf>>") == 0) return IR_TYPE_MAYBE_BYTE_VIEW;
+  if (strcmp(type, "Maybe<MutSpan<u8>>") == 0 || strcmp(type, "Maybe<String>") == 0 || strcmp(type, "Maybe<owned<ByteBuf>>") == 0 || strcmp(type, "Maybe<owned<Mapping>>") == 0) return IR_TYPE_MAYBE_BYTE_VIEW;
   if (strcmp(type, "Maybe<JsonDoc>") == 0 ||
       strcmp(type, "Maybe<u8>") == 0 ||
       strcmp(type, "Maybe<u16>") == 0 ||
@@ -181,6 +227,27 @@ static IrTypeKind ir_type_kind(const char *type) {
       strcmp(type, "Maybe<u32>") == 0 ||
       strcmp(type, "Maybe<owned<File>>") == 0) return IR_TYPE_MAYBE_SCALAR;
   return IR_TYPE_UNSUPPORTED;
+}
+
+static IrTypeKind ir_byte_view_element_type(const char *type) {
+  if (!type) return IR_TYPE_U8;
+  char *inner = NULL;
+  if (!ir_parse_span_inner_type(type, &inner, NULL)) return IR_TYPE_U8;
+  IrTypeKind kind = ir_type_kind(inner);
+  free(inner);
+  switch (kind) {
+    case IR_TYPE_U8:
+    case IR_TYPE_I8:
+    case IR_TYPE_I32:
+    case IR_TYPE_U32:
+    case IR_TYPE_I64:
+    case IR_TYPE_U64:
+    case IR_TYPE_F32:
+    case IR_TYPE_F64:
+      return kind;
+    default:
+      return IR_TYPE_U8;
+  }
 }
 
 static int ir_std_http_error_code(const char *name) {
@@ -199,8 +266,12 @@ static int ir_std_http_error_code(const char *name) {
   return -1;
 }
 
+static bool ir_type_is_float(IrTypeKind type) {
+  return type == IR_TYPE_F32 || type == IR_TYPE_F64;
+}
+
 static bool ir_type_is_value(IrTypeKind type) {
-  return type == IR_TYPE_U8 || type == IR_TYPE_U16 || type == IR_TYPE_USIZE || type == IR_TYPE_I32 || type == IR_TYPE_U32 || type == IR_TYPE_I64 || type == IR_TYPE_U64;
+  return type == IR_TYPE_U8 || type == IR_TYPE_I8 || type == IR_TYPE_U16 || type == IR_TYPE_USIZE || type == IR_TYPE_I32 || type == IR_TYPE_U32 || type == IR_TYPE_I64 || type == IR_TYPE_U64 || ir_type_is_float(type);
 }
 
 static bool ir_type_is_direct_local(IrTypeKind type) {
@@ -209,17 +280,26 @@ static bool ir_type_is_direct_local(IrTypeKind type) {
 }
 
 static bool ir_type_is_direct_abi(IrTypeKind type) {
-  return type == IR_TYPE_BOOL || ir_type_is_value(type);
+  // Records ride the direct ABI by reference: a by-value record param is passed as a
+  // pointer to a pre-materialized caller-side local; a record return uses sret (indirect
+  // result register). Span<T>/MutSpan<T> (BYTE_VIEW) returns/args ride as a ptr+len pair.
+  // Backends pick up the marshaling from local_index + callee shape.
+  return type == IR_TYPE_BOOL || ir_type_is_value(type) || type == IR_TYPE_RECORD || type == IR_TYPE_BYTE_VIEW;
 }
 
 static bool ir_type_is_direct_param_abi(IrTypeKind type) {
-  return ir_type_is_direct_abi(type) || type == IR_TYPE_BYTE_VIEW;
+  return ir_type_is_direct_abi(type);
 }
 
 static bool ir_type_is_direct_fallible_value(IrTypeKind type) {
-  return type == IR_TYPE_VOID || type == IR_TYPE_BOOL || type == IR_TYPE_U8 ||
-         type == IR_TYPE_U16 || type == IR_TYPE_USIZE || type == IR_TYPE_I32 ||
-         type == IR_TYPE_U32;
+  // A fallible result carries an ok/err tag in the high 32 bits of the value register
+  // (rax/x0); a float result instead rides xmm0/v0 while the tag stays in that GPR. Either
+  // way the carrier covers the direct-ABI value set, so fallible returns match plain ones.
+  // Records also raise: the record flows through sret as usual, and the tag rides in
+  // the low 32 bits of the second-return register (x1/rdx) — a register that is otherwise free
+  // for record returns (it is the span len for span returns, which stay excluded). Byte-views
+  // remain excluded since their second-return register IS the len pair register.
+  return type != IR_TYPE_BYTE_VIEW && (type == IR_TYPE_VOID || type == IR_TYPE_RECORD || ir_type_is_direct_abi(type));
 }
 
 static IrTypeKind ir_maybe_scalar_element_type(const char *type) {
@@ -244,6 +324,7 @@ static unsigned ir_error_code_for_name(const char *name) {
 static const EnumDecl *ir_find_enum(const Program *program, const char *name);
 static IrTypeKind ir_type_kind_for_program(const Program *program, const char *type);
 static bool ir_parse_fixed_array_type_for_program(const Program *program, const char *type, unsigned *out_len, IrTypeKind *out_element);
+static bool ir_shape_layout(const Program *program, const char *shape_name, unsigned *out_size, unsigned *out_align);
 
 static const Shape *ir_find_shape(const Program *program, const char *name) {
   if (!program || !name) return NULL;
@@ -353,9 +434,46 @@ static const EnumDecl *ir_find_enum(const Program *program, const char *name) {
   return NULL;
 }
 
+// Detect `ref<T>` / `mutref<T>` wrappers and write the inner type into out_inner.
+// Returns true if matched; out_is_mut is set to true for mutref. out_inner is a heap-allocated
+// copy that the caller must free. Records-only scope is enforced at the call site (param
+// collection) — this helper just parses the wrapper.
+static bool ir_is_ref_record_type(const Program *program, const char *type, bool *out_is_mut, char **out_inner) {
+  if (!type) return false;
+  const char *prefix = NULL;
+  bool is_mut = false;
+  if (strncmp(type, "mutref<", 7) == 0) { prefix = "mutref<"; is_mut = true; }
+  else if (strncmp(type, "ref<", 4) == 0) { prefix = "ref<"; }
+  else return false;
+  size_t prefix_len = strlen(prefix);
+  size_t total = strlen(type);
+  if (total <= prefix_len + 1 || type[total - 1] != '>') return false;
+  size_t inner_len = total - prefix_len - 1;
+  char *inner = z_checked_malloc(inner_len + 1);
+  memcpy(inner, type + prefix_len, inner_len);
+  inner[inner_len] = '\0';
+  // Inner must be a known shape (record). The records-only gate: scalar/byte-view
+  // ref<T> is rejected by the caller after we report the unwrapped inner is not a record.
+  unsigned record_size = 0, record_align = 0;
+  bool is_record = program && ir_shape_layout(program, inner, &record_size, &record_align);
+  if (out_is_mut) *out_is_mut = is_mut;
+  if (out_inner) *out_inner = inner;
+  else free(inner);
+  // Returning true even when not a record so the caller can produce a scope-specific message
+  // (e.g. "ref<scalar> deferred"). The caller verifies is_record via ir_shape_layout itself.
+  (void)is_record;
+  return true;
+}
+
 static IrTypeKind ir_type_kind_for_program(const Program *program, const char *type) {
   IrTypeKind kind = ir_type_kind(type);
   if (kind != IR_TYPE_UNSUPPORTED) return kind;
+  // Named shapes declared via `type X` resolve to IR_TYPE_RECORD; backends pick up
+  // size/align/shape_name from the local (or callee return shape) at marshal time.
+  unsigned record_size = 0, record_align = 0;
+  if (program && type && ir_shape_layout(program, type, &record_size, &record_align)) {
+    return IR_TYPE_RECORD;
+  }
   const EnumDecl *item_enum = ir_find_enum(program, type);
   if (!item_enum) return IR_TYPE_UNSUPPORTED;
   IrTypeKind backing = ir_type_kind(item_enum->type ? item_enum->type : "u8");
@@ -386,13 +504,16 @@ static bool ir_enum_case_value(const EnumDecl *item_enum, const char *case_name,
 static unsigned ir_type_byte_size(IrTypeKind type) {
   switch (type) {
     case IR_TYPE_BOOL:
-    case IR_TYPE_U8: return 1;
+    case IR_TYPE_U8:
+    case IR_TYPE_I8: return 1;
     case IR_TYPE_U16: return 2;
     case IR_TYPE_I32:
     case IR_TYPE_USIZE:
-    case IR_TYPE_U32: return 4;
+    case IR_TYPE_U32:
+    case IR_TYPE_F32: return 4;
     case IR_TYPE_I64:
-    case IR_TYPE_U64: return 8;
+    case IR_TYPE_U64:
+    case IR_TYPE_F64: return 8;
     default: return 0;
   }
 }
@@ -410,6 +531,36 @@ static size_t ir_align_to(size_t value, size_t alignment) {
   return remainder == 0 ? value : value + (alignment - remainder);
 }
 
+// Layout of a single record field. Returns false if the field type has no fixed direct-ABI
+// layout (e.g. an unknown shape, an enum-without-fixed-size, etc.). Fat-pointer/handle field
+// types (Span/MutSpan/Alloc/Vec/Maybe<scalar>/Maybe<owned<...>>) use the same {ptr@0, len@8}
+// pair layout that the local table uses for top-level locals, so the backend reads/writes
+// them with the same two 8-byte slots.
+static bool ir_shape_field_layout_bytes(IrTypeKind field_type, bool is_array, IrTypeKind element_type, unsigned array_len, unsigned *out_size, unsigned *out_align) {
+  if (is_array) {
+    unsigned sz = ir_type_byte_size(element_type);
+    if (sz == 0 || array_len == 0) return false;
+    *out_align = ir_type_alignment(element_type);
+    *out_size = sz * array_len;
+    return true;
+  }
+  if (field_type == IR_TYPE_BOOL || ir_type_is_value(field_type)) {
+    unsigned sz = ir_type_byte_size(field_type);
+    if (sz == 0) return false;
+    *out_align = ir_type_alignment(field_type);
+    *out_size = sz;
+    return true;
+  }
+  if (field_type == IR_TYPE_BYTE_VIEW || field_type == IR_TYPE_ALLOC ||
+      field_type == IR_TYPE_VEC || field_type == IR_TYPE_MAYBE_SCALAR) {
+    *out_align = 8; *out_size = 16; return true;
+  }
+  if (field_type == IR_TYPE_MAYBE_BYTE_VIEW) {
+    *out_align = 8; *out_size = 24; return true;
+  }
+  return false;
+}
+
 static bool ir_shape_layout(const Program *program, const char *shape_name, unsigned *out_size, unsigned *out_align) {
   const Shape *shape = NULL;
   TypeArgVec args = {0};
@@ -422,13 +573,12 @@ static bool ir_shape_layout(const Program *program, const char *shape_name, unsi
     unsigned array_len = 0;
     IrTypeKind element_type = IR_TYPE_UNSUPPORTED;
     bool is_array = ir_parse_fixed_array_type_for_program(program, field_type_text, &array_len, &element_type);
-    if (!(field_type == IR_TYPE_BOOL || ir_type_is_value(field_type) || is_array)) {
+    unsigned align = 0, byte_size = 0;
+    if (!ir_shape_field_layout_bytes(field_type, is_array, element_type, array_len, &byte_size, &align)) {
       free(field_type_text);
       ir_type_arg_vec_free(&args);
       return false;
     }
-    unsigned align = is_array ? ir_type_alignment(element_type) : ir_type_alignment(field_type);
-    unsigned byte_size = is_array ? ir_type_byte_size(element_type) * array_len : ir_type_byte_size(field_type);
     free(field_type_text);
     offset = ir_align_to(offset, align);
     offset += byte_size;
@@ -453,13 +603,12 @@ static bool ir_shape_field_info(const Program *program, const char *shape_name, 
     unsigned array_len = 0;
     IrTypeKind element_type = IR_TYPE_UNSUPPORTED;
     bool is_array = ir_parse_fixed_array_type_for_program(program, field_type_text, &array_len, &element_type);
-    if (!(field_type == IR_TYPE_BOOL || ir_type_is_value(field_type) || is_array)) {
+    unsigned align = 0, byte_size = 0;
+    if (!ir_shape_field_layout_bytes(field_type, is_array, element_type, array_len, &byte_size, &align)) {
       free(field_type_text);
       ir_type_arg_vec_free(&args);
       return false;
     }
-    unsigned align = is_array ? ir_type_alignment(element_type) : ir_type_alignment(field_type);
-    unsigned byte_size = is_array ? ir_type_byte_size(element_type) * array_len : ir_type_byte_size(field_type);
     offset = ir_align_to(offset, align);
     if (strcmp(field->name, field_name) == 0) {
       free(field_type_text);
@@ -491,13 +640,12 @@ static bool ir_shape_field_storage_info(const Program *program, const char *shap
     unsigned array_len = 0;
     IrTypeKind element_type = IR_TYPE_UNSUPPORTED;
     bool is_array = ir_parse_fixed_array_type_for_program(program, field_type_text, &array_len, &element_type);
-    if (!(field_type == IR_TYPE_BOOL || ir_type_is_value(field_type) || is_array)) {
+    unsigned align = 0, byte_size = 0;
+    if (!ir_shape_field_layout_bytes(field_type, is_array, element_type, array_len, &byte_size, &align)) {
       free(field_type_text);
       ir_type_arg_vec_free(&args);
       return false;
     }
-    unsigned align = is_array ? ir_type_alignment(element_type) : ir_type_alignment(field_type);
-    unsigned byte_size = is_array ? ir_type_byte_size(element_type) * array_len : ir_type_byte_size(field_type);
     offset = ir_align_to(offset, align);
     if (strcmp(field->name, field_name) == 0) {
       free(field_type_text);
@@ -566,6 +714,28 @@ static void ir_mark_unsupported(IrProgram *ir, const char *message, int line, in
   snprintf(ir->mir_actual, sizeof(ir->mir_actual), "%s", actual ? actual : "unsupported construct");
   snprintf(ir->mir_help, sizeof(ir->mir_help), "restrict this program to exported primitive arithmetic functions or choose another supported direct target");
   z_backend_blocker_set(&ir->backend_blocker, NULL, NULL, NULL, "lower", ir->mir_actual);
+}
+
+static bool ir_parse_float_literal(const char *text, IrTypeKind type, unsigned long long *out) {
+  if (!text || !text[0]) return false;
+  char *end = NULL;
+  double parsed = strtod(text, &end);
+  if (!end || *end != 0) return false;
+  unsigned long long bits = 0;
+  if (type == IR_TYPE_F32) {
+    float narrowed = (float)parsed;
+    uint32_t pattern = 0;
+    memcpy(&pattern, &narrowed, sizeof(pattern));
+    bits = pattern;
+  } else if (type == IR_TYPE_F64) {
+    uint64_t pattern = 0;
+    memcpy(&pattern, &parsed, sizeof(pattern));
+    bits = pattern;
+  } else {
+    return false;
+  }
+  if (out) *out = bits;
+  return true;
 }
 
 static bool ir_parse_integer_literal(const char *text, unsigned long long *out) {
@@ -722,12 +892,43 @@ static void ir_function_push_local(IrProgram *ir, IrFunction *fun, const char *n
     .is_array = is_array,
     .is_record = is_record,
     .is_mutable = is_mutable,
+    .is_ref = false,
     .shape_name = shape_name ? z_strdup(shape_name) : NULL,
     .line = line,
     .column = column
   };
   fun->local_len++;
   if (is_param) fun->param_count++;
+}
+
+// Push a ref-record param local. The local's slot is the full record size (so MIR
+// field-span validation passes for any field offset), but the backend prologue only writes
+// the caller's pointer into the first 8 bytes — field loads/stores go through that pointer.
+// `is_mutable` distinguishes mutref (true) from ref (false). The wasted frame bytes beyond
+// the first 8 are a small ergonomic cost we accept to keep the existing field-span contract.
+static void ir_function_push_ref_record_local(IrProgram *ir, IrFunction *fun, const char *name, const char *shape_name, bool is_mutable, unsigned record_size, unsigned record_align, int line, int column) {
+  fun->locals = ir_grow_tracked_items(ir, fun->locals, fun->local_len, &fun->local_cap, 4, sizeof(IrLocal));
+  unsigned byte_size = record_size < 8 ? 8 : record_size;
+  unsigned alignment = record_align < 8 ? 8 : record_align;
+  fun->locals[fun->local_len] = (IrLocal){
+    .name = z_strdup(name),
+    .type = IR_TYPE_RECORD,
+    .element_type = IR_TYPE_UNSUPPORTED,
+    .index = (unsigned)fun->local_len,
+    .array_len = 0,
+    .byte_size = byte_size,
+    .alignment = alignment,
+    .is_param = true,
+    .is_array = false,
+    .is_record = true,
+    .is_mutable = is_mutable,
+    .is_ref = true,
+    .shape_name = shape_name ? z_strdup(shape_name) : NULL,
+    .line = line,
+    .column = column
+  };
+  fun->local_len++;
+  fun->param_count++;
 }
 
 static const IrLocal *ir_function_find_local(const IrFunction *fun, const char *name) {
@@ -746,6 +947,52 @@ static const Function *ir_find_source_function(const Program *program, const cha
     }
   }
   return NULL;
+}
+
+// Discarded record-returning call as a bare expression statement (`f()` with no `let`).
+// Both the local-collection pass and the lowering pass must agree on the synthetic local
+// name; line+column is unique per stmt site and stable across the two walks.
+static int ir_format_discard_local_name(char *buf, size_t buf_size, int line, int column) {
+  return snprintf(buf, buf_size, "__zero_discard__L%d_C%d__", line, column);
+}
+
+// Identify a STMT_EXPR whose call returns a same-file user record; the discarded result
+// rides through a synthetic record local (sret target). Generic and raising callees are
+// excluded — generics need specialized-name resolution; raising record callees route through
+// `check`/`rescue` instead (`f()` alone is not a fallible site).
+static const Function *ir_stmt_expr_discard_record_callee(const Program *program, const Stmt *stmt) {
+  if (!program || !stmt || stmt->kind != STMT_EXPR) return NULL;
+  const Expr *expr = stmt->expr;
+  if (!expr || expr->kind != EXPR_CALL) return NULL;
+  if (!expr->left || expr->left->kind != EXPR_IDENT) return NULL;
+  const Function *callee = ir_find_source_function(program, expr->left->text, NULL);
+  if (!callee || callee->type_params.len > 0) return NULL;
+  if (callee->raises) return NULL;
+  if (!callee->return_type) return NULL;
+  unsigned size = 0;
+  unsigned align = 0;
+  if (!ir_shape_layout(program, callee->return_type, &size, &align)) return NULL;
+  return callee;
+}
+
+// Identify a STMT_CHECK whose checked expression is a record-returning raising
+// call (`check f()` discarded — no `let`). The result rides through a synthetic record local so
+// the callee has a concrete sret target; the CHECK wrapper on the LOCAL_SET then routes the
+// fallible-tag propagation. Generic callees are excluded for the same reason as the STMT_EXPR
+// sibling.
+static const Function *ir_stmt_check_discard_record_callee(const Program *program, const Stmt *stmt) {
+  if (!program || !stmt || stmt->kind != STMT_CHECK) return NULL;
+  const Expr *expr = stmt->expr;
+  if (!expr || expr->kind != EXPR_CALL) return NULL;
+  if (!expr->left || expr->left->kind != EXPR_IDENT) return NULL;
+  const Function *callee = ir_find_source_function(program, expr->left->text, NULL);
+  if (!callee || callee->type_params.len > 0) return NULL;
+  if (!callee->raises) return NULL;
+  if (!callee->return_type) return NULL;
+  unsigned size = 0;
+  unsigned align = 0;
+  if (!ir_shape_layout(program, callee->return_type, &size, &align)) return NULL;
+  return callee;
 }
 
 static bool ir_find_function_index(const IrProgram *ir, const char *name, unsigned *out_index) {
@@ -964,6 +1211,19 @@ static bool ir_lower_string_literal_byte_view(IrProgram *ir, const Expr *expr, I
   return true;
 }
 
+static bool ir_byte_view_reinterpret_element(const char *callee, IrTypeKind *out) {
+  if (!callee) return false;
+  if (strcmp(callee, "std.mem.bytesAsF32") == 0 || strcmp(callee, "std.mem.bytesAsMutF32") == 0) { if (out) *out = IR_TYPE_F32; return true; }
+  if (strcmp(callee, "std.mem.bytesAsF64") == 0 || strcmp(callee, "std.mem.bytesAsMutF64") == 0) { if (out) *out = IR_TYPE_F64; return true; }
+  if (strcmp(callee, "std.mem.bytesAsI32") == 0 || strcmp(callee, "std.mem.bytesAsMutI32") == 0) { if (out) *out = IR_TYPE_I32; return true; }
+  if (strcmp(callee, "std.mem.bytesAsU32") == 0 || strcmp(callee, "std.mem.bytesAsMutU32") == 0) { if (out) *out = IR_TYPE_U32; return true; }
+  if (strcmp(callee, "std.mem.bytesAsI8") == 0 || strcmp(callee, "std.mem.bytesAsMutI8") == 0) { if (out) *out = IR_TYPE_I8; return true; }
+  if (strcmp(callee, "std.mem.bytesAsI64") == 0 || strcmp(callee, "std.mem.bytesAsMutI64") == 0) { if (out) *out = IR_TYPE_I64; return true; }
+  if (strcmp(callee, "std.mem.bytesAsU64") == 0 || strcmp(callee, "std.mem.bytesAsMutU64") == 0) { if (out) *out = IR_TYPE_U64; return true; }
+  if (strcmp(callee, "std.mem.bytesAsU8") == 0 || strcmp(callee, "std.mem.bytesAsMutU8") == 0) { if (out) *out = IR_TYPE_U8; return true; }
+  return false;
+}
+
 static bool ir_lower_byte_view(const Program *program, IrProgram *ir, const IrFunction *fun, const Expr *expr, IrValue **out) {
   if (!expr) {
     ir_mark_unsupported(ir, "direct backend byte view is missing", 1, 1, "missing expression");
@@ -977,11 +1237,29 @@ static bool ir_lower_byte_view(const Program *program, IrProgram *ir, const IrFu
     char *callee = ir_expr_callee_name(expr->left);
     bool member_span = expr->left && expr->left->kind == EXPR_MEMBER && strcmp(expr->left->text ? expr->left->text : "", "span") == 0;
     bool member_buf_bytes = expr->left && expr->left->kind == EXPR_MEMBER && strcmp(expr->left->text ? expr->left->text : "", "bufBytes") == 0;
+    bool member_mapping_bytes = expr->left && expr->left->kind == EXPR_MEMBER && strcmp(expr->left->text ? expr->left->text : "", "mappingBytes") == 0;
     bool is_span = (callee && strcmp(callee, "std.mem.span") == 0) || member_span;
-    bool is_buf_bytes = (callee && strcmp(callee, "std.mem.bufBytes") == 0) || member_buf_bytes;
+    // std.fs.mappingBytes(&m) borrows a Mapping local's byte-view slot as a Span<u8> — identical
+    // lowering shape to std.mem.bufBytes (a borrowed byte-view local -> IR_VALUE_LOCAL).
+    bool is_buf_bytes = (callee && strcmp(callee, "std.mem.bufBytes") == 0) || member_buf_bytes ||
+                        (callee && strcmp(callee, "std.fs.mappingBytes") == 0) || member_mapping_bytes;
     bool is_io_buffer = callee && (strcmp(callee, "std.io.bufferedReader") == 0 || strcmp(callee, "std.io.bufferedWriter") == 0);
+    IrTypeKind reinterpret_elem = IR_TYPE_VOID;
+    bool is_reinterpret = ir_byte_view_reinterpret_element(callee, &reinterpret_elem);
     free(callee);
     if (is_span || is_io_buffer) return ir_lower_byte_view(program, ir, fun, expr->args.items[0], out);
+    if (is_reinterpret) {
+      // bytesAs*/bytesAsMut* reinterpret a Span<u8>/MutSpan<u8> byte view as a typed span: the
+      // pointer is unchanged and the element count becomes byteLen / sizeof(T) (computed lazily
+      // by the backend's byte-view-len handler when this value is consumed).
+      IrValue *inner = NULL;
+      if (!ir_lower_byte_view(program, ir, fun, expr->args.items[0], &inner)) return false;
+      IrValue *value = ir_new_value(ir, IR_VALUE_BYTE_VIEW_REINTERPRET, IR_TYPE_BYTE_VIEW, expr->line, expr->column);
+      value->left = inner;
+      value->element_type = reinterpret_elem;
+      *out = value;
+      return true;
+    }
     if (is_buf_bytes) {
       const Expr *arg = expr->args.items[0];
       if (arg && arg->kind == EXPR_BORROW) arg = arg->left;
@@ -1013,10 +1291,15 @@ static bool ir_lower_byte_view(const Program *program, IrProgram *ir, const IrFu
       *out = value;
       return true;
     }
-    if (local && local->is_array && local->element_type == IR_TYPE_U8) {
+    if (local && local->is_array) {
+      // Typed-span-from-array binding for any supported element type. The byte-view
+      // ptr is `&arr[0]`; the len carries the element count (NOT the byte count), so a
+      // `Span<i32>` of `[5]i32` has len=5. element_type rides on the value so element-scaled
+      // INDEX_LOAD/STORE / sized slicing work consistently with the BYTE_VIEW_REINTERPRET path.
       IrValue *value = ir_new_value(ir, IR_VALUE_ARRAY_BYTE_VIEW, IR_TYPE_BYTE_VIEW, expr->line, expr->column);
       value->array_index = local->index;
       value->data_len = local->array_len;
+      value->element_type = local->element_type;
       *out = value;
       return true;
     }
@@ -1037,7 +1320,18 @@ static bool ir_lower_byte_view(const Program *program, IrProgram *ir, const IrFu
     return true;
   }
   if (expr->kind == EXPR_SLICE) {
-    if (!ir_expr_is_byte_view_source(expr->left)) {
+    // Typed-array slicing (`arr[a..b]` where arr is [N]T, T != u8) also produces a span,
+    // alongside the existing byte-view sources (Span<u8>, string literals, [N]u8 fixed buffers).
+    bool typed_array_slice = false;
+    if (expr->left && expr->left->resolved_type) {
+      unsigned array_len = 0;
+      IrTypeKind element_type = IR_TYPE_UNSUPPORTED;
+      if (ir_parse_fixed_array_type(expr->left->resolved_type, &array_len, &element_type) &&
+          ir_type_is_value(element_type) && element_type != IR_TYPE_U8) {
+        typed_array_slice = true;
+      }
+    }
+    if (!typed_array_slice && !ir_expr_is_byte_view_source(expr->left)) {
       ir_mark_unsupported(ir, "direct backend slicing currently supports only string literal byte views", expr->line, expr->column, "non-string slice base");
       return false;
     }
@@ -1067,8 +1361,22 @@ static bool ir_lower_byte_view(const Program *program, IrProgram *ir, const IrFu
     value->left = base;
     value->index = start;
     value->right = end;
+    // Element type rides the slice so the backend scales the start offset by sizeof(T); the slice
+    // bounds are in element units, so the element count (end - start) needs no further scaling.
+    value->element_type = expr->resolved_type ? ir_byte_view_element_type(expr->resolved_type) : IR_TYPE_U8;
     *out = value;
     return true;
+  }
+  // Fallback: any expression whose generic lowering produces a BYTE_VIEW value works as a
+  // byte-view source. Covers user-defined functions returning Span<T>/MutSpan<T> and record
+  // field loads of span-typed fields (e.g. `sampler.prob` where Sampler holds MutSpan<f32>).
+  if (expr->kind == EXPR_CALL || expr->kind == EXPR_MEMBER) {
+    IrValue *call_value = NULL;
+    if (ir_lower_expr(program, ir, fun, expr, &call_value) && call_value && call_value->type == IR_TYPE_BYTE_VIEW) {
+      *out = call_value;
+      return true;
+    }
+    if (call_value) ir_free_value(call_value);
   }
   ir_mark_unsupported(ir, "direct backend byte views currently support string literals and slices", expr->line, expr->column, "unsupported byte view source");
   return false;
@@ -1190,6 +1498,17 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
         ir_mark_unsupported(ir, "direct backend numeric expression type is unsupported", expr->line, expr->column, expr->resolved_type);
         return false;
       }
+      if (ir_type_is_float(type)) {
+        unsigned long long bits = 0;
+        if (!ir_parse_float_literal(expr->text, type, &bits)) {
+          ir_mark_unsupported(ir, "direct backend float literal is malformed", expr->line, expr->column, expr->text);
+          return false;
+        }
+        IrValue *value = ir_new_value(ir, IR_VALUE_FLOAT, type, expr->line, expr->column);
+        value->int_value = bits;
+        *out = value;
+        return true;
+      }
       unsigned long long parsed = 0;
       if (!ir_parse_integer_literal(expr->text, &parsed)) {
         ir_mark_unsupported(ir, "direct backend integer literal is malformed", expr->line, expr->column, expr->text);
@@ -1305,6 +1624,27 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
           return true;
         }
       }
+      if (expr->left && expr->left->kind == EXPR_IDENT) {
+        const IrLocal *span_local = ir_function_find_local(fun, expr->left->text);
+        // Typed-span element read (Span<T>/MutSpan<T>, T != u8): an element-scaled INDEX_LOAD keyed
+        // on the local's element_type. u8 byte-view reads fall through to the BYTE_VIEW_INDEX_LOAD
+        // path below, which every object backend handles.
+        if (span_local && span_local->type == IR_TYPE_BYTE_VIEW && span_local->element_type != IR_TYPE_U8 &&
+            ir_type_is_value(span_local->element_type)) {
+          IrValue *index = NULL;
+          if (!ir_lower_expr(program, ir, fun, expr->right, &index)) return false;
+          if (!ir_type_is_value(index->type)) {
+            ir_free_value(index);
+            ir_mark_unsupported(ir, "direct backend span index must be an integer value", expr->line, expr->column, "non-integer index");
+            return false;
+          }
+          IrValue *value = ir_new_value(ir, IR_VALUE_INDEX_LOAD, span_local->element_type, expr->line, expr->column);
+          value->array_index = span_local->index;
+          value->index = index;
+          *out = value;
+          return true;
+        }
+      }
       if (ir_expr_is_byte_view_source(expr->left)) {
         IrValue *view = NULL;
         IrValue *index = NULL;
@@ -1402,6 +1742,72 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
         *out = ir_new_integer_literal_value(ir, IR_TYPE_USIZE, len, expr->line, expr->column);
         return true;
       }
+      if ((strcmp(callee_name, "std.codec.readF32Le") == 0 ||
+           strcmp(callee_name, "std.codec.readF64Le") == 0) &&
+          expr->args.len == 2) {
+        IrTypeKind type = strcmp(callee_name, "std.codec.readF64Le") == 0 ? IR_TYPE_F64 : IR_TYPE_F32;
+        IrValue *view = NULL;
+        if (!ir_lower_byte_view(program, ir, fun, expr->args.items[0], &view)) {
+          free(callee_name);
+          return false;
+        }
+        IrValue *offset = NULL;
+        if (!ir_lower_expr(program, ir, fun, expr->args.items[1], &offset)) {
+          ir_free_value(view);
+          free(callee_name);
+          return false;
+        }
+        if (!ir_type_is_value(offset->type)) {
+          ir_free_value(view);
+          ir_free_value(offset);
+          free(callee_name);
+          ir_mark_unsupported(ir, "direct backend std.codec.readF*Le offset must be an integer value", expr->line, expr->column, "non-integer offset");
+          return false;
+        }
+        free(callee_name);
+        IrValue *value = ir_new_value(ir, IR_VALUE_BYTE_VIEW_READ_FLOAT_LE, type, expr->line, expr->column);
+        value->left = view;
+        value->index = offset;
+        value->element_type = type;
+        *out = value;
+        return true;
+      }
+      {
+        IrTypeKind int_le_type = IR_TYPE_I32;
+        bool is_int_le = false;
+        if (strcmp(callee_name, "std.codec.readI32Le") == 0) { int_le_type = IR_TYPE_I32; is_int_le = true; }
+        else if (strcmp(callee_name, "std.codec.readU32Le") == 0) { int_le_type = IR_TYPE_U32; is_int_le = true; }
+        else if (strcmp(callee_name, "std.codec.readU16Le") == 0) { int_le_type = IR_TYPE_U16; is_int_le = true; }
+        else if (strcmp(callee_name, "std.codec.readI64Le") == 0) { int_le_type = IR_TYPE_I64; is_int_le = true; }
+        else if (strcmp(callee_name, "std.codec.readU64Le") == 0) { int_le_type = IR_TYPE_U64; is_int_le = true; }
+        if (is_int_le && expr->args.len == 2) {
+          IrValue *view = NULL;
+          if (!ir_lower_byte_view(program, ir, fun, expr->args.items[0], &view)) {
+            free(callee_name);
+            return false;
+          }
+          IrValue *offset = NULL;
+          if (!ir_lower_expr(program, ir, fun, expr->args.items[1], &offset)) {
+            ir_free_value(view);
+            free(callee_name);
+            return false;
+          }
+          if (!ir_type_is_value(offset->type)) {
+            ir_free_value(view);
+            ir_free_value(offset);
+            free(callee_name);
+            ir_mark_unsupported(ir, "direct backend std.codec.read*Le offset must be an integer value", expr->line, expr->column, "non-integer offset");
+            return false;
+          }
+          free(callee_name);
+          IrValue *value = ir_new_value(ir, IR_VALUE_BYTE_VIEW_READ_INT_LE, int_le_type, expr->line, expr->column);
+          value->left = view;
+          value->index = offset;
+          value->element_type = int_le_type;
+          *out = value;
+          return true;
+        }
+      }
       if (strncmp(callee_name, "std.parse.", strlen("std.parse.")) == 0 && expr->args.len == 1) {
         const unsigned char *bytes = NULL;
         size_t len = 0;
@@ -1464,6 +1870,16 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
           return true;
         }
       }
+      if (strcmp(callee_name, "std.mem.pageAlloc") == 0 && expr->args.len == 0) {
+        // A PageAlloc carries no pre-reserved buffer: each std.mem.allocBytes performs a fresh
+        // anonymous mmap (calloc semantics). The value just zeroes the allocator slot; the
+        // is_page_alloc flag on the receiving local routes allocBytes to the mmap path.
+        IrValue *value = ir_new_value(ir, IR_VALUE_PAGE_ALLOC, IR_TYPE_ALLOC, expr->line, expr->column);
+        ir->direct_allocator_helper_count = ir->direct_allocator_helper_count < 1 ? 1 : ir->direct_allocator_helper_count;
+        free(callee_name);
+        *out = value;
+        return true;
+      }
       if (strcmp(callee_name, "std.mem.fixedBufAlloc") == 0 &&
           expr->args.len == 1 &&
           ir_expr_is_mutable_byte_view_dest(fun, expr->args.items[0])) {
@@ -1484,9 +1900,9 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
           expr->args.items[0] &&
           expr->args.items[0]->kind == EXPR_IDENT) {
         const IrLocal *alloc = ir_function_find_local(fun, expr->args.items[0]->text);
-        if (!alloc || alloc->type != IR_TYPE_ALLOC || !alloc->is_mutable) {
+        if (!alloc || alloc->type != IR_TYPE_ALLOC || (!alloc->is_mutable && !alloc->is_page_alloc)) {
           free(callee_name);
-          ir_mark_unsupported(ir, "direct backend std.mem.allocBytes expects a mutable FixedBufAlloc local", expr->args.items[0]->line, expr->args.items[0]->column, "non-mutable allocator");
+          ir_mark_unsupported(ir, "direct backend std.mem.allocBytes expects a mutable FixedBufAlloc or a PageAlloc local", expr->args.items[0]->line, expr->args.items[0]->column, "non-mutable allocator");
           return false;
         }
         IrValue *len = NULL;
@@ -1877,6 +2293,71 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
         *out = value;
         return true;
       }
+      if ((strcmp(callee_name, "std.math.piF") == 0 ||
+           strcmp(callee_name, "std.math.eF") == 0 ||
+           strcmp(callee_name, "std.math.infinityF") == 0 ||
+           strcmp(callee_name, "std.math.nanF") == 0) && expr->args.len == 0) {
+        unsigned long long bits = 0;
+        if (strcmp(callee_name, "std.math.piF") == 0) bits = 0x40490fdbull;
+        else if (strcmp(callee_name, "std.math.eF") == 0) bits = 0x402df854ull;
+        else if (strcmp(callee_name, "std.math.infinityF") == 0) bits = 0x7f800000ull;
+        else bits = 0x7fc00000ull;
+        IrValue *value = ir_new_value(ir, IR_VALUE_FLOAT, IR_TYPE_F32, expr->line, expr->column);
+        value->int_value = bits;
+        free(callee_name);
+        *out = value;
+        return true;
+      }
+      {
+        IrValueKind math_kind = IR_VALUE_FLOAT;
+        int math_arity = 0;
+        if (strcmp(callee_name, "std.math.sqrtf") == 0) { math_kind = IR_VALUE_MATH_SQRTF; math_arity = 1; }
+        else if (strcmp(callee_name, "std.math.expf") == 0) { math_kind = IR_VALUE_MATH_EXPF; math_arity = 1; }
+        else if (strcmp(callee_name, "std.math.cosf") == 0) { math_kind = IR_VALUE_MATH_COSF; math_arity = 1; }
+        else if (strcmp(callee_name, "std.math.sinf") == 0) { math_kind = IR_VALUE_MATH_SINF; math_arity = 1; }
+        else if (strcmp(callee_name, "std.math.absf") == 0) { math_kind = IR_VALUE_MATH_FABSF; math_arity = 1; }
+        else if (strcmp(callee_name, "std.math.floorf") == 0) { math_kind = IR_VALUE_MATH_FLOORF; math_arity = 1; }
+        else if (strcmp(callee_name, "std.math.isNaNf") == 0) { math_kind = IR_VALUE_MATH_ISNANF; math_arity = 1; }
+        else if (strcmp(callee_name, "std.math.powf") == 0) { math_kind = IR_VALUE_MATH_POWF; math_arity = 2; }
+        if (math_arity > 0 && expr->args.len == (size_t)math_arity) {
+          IrValue *left = NULL;
+          IrValue *right = NULL;
+          if (!ir_lower_expr(program, ir, fun, expr->args.items[0], &left)) {
+            free(callee_name);
+            return false;
+          }
+          if (left->type != IR_TYPE_F32) {
+            ir_free_value(left);
+            free(callee_name);
+            ir_mark_unsupported(ir, "direct backend std.math function expects f32 argument", expr->args.items[0]->line, expr->args.items[0]->column, "non-f32 argument");
+            return false;
+          }
+          if (math_arity == 2) {
+            if (!ir_lower_expr(program, ir, fun, expr->args.items[1], &right)) {
+              ir_free_value(left);
+              free(callee_name);
+              return false;
+            }
+            if (right->type != IR_TYPE_F32) {
+              ir_free_value(left);
+              ir_free_value(right);
+              free(callee_name);
+              ir_mark_unsupported(ir, "direct backend std.math.powf expects f32 arguments", expr->args.items[1]->line, expr->args.items[1]->column, "non-f32 argument");
+              return false;
+            }
+          }
+          IrTypeKind result_type = math_kind == IR_VALUE_MATH_ISNANF ? IR_TYPE_BOOL : IR_TYPE_F32;
+          IrValue *value = ir_new_value(ir, math_kind, result_type, expr->line, expr->column);
+          value->left = left;
+          value->right = right;
+          if (math_kind != IR_VALUE_MATH_ISNANF) {
+            if (ir->direct_math_runtime_import_count < 1) ir->direct_math_runtime_import_count = 1;
+          }
+          free(callee_name);
+          *out = value;
+          return true;
+        }
+      }
       if (strcmp(callee_name, "std.args.len") == 0 && expr->args.len == 0) {
         IrValue *value = ir_new_value(ir, IR_VALUE_ARGS_LEN, IR_TYPE_USIZE, expr->line, expr->column);
         free(callee_name);
@@ -1933,6 +2414,57 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
         value->left = path;
         value->element_type = IR_TYPE_I32;
         if (raises) value->error_code = kind == IR_VALUE_FS_OPEN ? IR_ERROR_NOT_FOUND : IR_ERROR_IO;
+        free(callee_name);
+        *out = value;
+        return true;
+      }
+      if (strcmp(callee_name, "std.fs.mmap") == 0 && expr->args.len == 2) {
+        // std.fs.mmap(fs, path) -> Maybe<owned<Mapping>>. The Fs handle (arg0) is a capability
+        // marker only; the mapping is keyed by path (arg1). A Mapping is a BYTE_VIEW {ptr, len};
+        // wrapped in a Maybe (has@0, ptr@8, len@16), the failure case clears the Maybe.
+        IrValue *path = NULL;
+        if (!ir_lower_byte_view(program, ir, fun, expr->args.items[1], &path)) {
+          free(callee_name);
+          return false;
+        }
+        IrValue *value = ir_new_value(ir, IR_VALUE_FS_MMAP, IR_TYPE_MAYBE_BYTE_VIEW, expr->line, expr->column);
+        value->left = path;
+        value->element_type = IR_TYPE_U8;
+        free(callee_name);
+        *out = value;
+        return true;
+      }
+      if (strcmp(callee_name, "std.fs.mappingBytes") == 0 && expr->args.len == 1) {
+        // std.fs.mappingBytes(&m) borrows the mapped region as a Span<u8>: it views the Mapping
+        // local's BYTE_VIEW slot (ptr@0, len@8) directly, no syscall and no copy.
+        const Expr *arg = expr->args.items[0];
+        if (arg && arg->kind == EXPR_BORROW) arg = arg->left;
+        const IrLocal *mapping = arg && arg->kind == EXPR_IDENT ? ir_function_find_local(fun, arg->text) : NULL;
+        if (!mapping || mapping->type != IR_TYPE_BYTE_VIEW) {
+          free(callee_name);
+          ir_mark_unsupported(ir, "direct backend std.fs.mappingBytes expects a Mapping local", expr->line, expr->column, "non-Mapping mappingBytes");
+          return false;
+        }
+        IrValue *value = ir_new_value(ir, IR_VALUE_LOCAL, IR_TYPE_BYTE_VIEW, expr->line, expr->column);
+        value->local_index = mapping->index;
+        value->element_type = IR_TYPE_U8;
+        free(callee_name);
+        *out = value;
+        return true;
+      }
+      if (strcmp(callee_name, "std.fs.munmap") == 0 && expr->args.len == 1) {
+        // std.fs.munmap(&mut m) releases the mapping. The Mapping local holds ptr@0/len@8; the
+        // backend passes them to the munmap syscall (or libSystem _munmap on Mach-O).
+        const Expr *arg = expr->args.items[0];
+        if (arg && arg->kind == EXPR_BORROW) arg = arg->left;
+        const IrLocal *mapping = arg && arg->kind == EXPR_IDENT ? ir_function_find_local(fun, arg->text) : NULL;
+        if (!mapping || mapping->type != IR_TYPE_BYTE_VIEW) {
+          free(callee_name);
+          ir_mark_unsupported(ir, "direct backend std.fs.munmap expects a Mapping local", expr->line, expr->column, "non-Mapping munmap");
+          return false;
+        }
+        IrValue *value = ir_new_value(ir, IR_VALUE_FS_MUNMAP, IR_TYPE_VOID, expr->line, expr->column);
+        value->local_index = mapping->index;
         free(callee_name);
         *out = value;
         return true;
@@ -2487,7 +3019,7 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
       }
       char *specialized_return_type = generic_call ? ir_specialize_type_text(callee->return_type, callee, type_args) : NULL;
       const char *return_type_text = generic_call ? specialized_return_type : callee->return_type;
-      IrTypeKind type = ir_type_kind(return_type_text);
+      IrTypeKind type = ir_type_kind_for_program(program, return_type_text);
       if (callee->raises && !ir_type_is_direct_fallible_value(type)) {
         free(specialized_return_type);
         free(specialized_name);
@@ -2500,13 +3032,92 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
         ir_mark_unsupported(ir, "direct backend call return type is unsupported", expr->line, expr->column, callee->return_type);
         return false;
       }
-      IrValue *value = ir_new_value(ir, IR_VALUE_CALL, callee->raises ? IR_TYPE_I64 : type, expr->line, expr->column);
+      // A fallible float result rides xmm0/v0 with the error tag in the value GPR, so it keeps
+      // its float type here. A fallible RECORD result flows via sret as usual and keeps
+      // its RECORD type — the tag rides in the low 32 bits of the second-return register
+      // (x1 on AArch64 / rdx on System V x64), which is free for record-returning calls. Every
+      // other fallible result transits the i64 value GPR (tag packed into the high 32 bits).
+      // CHECK/RESCUE read the tag from the appropriate location based on the carrier type.
+      IrValue *value = ir_new_value(ir, IR_VALUE_CALL, callee->raises ? ((ir_type_is_float(type) || type == IR_TYPE_RECORD) ? type : IR_TYPE_I64) : type, expr->line, expr->column);
       value->callee_index = callee_index;
       value->element_type = type;
       for (size_t i = 0; i < expr->args.len; i++) {
         char *specialized_param_type = generic_call ? ir_specialize_type_text(callee->params.items[i].type, callee, type_args) : NULL;
         const char *param_type_text = generic_call ? specialized_param_type : callee->params.items[i].type;
-        IrTypeKind expected = ir_type_kind(param_type_text);
+        // ref<Record> / mutref<Record> parameter — caller must pass `&local`
+        // (or `&mut local`). The arg lowers to IR_VALUE_LOCAL pointing at the caller's
+        // record local; the backend marshals it identically to a by-value record (address
+        // in one int reg), only the callee's prologue differs (no copy).
+        bool param_is_mut_ref = false;
+        char *param_ref_inner = NULL;
+        if (ir_is_ref_record_type(program, param_type_text, &param_is_mut_ref, &param_ref_inner)) {
+          unsigned ref_record_size = 0, ref_record_align = 0;
+          if (!ir_shape_layout(program, param_ref_inner, &ref_record_size, &ref_record_align)) {
+            free(param_ref_inner);
+            free(specialized_param_type);
+            free(specialized_return_type);
+            free(specialized_name);
+            ir_free_value(value);
+            ir_mark_unsupported(ir, "only ref<Record> / mutref<Record> supported (scalar ref deferred)", callee->params.items[i].line, callee->params.items[i].column, callee->params.items[i].type);
+            return false;
+          }
+          const Expr *arg_expr = expr->args.items[i];
+          if (!arg_expr || arg_expr->kind != EXPR_BORROW || !arg_expr->left || arg_expr->left->kind != EXPR_IDENT) {
+            free(param_ref_inner);
+            free(specialized_param_type);
+            free(specialized_return_type);
+            free(specialized_name);
+            ir_free_value(value);
+            ir_mark_unsupported(ir, "ref<Record> argument requires &local / &mut local syntax", arg_expr ? arg_expr->line : expr->line, arg_expr ? arg_expr->column : expr->column, "non-borrow ref<Record> argument");
+            return false;
+          }
+          if (param_is_mut_ref && !arg_expr->mutable_borrow) {
+            free(param_ref_inner);
+            free(specialized_param_type);
+            free(specialized_return_type);
+            free(specialized_name);
+            ir_free_value(value);
+            ir_mark_unsupported(ir, "mutref<Record> argument requires &mut local syntax", arg_expr->line, arg_expr->column, "missing &mut");
+            return false;
+          }
+          const IrLocal *target = ir_function_find_local(fun, arg_expr->left->text);
+          if (!target || !target->is_record || target->is_ref) {
+            // Disallow re-borrowing an existing ref/mutref local (would need a separate
+            // copy/forward path; out of scope).
+            free(param_ref_inner);
+            free(specialized_param_type);
+            free(specialized_return_type);
+            free(specialized_name);
+            ir_free_value(value);
+            ir_mark_unsupported(ir, "ref<Record> argument must reference a by-value record local", arg_expr->line, arg_expr->column, arg_expr->left->text ? arg_expr->left->text : "missing local");
+            return false;
+          }
+          if (target->shape_name && strcmp(target->shape_name, param_ref_inner) != 0) {
+            free(param_ref_inner);
+            free(specialized_param_type);
+            free(specialized_return_type);
+            free(specialized_name);
+            ir_free_value(value);
+            ir_mark_unsupported(ir, "ref<Record> argument shape does not match parameter", arg_expr->line, arg_expr->column, target->shape_name);
+            return false;
+          }
+          if (param_is_mut_ref && !target->is_mutable) {
+            free(param_ref_inner);
+            free(specialized_param_type);
+            free(specialized_return_type);
+            free(specialized_name);
+            ir_free_value(value);
+            ir_mark_unsupported(ir, "mutref<Record> argument requires a mutable record local", arg_expr->line, arg_expr->column, target->name ? target->name : "immutable local");
+            return false;
+          }
+          IrValue *arg = ir_new_value(ir, IR_VALUE_LOCAL, IR_TYPE_RECORD, arg_expr->line, arg_expr->column);
+          arg->local_index = target->index;
+          ir_value_push_arg(ir, value, arg);
+          free(param_ref_inner);
+          free(specialized_param_type);
+          continue;
+        }
+        IrTypeKind expected = ir_type_kind_for_program(program, param_type_text);
         if (!ir_type_is_direct_param_abi(expected)) {
           free(specialized_param_type);
           free(specialized_return_type);
@@ -2543,7 +3154,9 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
     case EXPR_CHECK: {
       IrValue *checked = NULL;
       if (!ir_lower_expr(program, ir, fun, expr->left, &checked)) return false;
-      if (!checked || checked->type != IR_TYPE_I64) {
+      // Fallible value carriers: I64 (packed-tag int), float (tag in GPR), RECORD (tag in
+      // second-return reg).
+      if (!checked || (checked->type != IR_TYPE_I64 && !ir_type_is_float(checked->type) && checked->type != IR_TYPE_RECORD)) {
         ir_free_value(checked);
         ir_mark_unsupported(ir, "direct backend check currently supports only fallible values", expr->line, expr->column, "non-fallible check");
         return false;
@@ -2562,12 +3175,33 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
         ir_free_value(fallback);
         return false;
       }
-      if (!fallible || fallible->kind != IR_VALUE_CALL || fallible->type != IR_TYPE_I64 ||
+      if (!fallible || fallible->kind != IR_VALUE_CALL ||
+          (fallible->type != IR_TYPE_I64 && !ir_type_is_float(fallible->type) && fallible->type != IR_TYPE_RECORD) ||
           !fallback || fallback->type != fallible->element_type) {
         ir_free_value(fallible);
         ir_free_value(fallback);
-        ir_mark_unsupported(ir, "direct backend rescue currently supports fallible function calls with primitive fallbacks", expr->line, expr->column, "unsupported rescue");
+        ir_mark_unsupported(ir, "direct backend rescue currently supports fallible function calls with matching fallbacks", expr->line, expr->column, "unsupported rescue");
         return false;
+      }
+      // RECORD rescue: fallback must be a record local or another record-returning call so the
+      // backend has a concrete sret source. A raising fallback CALL is rejected — its own error
+      // tag (the second-return register) would never be observed since the rescue context
+      // intentionally suppresses it. Other shapes are rejected by the per-backend emitter
+      // helper anyway, but reject here for a clearer diagnostic at lowering time.
+      if (fallible->type == IR_TYPE_RECORD) {
+        if (fallback->kind != IR_VALUE_LOCAL && fallback->kind != IR_VALUE_CALL) {
+          ir_free_value(fallible);
+          ir_free_value(fallback);
+          ir_mark_unsupported(ir, "direct backend record rescue fallback must be a record local or call", expr->line, expr->column, "unsupported record rescue fallback");
+          return false;
+        }
+        if (fallback->kind == IR_VALUE_CALL && fallback->callee_index < ir->function_len &&
+            ir->functions[fallback->callee_index].raises) {
+          ir_free_value(fallible);
+          ir_free_value(fallback);
+          ir_mark_unsupported(ir, "direct backend record rescue fallback call cannot itself raise", expr->line, expr->column, "raising record rescue fallback");
+          return false;
+        }
       }
       IrValue *value = ir_new_value(ir, IR_VALUE_RESCUE, fallible->element_type, expr->line, expr->column);
       value->left = fallible;
@@ -2640,8 +3274,10 @@ static bool ir_lower_index_store(const Program *program, IrProgram *ir, IrFuncti
     return false;
   }
   const IrLocal *local = ir_function_find_local(mir_fun, target->left->text);
-  if (!local || !local->is_array) {
-    ir_mark_unsupported(ir, "direct backend indexed assignment target is not a fixed array local", line, column, target->left->text);
+  bool is_array_target = local && local->is_array;
+  bool is_span_target = local && local->type == IR_TYPE_BYTE_VIEW;
+  if (!is_array_target && !is_span_target) {
+    ir_mark_unsupported(ir, "direct backend indexed assignment target is not a fixed array or typed span local", line, column, target->left->text);
     return false;
   }
   if (!local->is_mutable) {
@@ -2904,6 +3540,29 @@ static bool ir_lower_stmt_to_vec(const Program *program, IrProgram *ir, IrFuncti
       return ir_lower_array_initializer(program, ir, mir_fun, local, stmt->expr, out_items, out_len, out_cap, stmt->line, stmt->column);
     }
     if (local && local->is_record) {
+      // Shape literal initializer: build field-by-field LOCAL_SET / FIELD_STORE
+      // instructions (the long-standing path).
+      if (stmt->expr && stmt->expr->kind == EXPR_SHAPE_LITERAL) {
+        return ir_lower_shape_initializer(program, ir, mir_fun, local, stmt->expr, out_items, out_len, out_cap, stmt->line, stmt->column);
+      }
+      // Record-returning call initializer (raising or not): lower the call (or CHECK/RESCUE
+      // wrapping the call) into an IR value and bind it to this record local via LOCAL_SET.
+      // The backend's record-aware LOCAL_SET case targets the local's storage via sret (no
+      // temp); the CHECK/RESCUE wrapper routes through helpers that combine
+      // record_call_with_dest with the fallible-tag check on the second-return register.
+      if (stmt->expr && (stmt->expr->kind == EXPR_CALL || stmt->expr->kind == EXPR_CHECK || stmt->expr->kind == EXPR_RESCUE)) {
+        IrValue *value = NULL;
+        if (!ir_lower_expr(program, ir, mir_fun, stmt->expr, &value)) return false;
+        if (!value || value->type != IR_TYPE_RECORD) {
+          if (value) ir_free_value(value);
+          ir_mark_unsupported(ir, "direct backend record local initializer must return a record", stmt->line, stmt->column, local->name);
+          return false;
+        }
+        ir_instr_vec_push(ir, out_items, out_len, out_cap, (IrInstr){.kind = IR_INSTR_LOCAL_SET, .local_index = local->index, .value = value, .line = stmt->line, .column = stmt->column});
+        return true;
+      }
+      // Anything else (e.g. copying another record local) falls through to the
+      // existing shape-initializer diagnostic.
       return ir_lower_shape_initializer(program, ir, mir_fun, local, stmt->expr, out_items, out_len, out_cap, stmt->line, stmt->column);
     }
     IrValue *value = NULL;
@@ -2973,6 +3632,11 @@ static bool ir_lower_stmt_to_vec(const Program *program, IrProgram *ir, IrFuncti
     } else if (!stmt->expr && mir_fun->return_type == IR_TYPE_I32) {
       value = ir_new_value(ir, IR_VALUE_INT, IR_TYPE_I32, stmt->line, stmt->column);
       value->int_value = 0;
+    } else if (mir_fun->value_return_type == IR_TYPE_BYTE_VIEW && stmt->expr) {
+      // Returning Span<T>/MutSpan<T>: route through ir_lower_byte_view so std reinterprets
+      // (`std.mem.bytesAsF32 …`) and slices are lowered like a byte-view local read,
+      // mirroring STMT_LET handling for byte-view locals above.
+      if (!ir_lower_byte_view(program, ir, mir_fun, stmt->expr, &value)) return false;
     } else if (!ir_lower_expr(program, ir, mir_fun, stmt->expr, &value)) {
       return false;
     }
@@ -2999,13 +3663,27 @@ static bool ir_lower_stmt_to_vec(const Program *program, IrProgram *ir, IrFuncti
   if (stmt->kind == STMT_CHECK) {
     IrValue *checked = NULL;
     if (!ir_lower_expr(program, ir, mir_fun, stmt->expr, &checked)) return false;
-    if (!checked || checked->type != IR_TYPE_I64) {
+    if (!checked || (checked->type != IR_TYPE_I64 && !ir_type_is_float(checked->type) && checked->type != IR_TYPE_RECORD)) {
       ir_free_value(checked);
       ir_mark_unsupported(ir, "direct backend check statement requires a fallible value", stmt->line, stmt->column, "non-fallible check");
       return false;
     }
     IrValue *value = ir_new_value(ir, IR_VALUE_CHECK, checked->element_type, stmt->line, stmt->column);
     value->left = checked;
+    // Discarded `check f()` where f returns a record — route through the synthetic
+    // discard local reserved during local collection so the callee has a concrete sret target.
+    if (value->type == IR_TYPE_RECORD) {
+      char name[64];
+      ir_format_discard_local_name(name, sizeof(name), stmt->line, stmt->column);
+      const IrLocal *discard = ir_function_find_local(mir_fun, name);
+      if (!discard) {
+        ir_free_value(value);
+        ir_mark_unsupported(ir, "direct backend discarded record check missing synthetic local", stmt->line, stmt->column, "missing discard local");
+        return false;
+      }
+      ir_instr_vec_push(ir, out_items, out_len, out_cap, (IrInstr){.kind = IR_INSTR_LOCAL_SET, .local_index = discard->index, .value = value, .line = stmt->line, .column = stmt->column});
+      return true;
+    }
     ir_instr_vec_push(ir, out_items, out_len, out_cap, (IrInstr){.kind = IR_INSTR_EXPR, .value = value, .line = stmt->line, .column = stmt->column});
     return true;
   }
@@ -3016,13 +3694,32 @@ static bool ir_lower_stmt_to_vec(const Program *program, IrProgram *ir, IrFuncti
       return false;
     }
     if (!ir_lower_expr(program, ir, mir_fun, stmt->expr, &value)) return false;
-    if (!value || value->type != IR_TYPE_VOID) {
-      ir_free_value(value);
-      ir_mark_unsupported(ir, "direct backend expression statement call must return Void", stmt->line, stmt->column, "non-Void call");
+    if (!value) {
+      ir_mark_unsupported(ir, "direct backend expression statement call lowered to no value", stmt->line, stmt->column, "missing call value");
       return false;
     }
-    ir_instr_vec_push(ir, out_items, out_len, out_cap, (IrInstr){.kind = IR_INSTR_EXPR, .value = value, .line = stmt->line, .column = stmt->column});
-    return true;
+    if (value->type == IR_TYPE_VOID) {
+      ir_instr_vec_push(ir, out_items, out_len, out_cap, (IrInstr){.kind = IR_INSTR_EXPR, .value = value, .line = stmt->line, .column = stmt->column});
+      return true;
+    }
+    // Discarded record-returning call (`f()` where f returns a record, no `let`): route the
+    // sret write into the synthetic local pushed during local collection (LOCAL_SET reuses
+    // the record-from-call lowering — sret target = the discard local's frame slot).
+    if (value->type == IR_TYPE_RECORD) {
+      char name[64];
+      ir_format_discard_local_name(name, sizeof(name), stmt->line, stmt->column);
+      const IrLocal *discard = ir_function_find_local(mir_fun, name);
+      if (!discard) {
+        ir_free_value(value);
+        ir_mark_unsupported(ir, "direct backend discarded record call missing synthetic local", stmt->line, stmt->column, "missing discard local");
+        return false;
+      }
+      ir_instr_vec_push(ir, out_items, out_len, out_cap, (IrInstr){.kind = IR_INSTR_LOCAL_SET, .local_index = discard->index, .value = value, .line = stmt->line, .column = stmt->column});
+      return true;
+    }
+    ir_free_value(value);
+    ir_mark_unsupported(ir, "direct backend expression statement call must return Void or a record", stmt->line, stmt->column, "non-Void non-record call");
+    return false;
   }
   if (stmt->kind == STMT_IF) {
     IrValue *cond = NULL;
@@ -3077,19 +3774,32 @@ static bool ir_lower_stmt_vec(const Program *program, IrProgram *ir, IrFunction 
   return true;
 }
 
-static IrFunction *ir_program_push_function(IrProgram *ir, const Function *source, const char *stable_id_text) {
+static IrFunction *ir_program_push_function(IrProgram *ir, const Program *program, const Function *source, const char *stable_id_text) {
   ir->functions = ir_grow_tracked_items(ir, ir->functions, ir->function_len, &ir->function_cap, 4, sizeof(IrFunction));
   IrFunction *fun = &ir->functions[ir->function_len++];
   ZBuf stable_id;
   zbuf_init(&stable_id);
   zbuf_append(&stable_id, stable_id_text ? stable_id_text : "main.");
   if (!stable_id_text) zbuf_append(&stable_id, source->name ? source->name : "");
+  IrTypeKind value_rt = ir_type_kind_for_program(program, source->return_type);
+  // For raising functions the "return_type" is the carrier in the value GPR — I64 for the
+  // packed-tag scheme. Record-raising callees keep RECORD as their return_type since the
+  // record flows through sret as usual (no GPR carrier collision); the tag rides in the
+  // second-return register (x1/rdx) and is materialized at the call/raise sites.
+  IrTypeKind return_rt;
+  if (ir_is_hosted_world_main(source)) {
+    return_rt = IR_TYPE_I32;
+  } else if (source->raises) {
+    return_rt = (value_rt == IR_TYPE_RECORD) ? IR_TYPE_RECORD : IR_TYPE_I64;
+  } else {
+    return_rt = value_rt;
+  }
   *fun = (IrFunction){
     .name = z_strdup(source->name),
     .stable_id = stable_id.data,
     .world_param_name = ir_is_hosted_world_main(source) && source->params.items[0].name ? z_strdup(source->params.items[0].name) : NULL,
-    .return_type = ir_is_hosted_world_main(source) ? IR_TYPE_I32 : (source->raises ? IR_TYPE_I64 : ir_type_kind(source->return_type)),
-    .value_return_type = ir_type_kind(source->return_type),
+    .return_type = return_rt,
+    .value_return_type = value_rt,
     .is_exported = source->export_c || ir_is_hosted_world_main(source),
     .raises = ir_is_hosted_world_main(source) ? false : source->raises,
     .line = source->line,
@@ -3105,12 +3815,45 @@ static bool ir_collect_function_locals(const Program *program, IrProgram *ir, Ir
   for (size_t i = 0; i < source->params.len; i++) {
     const Param *param = &source->params.items[i];
     if (hosted_world_main && i == 0 && strcmp(param->type ? param->type : "", "World") == 0) continue;
-    IrTypeKind type = ir_type_kind(param->type);
+    // ref<Record> / mutref<Record> param — pointer in one int reg; the body reads
+    // fields through the deref (no by-value copy in the prologue). Scope is records-only.
+    {
+      bool is_mut = false;
+      char *inner_text = NULL;
+      if (ir_is_ref_record_type(program, param->type, &is_mut, &inner_text)) {
+        unsigned record_size = 0, record_align = 0;
+        if (!ir_shape_layout(program, inner_text, &record_size, &record_align)) {
+          char actual[128];
+          snprintf(actual, sizeof(actual), "%s (inner type is not a record)", param->type ? param->type : "ref");
+          free(inner_text);
+          ir_mark_unsupported(ir, "only ref<Record> / mutref<Record> supported (scalar ref deferred)", param->line, param->column, actual);
+          return false;
+        }
+        ir_function_push_ref_record_local(ir, mir_fun, param->name, inner_text, is_mut, record_size, record_align, param->line, param->column);
+        free(inner_text);
+        continue;
+      }
+    }
+    IrTypeKind type = ir_type_kind_for_program(program, param->type);
     if (!ir_type_is_direct_param_abi(type)) {
       ir_mark_unsupported(ir, "direct backend parameter type is unsupported", param->line, param->column, param->type);
       return false;
     }
-    ir_function_push_local(ir, mir_fun, param->name, type, true, false, false, NULL, IR_TYPE_UNSUPPORTED, 0, 0, 0, false, param->line, param->column);
+    if (type == IR_TYPE_RECORD) {
+      // Record param: stash size/align + shape_name so the backend can sret into
+      // (or copy from) the local's frame slot. AAPCS/System V both pass by pointer.
+      unsigned record_size = 0, record_align = 0;
+      if (!ir_shape_layout(program, param->type, &record_size, &record_align)) {
+        ir_mark_unsupported(ir, "direct backend record parameter shape is unknown", param->line, param->column, param->type);
+        return false;
+      }
+      ir_function_push_local(ir, mir_fun, param->name, IR_TYPE_RECORD, true, false, true, param->type, IR_TYPE_UNSUPPORTED, 0, record_size, record_align, false, param->line, param->column);
+      continue;
+    }
+    IrTypeKind param_element_type = (type == IR_TYPE_BYTE_VIEW) ? ir_byte_view_element_type(param->type) : IR_TYPE_UNSUPPORTED;
+    bool param_mutable_span = param->type && strncmp(param->type, "MutSpan<", 8) == 0;
+    ir_function_push_local(ir, mir_fun, param->name, type, true, false, false, NULL, param_element_type, 0, 0, 0, param_mutable_span, param->line, param->column);
+    if (param->type && strcmp(param->type, "PageAlloc") == 0) mir_fun->locals[mir_fun->local_len - 1].is_page_alloc = true;
   }
   if (!ir_collect_stmt_locals(program, ir, mir_fun, &source->body)) return false;
 
@@ -3159,12 +3902,42 @@ static bool ir_collect_stmt_locals(const Program *program, IrProgram *ir, IrFunc
         ir_mark_unsupported(ir, "direct backend local type is unsupported", stmt->line, stmt->column, stmt_type ? stmt_type : "inferred unknown");
         return false;
       }
-      bool mutable_byte_view = stmt_type && strcmp(stmt_type, "MutSpan<u8>") == 0;
-      ir_function_push_local(ir, mir_fun, stmt->name, type, false, false, false, NULL, IR_TYPE_UNSUPPORTED, 0, 0, 0, stmt->mutable_binding || mutable_byte_view, stmt->line, stmt->column);
+      bool mutable_byte_view = stmt_type && strncmp(stmt_type, "MutSpan<", 8) == 0;
+      IrTypeKind let_element_type = (type == IR_TYPE_BYTE_VIEW) ? ir_byte_view_element_type(stmt_type) : IR_TYPE_UNSUPPORTED;
+      ir_function_push_local(ir, mir_fun, stmt->name, type, false, false, false, NULL, let_element_type, 0, 0, 0, stmt->mutable_binding || mutable_byte_view, stmt->line, stmt->column);
+      if (stmt_type && strcmp(stmt_type, "PageAlloc") == 0) mir_fun->locals[mir_fun->local_len - 1].is_page_alloc = true;
     } else if (stmt->kind == STMT_IF) {
       if (!ir_collect_stmt_locals(program, ir, mir_fun, &stmt->then_body) || !ir_collect_stmt_locals(program, ir, mir_fun, &stmt->else_body)) return false;
     } else if (stmt->kind == STMT_WHILE) {
       if (!ir_collect_stmt_locals(program, ir, mir_fun, &stmt->then_body)) return false;
+    } else if (stmt->kind == STMT_EXPR) {
+      const Function *callee = ir_stmt_expr_discard_record_callee(program, stmt);
+      if (callee) {
+        unsigned record_size = 0;
+        unsigned record_align = 0;
+        if (!ir_shape_layout(program, callee->return_type, &record_size, &record_align)) {
+          ir_mark_unsupported(ir, "direct backend discarded record-returning call has unknown shape", stmt->line, stmt->column, callee->return_type);
+          return false;
+        }
+        char name[64];
+        ir_format_discard_local_name(name, sizeof(name), stmt->line, stmt->column);
+        ir_function_push_local(ir, mir_fun, name, IR_TYPE_RECORD, false, false, true, callee->return_type, IR_TYPE_UNSUPPORTED, 0, record_size, record_align, false, stmt->line, stmt->column);
+      }
+    } else if (stmt->kind == STMT_CHECK) {
+      // `check f()` where f returns a record and raises — reserve a synthetic record
+      // local as the sret target; the lowering pass binds the CHECK-wrapped call to it.
+      const Function *callee = ir_stmt_check_discard_record_callee(program, stmt);
+      if (callee) {
+        unsigned record_size = 0;
+        unsigned record_align = 0;
+        if (!ir_shape_layout(program, callee->return_type, &record_size, &record_align)) {
+          ir_mark_unsupported(ir, "direct backend discarded record-returning check has unknown shape", stmt->line, stmt->column, callee->return_type);
+          return false;
+        }
+        char name[64];
+        ir_format_discard_local_name(name, sizeof(name), stmt->line, stmt->column);
+        ir_function_push_local(ir, mir_fun, name, IR_TYPE_RECORD, false, false, true, callee->return_type, IR_TYPE_UNSUPPORTED, 0, record_size, record_align, false, stmt->line, stmt->column);
+      }
     }
   }
   return true;
@@ -3176,7 +3949,7 @@ static bool ir_lower_function_body(const Program *program, IrProgram *ir, IrFunc
     return false;
   }
   bool hosted_world_main = ir_is_hosted_world_main(source);
-  IrTypeKind return_type = hosted_world_main ? IR_TYPE_I32 : ir_type_kind(source->return_type);
+  IrTypeKind return_type = hosted_world_main ? IR_TYPE_I32 : ir_type_kind_for_program(program, source->return_type);
   if (!hosted_world_main && source->raises && !ir_type_is_direct_fallible_value(return_type)) {
     ir_mark_unsupported(ir, "direct backend fallible return type is unsupported", source->line, source->column, source->return_type);
     return false;
@@ -3501,7 +4274,7 @@ static void ir_lower_direct_backend_subset(IrProgram *ir, const Program *program
   }
   qsort(order, direct_functions.len, sizeof(IrFunctionOrder), ir_function_order_compare);
   for (size_t i = 0; i < direct_functions.len; i++) {
-    ir_program_push_function(ir, &direct_functions.items[order[i].source_index], order[i].stable_id);
+    ir_program_push_function(ir, program, &direct_functions.items[order[i].source_index], order[i].stable_id);
   }
   bool has_export = false;
   for (size_t i = 0; i < ir->function_len; i++) {

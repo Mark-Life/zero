@@ -9,3 +9,17 @@ npm-debug.log*
 # environment variables
 .env*
 !.env.example
+
+# Large sparse fixture for the >4 GiB mmap-length round-trip test; generate locally.
+# Build-tolerated in CI, so never committed.
+conformance/fixtures/mmap-4gib-sparse.bin
+
+# llama2 example weights, downloaded per examples/llama2/README.md (stories15M/42M/110M).
+/stories*.bin
+/tokenizer.bin
+
+# Claude Code transient worktrees (the rest of .claude/ may be committed by choice)
+.claude/worktrees/
+
+# packaged VS Code extension build artifacts
+*.vsix

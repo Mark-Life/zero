@@ -355,6 +355,17 @@ void z_x64_emit_sub_rax_u32(ZBuf *buf, uint32_t value, bool wide) {
   z_x64_append_u32(buf, value);
 }
 
+// Add a u32 immediate to any register (REX.B handles r8-r15). ADD r/m, imm32 = 0x81 /0.
+void z_x64_emit_add_reg_u32(ZBuf *buf, unsigned reg, uint32_t value, bool wide) {
+  z_x64_require_reg(reg);
+  unsigned rex = wide ? 0x48 : 0x40;
+  if (reg >= 8) rex |= 0x01;
+  if (rex != 0x40) z_x64_append_u8(buf, rex);
+  z_x64_append_u8(buf, 0x81);
+  z_x64_append_u8(buf, 0xc0 | (reg & 7u));
+  z_x64_append_u32(buf, value);
+}
+
 static unsigned z_x64_scale_bits(unsigned scale) {
   switch (scale) {
     case 1: return 0;
@@ -664,7 +675,7 @@ void z_x64_emit_shr_rcx_imm8(ZBuf *buf, unsigned amount) {
   z_x64_emit_shr_reg_imm8(buf, 1, amount, true);
 }
 
-static void z_x64_emit_ptr_reg_disp_op(ZBuf *buf, unsigned escape, unsigned opcode, unsigned reg, unsigned base_reg, unsigned disp, bool wide, bool reg_is_byte) {
+static void z_x64_emit_ptr_reg_disp_op_ex(ZBuf *buf, unsigned escape, unsigned opcode, unsigned reg, unsigned base_reg, unsigned disp, bool wide, bool reg_is_byte, bool force_disp32) {
   z_x64_require_reg(reg);
   z_x64_require_reg(base_reg);
   bool force_rex = !wide && reg_is_byte && reg >= 4 && reg < 8;
@@ -677,12 +688,18 @@ static void z_x64_emit_ptr_reg_disp_op(ZBuf *buf, unsigned escape, unsigned opco
   bool sib = (base_reg & 7u) == 4;
   bool needs_base_disp = (base_reg & 7u) == 5;
   unsigned mod = 0x80;
-  if (disp == 0 && !needs_base_disp) mod = 0x00;
-  else if (disp <= 127) mod = 0x40;
+  if (!force_disp32) {
+    if (disp == 0 && !needs_base_disp) mod = 0x00;
+    else if (disp <= 127) mod = 0x40;
+  }
   z_x64_append_u8(buf, mod | ((reg & 7u) << 3) | (sib ? 0x04 : (base_reg & 7u)));
   if (sib) z_x64_append_u8(buf, 0x20 | (base_reg & 7u));
   if (mod == 0x40) z_x64_append_u8(buf, disp);
   else if (mod == 0x80) z_x64_append_u32(buf, disp);
+}
+
+static void z_x64_emit_ptr_reg_disp_op(ZBuf *buf, unsigned escape, unsigned opcode, unsigned reg, unsigned base_reg, unsigned disp, bool wide, bool reg_is_byte) {
+  z_x64_emit_ptr_reg_disp_op_ex(buf, escape, opcode, reg, base_reg, disp, wide, reg_is_byte, false);
 }
 
 void z_x64_emit_movzx_reg32_ptr_reg_u8(ZBuf *buf, unsigned dst_reg, unsigned base_reg) { z_x64_emit_ptr_reg_disp_op(buf, 0x0f, 0xb6, dst_reg, base_reg, 0, false, false); }
@@ -690,6 +707,15 @@ void z_x64_emit_movzx_reg32_ptr_reg_u8(ZBuf *buf, unsigned dst_reg, unsigned bas
 void z_x64_emit_movzx_reg32_ptr_reg_disp_u16(ZBuf *buf, unsigned dst_reg, unsigned base_reg, unsigned disp) { z_x64_emit_ptr_reg_disp_op(buf, 0x0f, 0xb7, dst_reg, base_reg, disp, false, false); }
 
 void z_x64_emit_load_reg_ptr_reg(ZBuf *buf, unsigned dst_reg, unsigned base_reg, bool wide) { z_x64_emit_ptr_reg_disp_op(buf, 0, 0x8b, dst_reg, base_reg, 0, wide, false); }
+
+// Same as z_x64_emit_load_reg_ptr_reg but always encodes a mod=10 disp32 displacement (even when
+// disp would fit in a byte or be zero). Useful when matching exact byte output of legacy raw
+// sequences or when the caller wants a fixed-size 7-byte form for later patching.
+void z_x64_emit_load_reg_ptr_reg_disp(ZBuf *buf, unsigned dst_reg, unsigned base_reg, unsigned disp, bool wide) { z_x64_emit_ptr_reg_disp_op_ex(buf, 0, 0x8b, dst_reg, base_reg, disp, wide, false, true); }
+
+// Sign-extending byte load: MOVSX r32, byte ptr [base] (0F BE /r). The signed-byte counterpart
+// of the zero-extending MOVZX above; used for i8 typed-span element reads.
+void z_x64_emit_movsx_reg32_ptr_reg_i8(ZBuf *buf, unsigned dst_reg, unsigned base_reg) { z_x64_emit_ptr_reg_disp_op(buf, 0x0f, 0xbe, dst_reg, base_reg, 0, false, false); }
 
 void z_x64_emit_mov_ptr_reg_disp_u8(ZBuf *buf, unsigned base_reg, unsigned disp, unsigned value) {
   if (value > 0xff) abort();
@@ -700,6 +726,11 @@ void z_x64_emit_mov_ptr_reg_disp_u8(ZBuf *buf, unsigned base_reg, unsigned disp,
 void z_x64_emit_store_ptr_reg8_from_reg(ZBuf *buf, unsigned base_reg, unsigned src_reg) { z_x64_emit_ptr_reg_disp_op(buf, 0, 0x88, src_reg, base_reg, 0, false, true); }
 
 void z_x64_emit_store_ptr_reg_from_reg(ZBuf *buf, unsigned base_reg, unsigned src_reg, bool wide) { z_x64_emit_ptr_reg_disp_op(buf, 0, 0x89, src_reg, base_reg, 0, wide, false); }
+
+// Same as z_x64_emit_store_ptr_reg_from_reg but always encodes a mod=10 disp32 displacement (even
+// when disp would fit in a byte or be zero). Useful when matching exact byte output of legacy raw
+// sequences or when the caller wants a fixed-size 7-byte form for later patching.
+void z_x64_emit_store_ptr_reg_disp_from_reg(ZBuf *buf, unsigned base_reg, unsigned disp, unsigned src_reg, bool wide) { z_x64_emit_ptr_reg_disp_op_ex(buf, 0, 0x89, src_reg, base_reg, disp, wide, false, true); }
 
 void z_x64_emit_cmp_reg_ptr_reg(ZBuf *buf, unsigned lhs_reg, unsigned base_reg, bool wide) { z_x64_emit_ptr_reg_disp_op(buf, 0, 0x3b, lhs_reg, base_reg, 0, wide, false); }
 
@@ -751,6 +782,30 @@ void z_x64_emit_setcc_al_to_bool(ZBuf *buf, unsigned setcc_opcode) {
   z_x64_append_u8(buf, 0xc0);
 }
 
+// SETcc AL: 0F <cc> C0 (reg field 0, rm = AL = 000). No trailing MOVZX, unlike
+// z_x64_emit_setcc_al_to_bool — use this when a parity fixup must run before the widen.
+void z_x64_emit_setcc_al(ZBuf *buf, uint8_t cc_opcode) {
+  if (cc_opcode < 0x90 || cc_opcode > 0x9f) abort();
+  z_x64_append_u8(buf, 0x0f);
+  z_x64_append_u8(buf, cc_opcode);
+  z_x64_append_u8(buf, 0xc0);
+}
+
+// MOVZX eax, al: 0F B6 C0. Zero-extends the bool byte to a full 32-bit value.
+void z_x64_emit_movzx_eax_al(ZBuf *buf) {
+  z_x64_append_u8(buf, 0x0f);
+  z_x64_append_u8(buf, 0xb6);
+  z_x64_append_u8(buf, 0xc0);
+}
+
+// MOVSX eax, al (0F BE C0): sign-extend the low byte across the 32-bit register. The signed-byte
+// counterpart of z_x64_emit_movzx_eax_al; used to normalize a value cast to i8.
+void z_x64_emit_movsx_eax_al(ZBuf *buf) {
+  z_x64_append_u8(buf, 0x0f);
+  z_x64_append_u8(buf, 0xbe);
+  z_x64_append_u8(buf, 0xc0);
+}
+
 void z_x64_emit_cmp_rax_rcx_to_bool(ZBuf *buf, unsigned setcc_opcode, bool wide) {
   z_x64_emit_cmp_rax_rcx(buf, wide);
   z_x64_emit_setcc_al_to_bool(buf, setcc_opcode);
@@ -759,6 +814,286 @@ void z_x64_emit_cmp_rax_rcx_to_bool(ZBuf *buf, unsigned setcc_opcode, bool wide)
 void z_x64_emit_bool_from_nonnegative_rax(ZBuf *buf) {
   z_x64_emit_test_rax_rax(buf, true);
   z_x64_emit_setcc_al_to_bool(buf, 0x99);
+}
+
+// MOVD/MOVQ xmm <- gpr (raw bits): 66 [REX.W] 0F 6E /r.
+void z_x64_emit_movd_xmm_from_gpr(ZBuf *buf, unsigned xmm, unsigned gpr, bool is64) {
+  z_x64_require_reg(xmm);
+  z_x64_require_reg(gpr);
+  z_x64_append_u8(buf, 0x66);
+  unsigned rex = 0;
+  if (is64) rex |= 0x48;
+  if (xmm >= 8) rex |= 0x44;
+  if (gpr >= 8) rex |= 0x41;
+  if (rex) z_x64_append_u8(buf, rex);
+  z_x64_append_u8(buf, 0x0f);
+  z_x64_append_u8(buf, 0x6e);
+  z_x64_append_u8(buf, 0xc0 | ((xmm & 7u) << 3) | (gpr & 7u));
+}
+
+// SSE scalar arithmetic: ADDSS/SD (58), SUBSS/SD (5C), MULSS/SD (59), DIVSS/SD (5E).
+// F32 uses the F3 prefix; F64 uses F2. dst is the destination XMM, src the source XMM.
+static void z_x64_emit_sse_arith(ZBuf *buf, unsigned opcode, unsigned dst, unsigned src, bool is64) {
+  z_x64_require_reg(dst);
+  z_x64_require_reg(src);
+  z_x64_append_u8(buf, is64 ? 0xf2 : 0xf3);
+  unsigned rex = 0;
+  if (dst >= 8) rex |= 0x44;
+  if (src >= 8) rex |= 0x41;
+  if (rex) z_x64_append_u8(buf, rex);
+  z_x64_append_u8(buf, 0x0f);
+  z_x64_append_u8(buf, opcode);
+  z_x64_append_u8(buf, 0xc0 | ((dst & 7u) << 3) | (src & 7u));
+}
+
+void z_x64_emit_sse_add(ZBuf *buf, unsigned dst, unsigned src, bool is64) {
+  z_x64_emit_sse_arith(buf, 0x58, dst, src, is64);
+}
+
+void z_x64_emit_sse_sub(ZBuf *buf, unsigned dst, unsigned src, bool is64) {
+  z_x64_emit_sse_arith(buf, 0x5c, dst, src, is64);
+}
+
+void z_x64_emit_sse_mul(ZBuf *buf, unsigned dst, unsigned src, bool is64) {
+  z_x64_emit_sse_arith(buf, 0x59, dst, src, is64);
+}
+
+void z_x64_emit_sse_div(ZBuf *buf, unsigned dst, unsigned src, bool is64) {
+  z_x64_emit_sse_arith(buf, 0x5e, dst, src, is64);
+}
+
+// UCOMISS (0F 2E /r) / UCOMISD (66 0F 2E /r): IEEE 754 unordered compare into EFLAGS.
+void z_x64_emit_ucomis(ZBuf *buf, unsigned lhs, unsigned rhs, bool is64) {
+  z_x64_require_reg(lhs);
+  z_x64_require_reg(rhs);
+  if (is64) z_x64_append_u8(buf, 0x66);
+  unsigned rex = 0;
+  if (lhs >= 8) rex |= 0x44;
+  if (rhs >= 8) rex |= 0x41;
+  if (rex) z_x64_append_u8(buf, rex);
+  z_x64_append_u8(buf, 0x0f);
+  z_x64_append_u8(buf, 0x2e);
+  z_x64_append_u8(buf, 0xc0 | ((lhs & 7u) << 3) | (rhs & 7u));
+}
+
+// CVTSI2SS (F3 [REX.W] 0F 2A /r) / CVTSI2SD (F2 ...): int -> float. src_is64 sets REX.W.
+void z_x64_emit_cvtsi2s(ZBuf *buf, unsigned xmm, unsigned gpr, bool dst_is64, bool src_is64) {
+  z_x64_require_reg(xmm);
+  z_x64_require_reg(gpr);
+  z_x64_append_u8(buf, dst_is64 ? 0xf2 : 0xf3);
+  unsigned rex = 0;
+  if (src_is64) rex |= 0x48;
+  if (xmm >= 8) rex |= 0x44;
+  if (gpr >= 8) rex |= 0x41;
+  if (rex) z_x64_append_u8(buf, rex);
+  z_x64_append_u8(buf, 0x0f);
+  z_x64_append_u8(buf, 0x2a);
+  z_x64_append_u8(buf, 0xc0 | ((xmm & 7u) << 3) | (gpr & 7u));
+}
+
+// CVTTSS2SI (F3 [REX.W] 0F 2C /r) / CVTTSD2SI (F2 ...): float -> int, truncating. dst_is64 sets REX.W.
+void z_x64_emit_cvtts2si(ZBuf *buf, unsigned gpr, unsigned xmm, bool src_is64, bool dst_is64) {
+  z_x64_require_reg(gpr);
+  z_x64_require_reg(xmm);
+  z_x64_append_u8(buf, src_is64 ? 0xf2 : 0xf3);
+  unsigned rex = 0;
+  if (dst_is64) rex |= 0x48;
+  if (gpr >= 8) rex |= 0x44;
+  if (xmm >= 8) rex |= 0x41;
+  if (rex) z_x64_append_u8(buf, rex);
+  z_x64_append_u8(buf, 0x0f);
+  z_x64_append_u8(buf, 0x2c);
+  z_x64_append_u8(buf, 0xc0 | ((gpr & 7u) << 3) | (xmm & 7u));
+}
+
+// CVTSS2SD (F3 0F 5A /r) / CVTSD2SS (F2 0F 5A /r): float<->float. src_is64 picks the source width.
+void z_x64_emit_cvts2s(ZBuf *buf, unsigned dst, unsigned src, bool src_is64) {
+  z_x64_require_reg(dst);
+  z_x64_require_reg(src);
+  z_x64_append_u8(buf, src_is64 ? 0xf2 : 0xf3);
+  unsigned rex = 0;
+  if (dst >= 8) rex |= 0x44;
+  if (src >= 8) rex |= 0x41;
+  if (rex) z_x64_append_u8(buf, rex);
+  z_x64_append_u8(buf, 0x0f);
+  z_x64_append_u8(buf, 0x5a);
+  z_x64_append_u8(buf, 0xc0 | ((dst & 7u) << 3) | (src & 7u));
+}
+
+// MOVAPS xmm, xmm (0F 28 /r): copy a full XMM register. No mandatory prefix.
+void z_x64_emit_movaps(ZBuf *buf, unsigned dst, unsigned src) {
+  z_x64_require_reg(dst);
+  z_x64_require_reg(src);
+  unsigned rex = 0;
+  if (dst >= 8) rex |= 0x44;
+  if (src >= 8) rex |= 0x41;
+  if (rex) z_x64_append_u8(buf, rex);
+  z_x64_append_u8(buf, 0x0f);
+  z_x64_append_u8(buf, 0x28);
+  z_x64_append_u8(buf, 0xc0 | ((dst & 7u) << 3) | (src & 7u));
+}
+
+// MOVSS/MOVSD xmm,[rbp+disp] (load, opcode 0x10) or [rbp+disp],xmm (store, opcode 0x11).
+// base = RBP (101) always uses a displacement; disp8 when it fits a signed byte, else disp32.
+void z_x64_emit_movs_xmm_rbp_disp(ZBuf *buf, unsigned xmm, int32_t disp, bool is64, bool is_load) {
+  z_x64_require_reg(xmm);
+  z_x64_append_u8(buf, is64 ? 0xf2 : 0xf3);
+  unsigned rex = 0;
+  if (xmm >= 8) rex |= 0x44;
+  if (rex) z_x64_append_u8(buf, rex);
+  z_x64_append_u8(buf, 0x0f);
+  z_x64_append_u8(buf, is_load ? 0x10 : 0x11);
+  unsigned reg_low = xmm & 7u;
+  if (disp >= -128 && disp <= 127) {
+    z_x64_append_u8(buf, 0x40 | (reg_low << 3) | 0x05);
+    z_x64_append_u8(buf, (uint8_t)(int8_t)disp);
+  } else {
+    z_x64_append_u8(buf, 0x80 | (reg_low << 3) | 0x05);
+    z_x64_append_u32(buf, (uint32_t)disp);
+  }
+}
+
+// Scalar SSE load/store through a register-held address: MOVSS/MOVSD xmm,[base] (is_load) or
+// [base],xmm. F3 prefix for f32, F2 for f64; opcode 10 loads, 11 stores. A no-displacement
+// [base] operand uses mod=00 — except rbp/r13 (rm=101) which require an explicit disp8=0, and
+// rsp/r12 (rm=100) which require a SIB byte. Used for typed-span float element loads/stores.
+void z_x64_emit_movs_xmm_ptr_reg(ZBuf *buf, unsigned xmm, unsigned base_reg, bool is64, bool is_load) {
+  z_x64_require_reg(xmm);
+  z_x64_require_reg(base_reg);
+  z_x64_append_u8(buf, is64 ? 0xf2 : 0xf3);
+  unsigned rex = 0;
+  if (xmm >= 8) rex |= 0x44;
+  if (base_reg >= 8) rex |= 0x41;
+  if (rex) z_x64_append_u8(buf, rex);
+  z_x64_append_u8(buf, 0x0f);
+  z_x64_append_u8(buf, is_load ? 0x10 : 0x11);
+  unsigned reg_low = xmm & 7u;
+  unsigned base_low = base_reg & 7u;
+  bool sib = base_low == 4;
+  bool needs_disp = base_low == 5;
+  unsigned mod = needs_disp ? 0x40 : 0x00;
+  z_x64_append_u8(buf, mod | (reg_low << 3) | (sib ? 0x04 : base_low));
+  if (sib) z_x64_append_u8(buf, 0x20 | base_low);
+  if (needs_disp) z_x64_append_u8(buf, 0x00);
+}
+
+// MOVSS/MOVSD xmm,[base+disp] or [base+disp],xmm. F3/F2 prefix; opcode 10/11 load/store.
+// Same encoding shape as the disp=0 variant above, but always emits a disp8 or disp32 so the
+// field offset within a ref<Record> deref'd base survives. SIB (rsp/r12) and rbp/r13 base
+// quirks are handled exactly as the disp=0 variant: SIB byte for rsp-family, mod=01/10 for
+// non-zero disp.
+void z_x64_emit_movs_xmm_ptr_reg_disp(ZBuf *buf, unsigned xmm, unsigned base_reg, unsigned disp, bool is64, bool is_load) {
+  z_x64_require_reg(xmm);
+  z_x64_require_reg(base_reg);
+  z_x64_append_u8(buf, is64 ? 0xf2 : 0xf3);
+  unsigned rex = 0;
+  if (xmm >= 8) rex |= 0x44;
+  if (base_reg >= 8) rex |= 0x41;
+  if (rex) z_x64_append_u8(buf, rex);
+  z_x64_append_u8(buf, 0x0f);
+  z_x64_append_u8(buf, is_load ? 0x10 : 0x11);
+  unsigned reg_low = xmm & 7u;
+  unsigned base_low = base_reg & 7u;
+  bool sib = base_low == 4;
+  unsigned mod = disp <= 127 ? 0x40 : 0x80;
+  z_x64_append_u8(buf, mod | (reg_low << 3) | (sib ? 0x04 : base_low));
+  if (sib) z_x64_append_u8(buf, 0x20 | base_low);
+  if (mod == 0x40) z_x64_append_u8(buf, (uint8_t)disp);
+  else z_x64_append_u32(buf, disp);
+}
+
+// MOVZX r32, byte ptr [base+disp] — zero-extend a byte load through a register-held base into
+// the low 32 bits of a 32-bit destination (high 32 cleared automatically by the 32-bit form).
+// Used for u8/Bool field reads through a ref<Record>'s deref'd pointer.
+void z_x64_emit_movzx_reg32_ptr_reg_disp_u8(ZBuf *buf, unsigned dst_reg, unsigned base_reg, unsigned disp) {
+  z_x64_require_reg(dst_reg);
+  z_x64_require_reg(base_reg);
+  unsigned rex = 0;
+  if (dst_reg >= 8) rex |= 0x44;
+  if (base_reg >= 8) rex |= 0x41;
+  if (rex) z_x64_append_u8(buf, rex);
+  z_x64_append_u8(buf, 0x0f);
+  z_x64_append_u8(buf, 0xb6);
+  unsigned reg_low = dst_reg & 7u;
+  unsigned base_low = base_reg & 7u;
+  bool sib = base_low == 4;
+  unsigned mod = disp <= 127 ? 0x40 : 0x80;
+  z_x64_append_u8(buf, mod | (reg_low << 3) | (sib ? 0x04 : base_low));
+  if (sib) z_x64_append_u8(buf, 0x20 | base_low);
+  if (mod == 0x40) z_x64_append_u8(buf, (uint8_t)disp);
+  else z_x64_append_u32(buf, disp);
+}
+
+// MOV byte ptr [base+disp], reg8 — store the low byte of a GPR through a register-held base.
+// Used for u8/Bool field writes through a mutref<Record>'s deref'd pointer.
+void z_x64_emit_store_ptr_reg_disp_from_reg8(ZBuf *buf, unsigned base_reg, unsigned disp, unsigned src_reg) {
+  z_x64_require_reg(src_reg);
+  z_x64_require_reg(base_reg);
+  unsigned rex = 0;
+  if (src_reg >= 8) rex |= 0x44;
+  if (base_reg >= 8) rex |= 0x41;
+  // Force REX for spl/bpl/sil/dil (regs 4-7) byte access, just like z_x64_emit_ptr_reg_disp_op_ex.
+  bool force_rex = src_reg >= 4 && src_reg < 8;
+  if (rex || force_rex) z_x64_append_u8(buf, rex ? rex : 0x40);
+  z_x64_append_u8(buf, 0x88);
+  unsigned reg_low = src_reg & 7u;
+  unsigned base_low = base_reg & 7u;
+  bool sib = base_low == 4;
+  unsigned mod = disp <= 127 ? 0x40 : 0x80;
+  z_x64_append_u8(buf, mod | (reg_low << 3) | (sib ? 0x04 : base_low));
+  if (sib) z_x64_append_u8(buf, 0x20 | base_low);
+  if (mod == 0x40) z_x64_append_u8(buf, (uint8_t)disp);
+  else z_x64_append_u32(buf, disp);
+}
+
+// Spill an XMM: sub rsp,8 then MOVSD [rsp],xmm (F2 0F 11 /r, SIB base=rsp).
+void z_x64_emit_xmm_push(ZBuf *buf, unsigned xmm) {
+  z_x64_require_reg(xmm);
+  z_x64_append_u8(buf, 0x48);
+  z_x64_append_u8(buf, 0x83);
+  z_x64_append_u8(buf, 0xec);
+  z_x64_append_u8(buf, 0x08);
+  z_x64_append_u8(buf, 0xf2);
+  if (xmm >= 8) z_x64_append_u8(buf, 0x44);
+  z_x64_append_u8(buf, 0x0f);
+  z_x64_append_u8(buf, 0x11);
+  z_x64_append_u8(buf, 0x04 | ((xmm & 7u) << 3));
+  z_x64_append_u8(buf, 0x24);
+}
+
+// Reload an XMM: MOVSD xmm,[rsp] (F2 0F 10 /r, SIB base=rsp) then add rsp,8.
+void z_x64_emit_xmm_pop(ZBuf *buf, unsigned xmm) {
+  z_x64_require_reg(xmm);
+  z_x64_append_u8(buf, 0xf2);
+  if (xmm >= 8) z_x64_append_u8(buf, 0x44);
+  z_x64_append_u8(buf, 0x0f);
+  z_x64_append_u8(buf, 0x10);
+  z_x64_append_u8(buf, 0x04 | ((xmm & 7u) << 3));
+  z_x64_append_u8(buf, 0x24);
+  z_x64_append_u8(buf, 0x48);
+  z_x64_append_u8(buf, 0x83);
+  z_x64_append_u8(buf, 0xc4);
+  z_x64_append_u8(buf, 0x08);
+}
+
+// SETcc CL: 0F <cc> C1 (reg field 0, rm = CL = 001).
+void z_x64_emit_setcc_cl(ZBuf *buf, uint8_t cc_opcode) {
+  if (cc_opcode < 0x90 || cc_opcode > 0x9f) abort();
+  z_x64_append_u8(buf, 0x0f);
+  z_x64_append_u8(buf, cc_opcode);
+  z_x64_append_u8(buf, 0xc1);
+}
+
+// AND al, cl: 20 C8.
+void z_x64_emit_and_al_cl(ZBuf *buf) {
+  z_x64_append_u8(buf, 0x20);
+  z_x64_append_u8(buf, 0xc8);
+}
+
+// OR al, cl: 08 C8.
+void z_x64_emit_or_al_cl(ZBuf *buf) {
+  z_x64_append_u8(buf, 0x08);
+  z_x64_append_u8(buf, 0xc8);
 }
 
 void z_x64_emit_prologue(ZBuf *buf, unsigned stack_size) {
