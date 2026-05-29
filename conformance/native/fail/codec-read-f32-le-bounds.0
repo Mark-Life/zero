@@ -1,0 +1,6 @@
+pub fn main Void world World !
+  let buf [4]u8 [0, 0, 128, 63]
+  let read f32 (std.codec.readF32Le buf 1)
+  let zero f32 0.0
+  if == read zero
+    check world.out.write "unreachable\n"

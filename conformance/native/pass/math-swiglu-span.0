@@ -1,0 +1,33 @@
+fn swiglu Void hb MutSpan<f32> hb2 Span<f32>
+  let n usize std.mem.len hb
+  mut i usize 0
+  while < i n
+    let v f32 hb[i]
+    let negv f32 (- 0.0 v)
+    let e f32 (std.math.expf negv)
+    let denom f32 + 1.0 e
+    let sig f32 / 1.0 denom
+    let silu f32 * v sig
+    let g f32 hb2[i]
+    set hb[i] (* silu g)
+    set i + i 1
+
+pub fn main Void world World !
+  mut hbbytes [8]u8 [0, 0, 0, 0, 0, 0, 0, 0]
+  let hb MutSpan<f32> std.mem.bytesAsMutF32 hbbytes
+  set hb[0] 1.0
+  set hb[1] 2.0
+
+  mut hb2bytes [8]u8 [0, 0, 0, 0, 0, 0, 0, 0]
+  let hb2mut MutSpan<f32> std.mem.bytesAsMutF32 hb2bytes
+  set hb2mut[0] 3.0
+  set hb2mut[1] 4.0
+  let hb2 Span<f32> std.mem.bytesAsF32 hb2bytes
+
+  swiglu hb hb2
+
+  # silu(1)=0.731059 -> *3 = 2.193177 ; silu(2)=1.761594 -> *4 = 7.046377
+  let ok0 Bool (&& (> hb[0] 2.192) (< hb[0] 2.194))
+  let ok1 Bool (&& (> hb[1] 7.045) (< hb[1] 7.048))
+  if && ok0 ok1
+    check world.out.write "math swiglu span ok\n"

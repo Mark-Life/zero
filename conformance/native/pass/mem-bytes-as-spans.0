@@ -1,0 +1,27 @@
+fn sumInts i32 values Span<i32>
+  mut total i32 0
+  mut i usize 0
+  while < i (std.mem.len values)
+    set total (+ total values[i])
+    set i (+ i 1)
+  ret total
+
+pub fn main Void world World !
+  mut ibytes [16]u8 [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  let ints MutSpan<i32> std.mem.bytesAsMutI32 ibytes
+  set ints[0] 100
+  set ints[1] 23
+  let readInts Span<i32> std.mem.bytesAsI32 ibytes
+  mut fbytes [8]u8 [0, 0, 0, 0, 0, 0, 0, 0]
+  let floats MutSpan<f32> std.mem.bytesAsMutF32 fbytes
+  let half f32 0.5
+  set floats[0] half
+  set floats[1] half
+  let one f32 1.0
+  mut qbytes [4]u8 [0, 0, 0, 0]
+  let q8 MutSpan<i8> std.mem.bytesAsMutI8 qbytes
+  let big i32 200
+  set q8[0] (big as i8)
+  let r8 Span<i8> std.mem.bytesAsI8 qbytes
+  if && (&& (&& (&& (&& (== (sumInts readInts) 123) (== (std.mem.len ints) 4)) (== (+ floats[0] floats[1]) one)) (== (r8[0] as i32) (- 0 56))) (== (std.mem.len q8) 4)) (== (std.mem.len r8) 4)
+    check world.out.write "bytes as spans ok\n"

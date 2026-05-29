@@ -1,0 +1,9 @@
+pub fn main Void world World !
+  let buf [8]u8 [0, 0, 128, 63, 0, 0, 0, 64]
+  let floats Span<f32> std.mem.bytesAsF32 buf
+  let v0 f32 floats[0]
+  let v1 f32 floats[1]
+  let one f32 1.0
+  let two f32 2.0
+  if && (== (std.mem.len floats) 2) (&& (== v0 one) (== v1 two))
+    check world.out.write "mem bytes as f32 ok\n"

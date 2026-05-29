@@ -26,6 +26,57 @@ function runnableExeArgs(input, out) {
 
 await mkdir(outDir, { recursive: true });
 
+// Fixtures flagged `{libm: true}` link against libm via the zero runtime obj+link path. On hosts
+// without a working C toolchain (e.g. no zig/clang/gcc reachable) that link fails as BLD003 — the
+// numerics for such fixtures can only be validated on hosts where obj+link succeeds. The arrays
+// below collect skipped/run names so the final summary surfaces what was actually exercised vs
+// tolerated, matching the pre-rebase harness contract.
+const libmSkipped = [];
+const hostNativeRan = [];
+const hostNativeSkipped = [];
+
+// cross-target runners. The host helper above only exercises one direct backend at
+// runtime (macho64 on darwin-arm64 or elf64 on linux-x64). The two probes below opt the harness
+// into two more *parallel* runtime exec paths when the environment supports them:
+//
+//   * linux/arm64 via Docker — covers the `aarch64_direct` ELF backend (linux-musl-arm64).
+//     Apple Silicon + Docker Desktop runs the platform natively; on x86_64 hosts Docker runs it
+//     under qemu (slower but still validates the binary). Off-docker hosts no-op.
+//
+//   * darwin-x64 via Rosetta — covers the `macho_x64` Mach-O backend on Apple Silicon hosts.
+//     Requires the macOS x86_64 SDK sysroot; the probe auto-discovers it via `xcrun` when the
+//     env var isn't already set.
+//
+// Both branches build, run, and assert in addition to (never instead of) the existing host helper.
+// Cross-target builds that gate-fail with BLD004 / CGEN004 / TAR002 are tolerated skips — the
+// backends are honest (they refuse rather than miscompile), and as more fixtures are added they
+// will flip from skip to run with no harness change.
+const dockerLinuxArm64 = await (async () => {
+  try {
+    const probe = await execFileAsync("docker", ["run", "--rm", "--platform", "linux/arm64", "alpine", "uname", "-m"]);
+    return probe.stdout.trim() === "aarch64";
+  } catch {
+    return false;
+  }
+})();
+
+const canRunDarwinX64Rosetta = await (async () => {
+  if (process.platform !== "darwin" || process.arch !== "arm64") return false;
+  if (process.env.ZERO_SYSROOT_X86_64_MACOS && process.env.ZERO_SYSROOT_X86_64_MACOS.length > 0) return true;
+  try {
+    const sdk = await execFileAsync("xcrun", ["--show-sdk-path"]);
+    process.env.ZERO_SYSROOT_X86_64_MACOS = sdk.stdout.trim();
+    return true;
+  } catch {
+    return false;
+  }
+})();
+
+const linuxArm64Ran = [];
+const linuxArm64Skipped = [];
+const darwinX64Ran = [];
+const darwinX64Skipped = [];
+
 async function assertBoundsTrap(fixture, name) {
   const out = `${outDir}/${name}`;
   const build = await execFileAsync(zero, ["build", "--json", "--emit", "exe", "--target", "linux-musl-x64", fixture, "--out", out]).catch((error) => error);
@@ -38,6 +89,7 @@ async function assertBoundsTrap(fixture, name) {
   assert.equal(body.generatedCBytes, 0);
   if (!canRunLinuxMuslX64) return;
   const failedRun = await execFileAsync(out, []).catch((error) => error);
+  assert.ok(failedRun.code !== 0 || failedRun.signal, `expected bounds trap, got clean exit for ${name}`);
   if (failedRun.stderr) assert.match(failedRun.stderr, /zero bounds check failed/);
 }
 
@@ -46,7 +98,15 @@ async function assertDirectRuntimeOrUnsupported(fixture, name, expected) {
   const build = await execFileAsync(zero, ["build", "--json", "--emit", "exe", "--target", "linux-musl-x64", fixture, "--out", out]).catch((error) => error);
   if (build.code) {
     const body = JSON.parse(build.stdout);
-    assert.equal(body.diagnostics?.[0]?.code, "BLD004");
+    const code = body.diagnostics?.[0]?.code;
+    // BLD004 = backend feature gate (tolerated as a skip — the backend honestly refuses, never miscompiles).
+    // BLD003 = host runtime obj+link failed: only tolerated for libm-flagged fixtures, where the numerics
+    // can be validated on a different host. Any other code is a regression and fails loudly.
+    assert.ok(code === "BLD004" || (code === "BLD003" && expected.libm), `unexpected diagnostic ${code} for ${name}`);
+    if (code === "BLD003" && expected.libm) {
+      libmSkipped.push(name);
+      console.warn(`warning: libm fixture ${name} skipped via BLD003 — host runtime obj+link failed; numerics validated only on hosts with a working toolchain.`);
+    }
     return;
   }
 
@@ -55,11 +115,49 @@ async function assertDirectRuntimeOrUnsupported(fixture, name, expected) {
   assert.equal(body.legacy, false);
   if (!canRunLinuxMuslX64) return;
   const run = await execFileAsync(out, expected.args ?? [], expected.env ? { env: { ...process.env, ...expected.env } } : {}).catch((error) => error);
-  if (run.code || run.signal) return;
+  // A built binary that crashes/exits non-zero is a miscompile, not a skip: fail loudly (the
+  // genuinely-unsupported case already returned above via the BLD004/BLD003 build branch).
+  assert.ok(!run.code && !run.signal, `host runtime crash for ${name} (code ${run.code ?? 0}, signal ${run.signal ?? "none"})`);
   if (expected.stdout instanceof RegExp) assert.match(run.stdout, expected.stdout);
   else assert.equal(run.stdout, expected.stdout);
   if (expected.stderr !== undefined) assert.equal(run.stderr, expected.stderr);
   if (expected.file) assert.equal(await readFile(`${outDir}/${expected.file.name}`, "utf8"), expected.file.text);
+}
+
+// Asserts a fixture exits with a specific non-zero exit code (e.g. exit-code-arithmetic.0 → 42)
+// and produces no stdout. Builds for linux-musl-x64 (BLD004-tolerated), runs only on native linux-x64.
+async function assertDirectExitCode(fixture, name, expected) {
+  const out = `${outDir}/${name}`;
+  const build = await execFileAsync(zero, ["build", "--json", "--emit", "exe", "--target", "linux-musl-x64", fixture, "--out", out]).catch((error) => error);
+  if (build.code) {
+    const body = JSON.parse(build.stdout);
+    assert.equal(body.diagnostics?.[0]?.code, "BLD004");
+    return;
+  }
+  const body = JSON.parse(build.stdout);
+  assert.equal(body.generatedCBytes, 0);
+  assert.equal(body.legacy, false);
+  if (!canRunLinuxMuslX64) return;
+  const run = await execFileAsync(out, expected.args ?? [], expected.env ? { env: { ...process.env, ...expected.env } } : {}).catch((error) => error);
+  assert.equal(run.code, expected.exitCode);
+  assert.equal(run.stdout ?? "", "");
+}
+
+// fs/page-alloc programs use the `fs` capability, which the default direct-exe heuristic
+// (self_host_subset_compatible) excludes — so the ELF64 raw-syscall exe path must be requested
+// explicitly via `--backend zero-elf64`. This builds it for linux-musl-x64 (must succeed,
+// generatedCBytes:0, pure direct backend), then runs it only on a native linux-x64 host.
+async function assertElfDirectFsBuilds(fixture, name, expected) {
+  const out = `${outDir}/${name}`;
+  const build = await execFileAsync(zero, ["build", "--json", "--emit", "exe", "--target", "linux-musl-x64", "--backend", "zero-elf64", fixture, "--out", out]);
+  const body = JSON.parse(build.stdout);
+  assert.equal(body.generatedCBytes, 0);
+  assert.equal(body.legacy, false);
+  if (!canRunLinuxMuslX64) return;
+  const run = await execFileAsync(out, expected.args ?? [], expected.env ? { env: { ...process.env, ...expected.env } } : {});
+  if (expected.stdout instanceof RegExp) assert.match(run.stdout, expected.stdout);
+  else assert.equal(run.stdout, expected.stdout);
+  if (expected.stderr !== undefined) assert.equal(run.stderr, expected.stderr);
 }
 
 async function assertDirectRuntimeRequired(fixture, name, expected) {
@@ -82,7 +180,13 @@ async function assertCommonRuntimeOrUnsupported(fixture, name, expected) {
   const build = await execFileAsync(zero, ["build", "--json", "--emit", "exe", "--target", target, fixture, "--out", out]).catch((error) => error);
   if (build.code) {
     const body = JSON.parse(build.stdout);
-    assert.equal(body.diagnostics?.[0]?.code, "BLD004");
+    const code = body.diagnostics?.[0]?.code;
+    assert.ok(code === "BLD004" || (code === "BLD003" && expected.libm), `unexpected host diagnostic ${code} for ${name}`);
+    if (code === "BLD003" && expected.libm) {
+      libmSkipped.push(`${name} (host)`);
+      console.warn(`warning: libm fixture ${name} skipped via BLD003 on host runtime — obj+link failed; numerics validated only on hosts with a working toolchain.`);
+    }
+    hostNativeSkipped.push(name);
     return;
   }
 
@@ -91,12 +195,189 @@ async function assertCommonRuntimeOrUnsupported(fixture, name, expected) {
   assert.equal(body.legacy, false);
   if (!runnableDirectTarget) return;
   const run = await execFileAsync(out, expected.args ?? [], expected.env ? { env: { ...process.env, ...expected.env } } : {}).catch((error) => error);
-  assert.equal(run.code ?? 0, 0);
-  assert.equal(run.signal ?? null, null);
-  if (expected.stdout instanceof RegExp) assert.match(run.stdout, expected.stdout);
-  else assert.equal(run.stdout, expected.stdout);
+  if (expected.exitCode !== undefined) {
+    assert.equal(run.code ?? 0, expected.exitCode, `host exit code mismatch for ${name}`);
+  } else {
+    assert.equal(run.code ?? 0, 0);
+    assert.equal(run.signal ?? null, null);
+  }
+  if (expected.stdout !== undefined) {
+    if (expected.stdout instanceof RegExp) assert.match(run.stdout, expected.stdout);
+    else assert.equal(run.stdout, expected.stdout);
+  }
   if (expected.stderr !== undefined) assert.equal(run.stderr, expected.stderr);
   if (expected.file) assert.equal(await readFile(`${outDir}/${expected.file.name}`, "utf8"), expected.file.text);
+  hostNativeRan.push(name);
+}
+
+// linux-musl-arm64 runtime branch. Build for `--target linux-musl-arm64` and, when
+// docker is present, execute the resulting ELF aarch64 binary in a `linux/arm64` container with
+// the repo bind-mounted as `/repo` so the binary sees the same relative paths it does on the
+// host (e.g. the `.zero/conformance/*.bin` input files written by Node above). Build gates
+// that the aarch64_direct backend hasn't covered yet surface as BLD004/CGEN004; capability gaps
+// (e.g. an `args` capability the manifest doesn't declare) surface as TAR002. All three are
+// tolerated as skips — the backend never accept-and-miscompiles. `expected.backend` overrides
+// the default routing by passing `--backend <name>` (needed for fs-capability fixtures, which
+// the self-host-subset heuristic excludes; mirrors the linux-musl-x64 `assertElfDirectFsBuilds`
+// convention).
+async function assertLinuxArm64NativeOrUnsupported(fixture, name, expected) {
+  if (!dockerLinuxArm64) return;
+  const out = `${outDir}/${name}-linux-arm64`;
+  await rm(out, { force: true });
+  const buildArgs = ["build", "--json", "--emit", "exe", "--target", "linux-musl-arm64"];
+  if (expected.backend) buildArgs.push("--backend", expected.backend);
+  buildArgs.push(fixture, "--out", out);
+  const build = await execFileAsync(zero, buildArgs).catch((error) => error);
+  if (build.code) {
+    const body = JSON.parse(build.stdout);
+    const code = body.diagnostics?.[0]?.code;
+    assert.ok(
+      code === "BLD004" || code === "CGEN004" || code === "TAR002" || (code === "BLD003" && expected.libm),
+      `unexpected linux-arm64 diagnostic ${code} for ${name}`,
+    );
+    if (code === "BLD003" && expected.libm) {
+      libmSkipped.push(`${name} (linux-arm64)`);
+      console.warn(`warning: libm fixture ${name} skipped via BLD003 on linux-musl-arm64 — host toolchain cannot cross-link the target libm.`);
+    }
+    linuxArm64Skipped.push(name);
+    return;
+  }
+  const body = JSON.parse(build.stdout);
+  assert.equal(body.generatedCBytes, 0);
+  assert.equal(body.legacy, false);
+  const repo = process.cwd();
+  const dockerArgs = [
+    "run", "--rm", "--platform", "linux/arm64",
+    "-v", `${repo}:/repo`, "-w", "/repo",
+    "alpine", `/repo/${out}`,
+    ...(expected.args ?? []),
+  ];
+  const runEnv = expected.env ? { env: { ...process.env, ...expected.env } } : {};
+  const run = await execFileAsync("docker", dockerArgs, runEnv).catch((error) => error);
+  if (expected.exitCode !== undefined) {
+    assert.equal(run.code ?? 0, expected.exitCode, `linux-arm64 exit code mismatch for ${name}`);
+  } else {
+    assert.equal(run.code ?? 0, 0, `linux-arm64 unexpected exit for ${name}: ${run.stderr ?? ""}`);
+    assert.equal(run.signal ?? null, null);
+  }
+  if (expected.stdout !== undefined) {
+    if (expected.stdout instanceof RegExp) assert.match(run.stdout, expected.stdout);
+    else assert.equal(run.stdout, expected.stdout);
+  }
+  if (expected.stderr !== undefined) assert.equal(run.stderr, expected.stderr);
+  if (expected.file) assert.equal(await readFile(`${outDir}/${expected.file.name}`, "utf8"), expected.file.text);
+  linuxArm64Ran.push(name);
+}
+
+// darwin-x64 (Rosetta) runtime branch. On Apple Silicon hosts the macho_x64 direct
+// backend produces a Mach-O x86_64 executable that runs natively via Rosetta 2; off Apple
+// Silicon this branch no-ops. Build gates the backend hasn't covered yet surface as BLD004 /
+// CGEN004; capability gaps surface as TAR002 (e.g. darwin-x64 does not declare `args`, so
+// std-args-libm gracefully skips). `expected.backend` is forwarded the same way as the
+// linux-arm64 helper.
+async function assertDarwinX64NativeOrUnsupported(fixture, name, expected) {
+  if (!canRunDarwinX64Rosetta) return;
+  const out = `${outDir}/${name}-darwin-x64`;
+  await rm(out, { force: true });
+  const buildArgs = ["build", "--json", "--emit", "exe", "--target", "darwin-x64"];
+  if (expected.backend) buildArgs.push("--backend", expected.backend);
+  buildArgs.push(fixture, "--out", out);
+  const build = await execFileAsync(zero, buildArgs).catch((error) => error);
+  if (build.code) {
+    const body = JSON.parse(build.stdout);
+    const code = body.diagnostics?.[0]?.code;
+    assert.ok(
+      code === "BLD004" || code === "CGEN004" || code === "TAR002" || (code === "BLD003" && expected.libm),
+      `unexpected darwin-x64 diagnostic ${code} for ${name}`,
+    );
+    if (code === "BLD003" && expected.libm) {
+      libmSkipped.push(`${name} (darwin-x64)`);
+      console.warn(`warning: libm fixture ${name} skipped via BLD003 on darwin-x64 — host obj+link failed.`);
+    }
+    darwinX64Skipped.push(name);
+    return;
+  }
+  const body = JSON.parse(build.stdout);
+  assert.equal(body.generatedCBytes, 0);
+  assert.equal(body.legacy, false);
+  const runEnv = expected.env ? { env: { ...process.env, ...expected.env } } : {};
+  const run = await execFileAsync(out, expected.args ?? [], runEnv).catch((error) => error);
+  if (expected.exitCode !== undefined) {
+    assert.equal(run.code ?? 0, expected.exitCode, `darwin-x64 exit code mismatch for ${name}`);
+  } else {
+    assert.equal(run.code ?? 0, 0, `darwin-x64 unexpected exit for ${name}: ${run.stderr ?? ""}`);
+    assert.equal(run.signal ?? null, null);
+  }
+  if (expected.stdout !== undefined) {
+    if (expected.stdout instanceof RegExp) assert.match(run.stdout, expected.stdout);
+    else assert.equal(run.stdout, expected.stdout);
+  }
+  if (expected.stderr !== undefined) assert.equal(run.stderr, expected.stderr);
+  if (expected.file) assert.equal(await readFile(`${outDir}/${expected.file.name}`, "utf8"), expected.file.text);
+  darwinX64Ran.push(name);
+}
+
+// linux-musl-arm64 bounds-trap sibling of assertBoundsTrap. Builds for `--target
+// linux-musl-arm64`; tolerates BLD004 / CGEN004 / TAR002 as backend feature gates (skip).
+// On success the binary runs in `linux/arm64` Docker (when available); the bounds-check trap
+// is aarch64 `brk #0xc000` → SIGTRAP → exit 133. Stderr "zero bounds check failed" is
+// matched if present, mirroring the host helper's lax stderr check (some traps short-circuit
+// before flushing). No-op when Docker `linux/arm64` is unavailable.
+async function assertLinuxArm64BoundsTrap(fixture, name) {
+  if (!dockerLinuxArm64) return;
+  const out = `${outDir}/${name}-linux-arm64`;
+  await rm(out, { force: true });
+  const build = await execFileAsync(zero, ["build", "--json", "--emit", "exe", "--target", "linux-musl-arm64", fixture, "--out", out]).catch((error) => error);
+  if (build.code) {
+    const body = JSON.parse(build.stdout);
+    const code = body.diagnostics?.[0]?.code;
+    assert.ok(code === "BLD004" || code === "CGEN004" || code === "TAR002", `unexpected linux-arm64 diagnostic ${code} for ${name}`);
+    linuxArm64Skipped.push(name);
+    return;
+  }
+  const body = JSON.parse(build.stdout);
+  assert.equal(body.generatedCBytes, 0);
+  assert.equal(body.legacy, false);
+  const repo = process.cwd();
+  const failedRun = await execFileAsync("docker", [
+    "run", "--rm", "--platform", "linux/arm64",
+    "-v", `${repo}:/repo`, "-w", "/repo",
+    "alpine", `/repo/${out}`,
+  ]).catch((error) => error);
+  // The trap must actually fire: a built binary that runs to a clean exit-0 is a miscompiled
+  // bounds check, not a pass. aarch64's trap is `brk #0xc000` → SIGTRAP (docker surfaces it as a
+  // non-zero exit). Keep the stderr message check lax (some traps short-circuit before flushing).
+  assert.ok(failedRun.code !== 0 || failedRun.signal, `expected bounds trap, got clean exit for ${name}`);
+  if (failedRun.stderr) assert.match(failedRun.stderr, /zero bounds check failed/);
+  linuxArm64Ran.push(name);
+}
+
+// darwin-x64 (Rosetta) bounds-trap sibling of assertBoundsTrap. Builds for `--target
+// darwin-x64`; tolerates BLD004 / CGEN004 / TAR002. On success the binary runs natively via
+// Rosetta 2 on Apple Silicon; the bounds-check trap is x86_64 `ud2` → SIGILL → exit 132.
+// No-op when Rosetta is unavailable (non-darwin-arm64 host).
+async function assertDarwinX64BoundsTrap(fixture, name) {
+  if (!canRunDarwinX64Rosetta) return;
+  const out = `${outDir}/${name}-darwin-x64`;
+  await rm(out, { force: true });
+  const build = await execFileAsync(zero, ["build", "--json", "--emit", "exe", "--target", "darwin-x64", fixture, "--out", out]).catch((error) => error);
+  if (build.code) {
+    const body = JSON.parse(build.stdout);
+    const code = body.diagnostics?.[0]?.code;
+    assert.ok(code === "BLD004" || code === "CGEN004" || code === "TAR002", `unexpected darwin-x64 diagnostic ${code} for ${name}`);
+    darwinX64Skipped.push(name);
+    return;
+  }
+  const body = JSON.parse(build.stdout);
+  assert.equal(body.generatedCBytes, 0);
+  assert.equal(body.legacy, false);
+  const failedRun = await execFileAsync(out, []).catch((error) => error);
+  // The trap must actually fire: a built binary that runs to a clean exit-0 is a miscompiled
+  // bounds check, not a pass. x86_64's trap is `ud2` → SIGILL. Keep the stderr message check lax
+  // (some traps short-circuit before flushing).
+  assert.ok(failedRun.code !== 0 || failedRun.signal, `expected bounds trap, got clean exit for ${name}`);
+  if (failedRun.stderr) assert.match(failedRun.stderr, /zero bounds check failed/);
+  darwinX64Ran.push(name);
 }
 
 async function assertCheckTimeoutOrDiagnostic(fixture, expectedCodes) {
@@ -288,6 +569,7 @@ async function assertPeCoffX64Executable(path) {
 
 for (const fixture of [
   "conformance/run/pass/hello.0",
+  "conformance/run/pass/safe-piece-suppress.0",
   "conformance/native/pass/params.0",
   "conformance/native/pass/shape.0",
   "conformance/native/pass/primitive-stdlib.0",
@@ -304,6 +586,7 @@ for (const fixture of [
   "conformance/native/pass/null-maybe.0",
   "conformance/native/pass/meta-typed-target-type.0",
   "conformance/native/pass/std-args.0",
+  "conformance/native/pass/std-args-libm.0",
   "conformance/native/pass/std-env.0",
   "conformance/native/pass/std-fs.0",
   "conformance/native/pass/std-fs-bytes.0",
@@ -335,6 +618,47 @@ for (const fixture of [
   "conformance/native/pass/radix-suffix-literals.0",
   "conformance/native/pass/char-literals.0",
   "conformance/native/pass/float-primitives.0",
+  "conformance/native/pass/float-arith-add-f32.0",
+  "conformance/native/pass/float-arith-add-f64.0",
+  "conformance/native/pass/float-arith-sub-f32.0",
+  "conformance/native/pass/float-arith-sub-f64.0",
+  "conformance/native/pass/float-arith-mul-f32.0",
+  "conformance/native/pass/float-arith-mul-f64.0",
+  "conformance/native/pass/float-arith-div-f32.0",
+  "conformance/native/pass/float-arith-div-f64.0",
+  "conformance/native/pass/float-cast-f32-to-f64.0",
+  "conformance/native/pass/float-cast-f64-to-f32.0",
+  "conformance/native/pass/float-cast-f32-to-i32.0",
+  "conformance/native/pass/float-cast-f64-to-i32.0",
+  "conformance/native/pass/float-cast-i32-to-f32.0",
+  "conformance/native/pass/float-cast-i32-to-f64.0",
+  "conformance/native/pass/float-compare-eq-f32.0",
+  "conformance/native/pass/float-compare-eq-f64.0",
+  "conformance/native/pass/float-compare-ne-f32.0",
+  "conformance/native/pass/float-compare-ne-f64.0",
+  "conformance/native/pass/float-compare-lt-f32.0",
+  "conformance/native/pass/float-compare-lt-f64.0",
+  "conformance/native/pass/float-compare-le-f32.0",
+  "conformance/native/pass/float-compare-le-f64.0",
+  "conformance/native/pass/float-compare-gt-f32.0",
+  "conformance/native/pass/float-compare-gt-f64.0",
+  "conformance/native/pass/float-compare-ge-f32.0",
+  "conformance/native/pass/float-compare-ge-f64.0",
+  "conformance/native/pass/float-inf-arith.0",
+  "conformance/native/pass/float-nan-compare.0",
+  "conformance/native/pass/math-sqrtf-known-values.0",
+  "conformance/native/pass/math-expf-known-values.0",
+  "conformance/native/pass/math-cosf-sinf-identity.0",
+  "conformance/native/pass/math-powf-known-values.0",
+  "conformance/native/pass/math-absf-floorf.0",
+  "conformance/native/pass/math-isnanf.0",
+  "conformance/native/pass/math-matmul-span.0",
+  "conformance/native/pass/math-rmsnorm-smoke.0",
+  "conformance/native/pass/math-rmsnorm-span.0",
+  "conformance/native/pass/math-softmax-smoke.0",
+  "conformance/native/pass/math-softmax-span.0",
+  "conformance/native/pass/math-rope-span.0",
+  "conformance/native/pass/math-swiglu-span.0",
   "conformance/native/pass/wrapping-saturating-arithmetic.0",
   "conformance/native/pass/maybe-error-flow.0",
   "conformance/native/pass/match-scalar-guards.0",
@@ -346,18 +670,61 @@ for (const fixture of [
   "conformance/native/pass/checked-fallible-static-method.0",
   "conformance/native/pass/checked-fallible-interface-method.0",
   "conformance/native/pass/fallibility-check-value.0",
+  "conformance/native/pass/fallible-return-f32.0",
+  "conformance/native/pass/fallible-return-f64.0",
+  "conformance/native/pass/fallible-return-i64.0",
+  "conformance/native/pass/fallible-return-u64.0",
+  "conformance/native/pass/fallible-return-usize-wide.0",
+  "conformance/native/pass/fallible-void-fallthrough.0",
+  "conformance/native/pass/fallible-return-record.0",
+  "conformance/native/pass/fallible-return-record-discard.0",
+  "conformance/native/pass/ref-record-param.0",
+  "conformance/native/pass/mutref-record-param.0",
+  "conformance/native/pass/ref-record-span-field.0",
   "conformance/native/pass/rescue-check.0",
   "conformance/native/pass/std-fs-fallible.0",
   "conformance/native/pass/std-fs-fallible-resources.0",
+  "conformance/native/pass/fs-mmap-page.0",
+  "conformance/native/pass/mmap-maybe-success.0",
+  "conformance/native/pass/mmap-file-notfound.0",
+  "conformance/native/pass/mmap-file-readonly.0",
+  "conformance/native/pass/mmap-munmap-loop.0",
+  "conformance/native/pass/mmap-munmap-early-return.0",
+  "conformance/native/pass/page-alloc-region.0",
+  "conformance/native/pass/mem-bytes-as-f32-mmap.0",
+  "conformance/native/pass/mmap-maybe-4gib-len.0",
   "conformance/native/pass/std-cli-helpers.0",
   "conformance/native/pass/std-mem-copy-fill.0",
   "conformance/native/pass/const-layout.0",
   "conformance/native/pass/c-abi-export.0",
+  "conformance/native/pass/exit-code-arithmetic.0",
+  "conformance/native/pass/aggregate-shape-abi.0",
+  "conformance/native/pass/aggregate-float-field-sret.0",
+  "conformance/native/pass/call-int-float.0",
+  "conformance/native/pass/generate-loop.0",
+  "conformance/native/pass/generate-argmax.0",
+  "conformance/native/pass/generate-argmax-q.0",
+  "conformance/native/pass/sampler-sample.0",
+  "conformance/native/pass/sampler-topk-topp.0",
+  "conformance/native/pass/tokenizer-encode.0",
+  "conformance/native/pass/transformer-forward.0",
+  "conformance/native/pass/transformer-forwardq.0",
+  "conformance/native/pass/checkpoint-q-v2.0",
+  "conformance/native/pass/ops-q-matmul.0",
+  "conformance/native/pass/ops-q-quantize.0",
   "conformance/native/pass/range-slices.0",
   "conformance/native/pass/generic-spans.0",
   "conformance/native/pass/open-ended-slices.0",
   "conformance/native/pass/string-slices.0",
   "conformance/native/pass/coff-dynamic-byte-slice-blocked.0",
+  "conformance/native/pass/coff-float-builds.0",
+  "conformance/native/pass/coff-float-arg-call-builds.0",
+  "conformance/native/pass/coff-math-builds.0",
+  "conformance/native/pass/coff-bytes-as-builds.0",
+  "conformance/native/pass/coff-codec-le-builds.0",
+  "conformance/native/pass/coff-fallible-builds.0",
+  "conformance/native/pass/coff-aggregate-builds.0",
+  "conformance/native/pass/coff-mmap-builds.0",
   "conformance/native/pass/macho-large-byte-slice-blocked.0",
   "conformance/native/pass/macho-nested-call-scratch-blocked.0",
   "conformance/native/pass/macho-open-byte-slice-blocked.0",
@@ -365,6 +732,36 @@ for (const fixture of [
   "conformance/native/pass/indexed-mutation.0",
   "conformance/native/pass/nested-lvalues.0",
   "conformance/native/pass/mutable-spans.0",
+  "conformance/native/pass/mem-bytes-as-spans.0",
+  "conformance/native/pass/codec-le-reads.0",
+  "conformance/native/pass/codec-read-i32-le.0",
+  "conformance/native/pass/codec-read-u32-le.0",
+  "conformance/native/pass/codec-read-f32-le.0",
+  "conformance/native/pass/codec-read-f64-le.0",
+  "conformance/native/pass/codec-read-i32-le-offset.0",
+  "conformance/native/pass/codec-read-f32-le-offset.0",
+  "conformance/native/pass/codec-read-u16-le.0",
+  "conformance/native/pass/codec-read-i64-le.0",
+  "conformance/native/pass/codec-read-u64-le.0",
+  "conformance/native/pass/mem-bytes-as-i32.0",
+  "conformance/native/pass/mem-bytes-as-mut-i32.0",
+  "conformance/native/pass/mem-bytes-as-f32.0",
+  "conformance/native/pass/mem-bytes-as-mut-f32.0",
+  "conformance/native/pass/mem-bytes-as-f64.0",
+  "conformance/native/pass/mem-bytes-as-i8.0",
+  "conformance/native/pass/mem-bytes-as-mut-i8.0",
+  "conformance/native/pass/mem-bytes-as-i64.0",
+  "conformance/native/pass/mem-bytes-as-u64.0",
+  "conformance/native/pass/mem-bytes-as-u8.0",
+  "conformance/native/pass/mem-bytes-as-mut-i64.0",
+  "conformance/native/pass/mem-bytes-as-mut-u64.0",
+  "conformance/native/pass/typed-span-f32.0",
+  "conformance/native/pass/typed-span-i32.0",
+  "conformance/native/pass/typed-span-from-array.0",
+  "conformance/native/pass/mem-mut-span-array-store.0",
+  "conformance/native/pass/mem-mut-span-slice.0",
+  "conformance/native/pass/mem-mut-span-u8-store.0",
+  "conformance/native/pass/mem-bytes-as-mut-slice.0",
   "conformance/native/pass/mutref-indexed-lvalues.0",
   "conformance/native/pass/generic-mem.0",
   "conformance/native/pass/generic-function-basic.0",
@@ -431,6 +828,7 @@ for (const fixture of [
   "conformance/native/pass/std-mem-arena.0",
   "conformance/native/pass/std-mem-collections.0",
   "conformance/native/pass/owned-byte-buffer.0",
+  "conformance/native/pass/mem-fixed-buf-alloc.0",
   "conformance/check/pass/generic-function-basic.0",
   "conformance/check/pass/generic-array-inference.0",
   "conformance/check/pass/generic-static-explicit-shadowing.0",
@@ -475,6 +873,7 @@ for (const fixture of [
   "conformance/check/pass/package",
   "conformance/check/pass/imports",
   "examples/memory-package",
+  "examples/llama2",
   "examples/const-arithmetic.0",
   "examples/generic-pair.0",
   "examples/fixed-vec.0",
@@ -845,6 +1244,44 @@ const directStringCoffExeBody = JSON.parse(directStringCoffExe.stdout);
 assert.equal(directStringCoffExeBody.compiler, "zero-coff-x64");
 assert.equal(directStringCoffExeBody.generatedCBytes, 0);
 
+// Windows (COFF) build verification helper. Windows is NOT a CLI exec target (TAR001) so we verify by building
+// the COFF object/executable for both `win32-x64.exe` and `win32-arm64.exe` and asserting the
+// build is a pure direct-backend native artifact (generatedCBytes:0, expected compiler + arch).
+// Each per-feature fixture is wired through this helper.
+async function assertCoffBuilds(fixture, outBaseName) {
+  for (const [target, compiler, suffix] of [
+    ["win32-x64.exe", "zero-coff-x64", "x64"],
+    ["win32-arm64.exe", "zero-coff-aarch64", "arm64"],
+  ]) {
+    for (const emit of ["obj", "exe"]) {
+      const out = `${outDir}/${outBaseName}-${suffix}.${emit === "obj" ? "obj" : "exe"}`;
+      // fs-capability fixtures fail the self-host-subset check on COFF unless `--backend`
+      // is passed explicitly (Linux uses the same pattern via `--backend zero-elf64`). Pass the
+      // direct backend so the executable path is requested explicitly.
+      const args = ["build", "--json", "--emit", emit, "--target", target, fixture, "--out", out];
+      if (emit === "exe") {
+        args.splice(args.length - 2, 0, "--backend", compiler);
+      }
+      const build = await execFileAsync(zero, args);
+      const body = JSON.parse(build.stdout);
+      assert.notEqual(body.ok, false, `${fixture} build for ${target} ${emit} failed: ${build.stdout.slice(0, 200)}`);
+      assert.equal(body.compiler, compiler, `${fixture} compiler mismatch for ${target} ${emit}`);
+      assert.equal(body.generatedCBytes, 0, `${fixture} produced generated C bytes for ${target} ${emit}`);
+      assert(body.artifactBytes > 0, `${fixture} produced empty artifact for ${target} ${emit}`);
+      assert.equal(body.legacy, false, `${fixture} routed through legacy backend for ${target} ${emit}`);
+    }
+  }
+}
+
+await assertCoffBuilds("conformance/native/pass/coff-float-builds.0", "coff-float-builds");
+await assertCoffBuilds("conformance/native/pass/coff-float-arg-call-builds.0", "coff-float-arg-call-builds");
+await assertCoffBuilds("conformance/native/pass/coff-math-builds.0", "coff-math-builds");
+await assertCoffBuilds("conformance/native/pass/coff-bytes-as-builds.0", "coff-bytes-as-builds");
+await assertCoffBuilds("conformance/native/pass/coff-codec-le-builds.0", "coff-codec-le-builds");
+await assertCoffBuilds("conformance/native/pass/coff-fallible-builds.0", "coff-fallible-builds");
+await assertCoffBuilds("conformance/native/pass/coff-aggregate-builds.0", "coff-aggregate-builds");
+await assertCoffBuilds("conformance/native/pass/coff-mmap-builds.0", "coff-mmap-builds");
+
 const coffDynamicSliceFixture = "conformance/native/pass/coff-dynamic-byte-slice-blocked.0";
 const coffDynamicSliceReadiness = await execFileAsync(zero, [
   "check",
@@ -960,6 +1397,9 @@ assert.equal(machoBoolArraysBody.compiler, "zero-macho64");
 assert.equal(machoBoolArraysBody.generatedCBytes, 0);
 assert.equal(machoBoolArraysBody.objectBackend.objectEmission.path, "direct-macho64-object");
 
+// linux-arm64 (ELF aarch64) supports general user-function CALL with int + float +
+// Span<u8> args/returns, so examples/direct-call-add.0 builds clean as a pure direct-backend
+// object (no generated C).
 const directCallArm64ObjReadiness = await execFileAsync(zero, [
   "check",
   "--json",
@@ -972,12 +1412,9 @@ const directCallArm64ObjReadiness = await execFileAsync(zero, [
 const directCallArm64ObjReadinessBody = JSON.parse(directCallArm64ObjReadiness.stdout);
 assert.equal(directCallArm64ObjReadinessBody.ok, true);
 assert.equal(directCallArm64ObjReadinessBody.diagnostics.length, 0);
-assert.equal(directCallArm64ObjReadinessBody.targetReadiness.ok, false);
-assert.equal(directCallArm64ObjReadinessBody.targetReadiness.buildable, false);
-assert.equal(directCallArm64ObjReadinessBody.targetReadiness.diagnostics[0].code, "BLD004");
-assert.equal(directCallArm64ObjReadinessBody.targetReadiness.diagnostics[0].backendBlocker.backend, "zero-elf-aarch64");
-assert.equal(directCallArm64ObjReadinessBody.targetReadiness.diagnostics[0].backendBlocker.stage, "buildability");
-assert.match(directCallArm64ObjReadinessBody.targetReadiness.diagnostics[0].message, /without parameters|small integer literal/);
+assert.equal(directCallArm64ObjReadinessBody.targetReadiness.ok, true);
+assert.equal(directCallArm64ObjReadinessBody.targetReadiness.buildable, true);
+assert.equal(directCallArm64ObjReadinessBody.targetReadiness.backend, "zero-elf-aarch64");
 const directCallArm64ObjBuild = await execFileAsync(zero, [
   "build",
   "--json",
@@ -987,17 +1424,27 @@ const directCallArm64ObjBuild = await execFileAsync(zero, [
   "linux-arm64",
   "examples/direct-call-add.0",
   "--out",
-  `${outDir}/direct-call-add-arm64-blocked.o`,
-]).catch((error) => error);
-assert.notEqual(directCallArm64ObjBuild.code, 0);
+  `${outDir}/direct-call-add-arm64.o`,
+]);
 const directCallArm64ObjBuildBody = JSON.parse(directCallArm64ObjBuild.stdout);
-const directCallArm64ObjReadinessDiag = directCallArm64ObjReadinessBody.targetReadiness.diagnostics[0];
-const directCallArm64ObjBuildDiag = directCallArm64ObjBuildBody.diagnostics[0];
-for (const key of ["code", "path", "line", "column", "length", "expected", "actual", "help"]) {
-  assert.equal(directCallArm64ObjBuildDiag[key], directCallArm64ObjReadinessDiag[key]);
-}
-assert.equal(directCallArm64ObjBuildDiag.backendBlocker.backend, "zero-elf-aarch64");
-assert.equal(directCallArm64ObjBuildDiag.backendBlocker.stage, "buildability");
+assert.equal(directCallArm64ObjBuildBody.generatedCBytes, 0);
+assert.equal(directCallArm64ObjBuildBody.compiler, "zero-elf-aarch64");
+// General user-fn CALL is wired into the COFF aarch64 backend (via record_user_call_patch
+// + R_ARM64_BRANCH26 reloc on obj path / patched BL on exe path); the gate that previously
+// rejected this fixture with BLD004 is now open.
+const directCallWinArm64Readiness = await execFileAsync(zero, [
+  "check",
+  "--json",
+  "--emit",
+  "obj",
+  "--target",
+  "win32-arm64.exe",
+  "examples/direct-call-add.0",
+]);
+const directCallWinArm64ReadinessBody = JSON.parse(directCallWinArm64Readiness.stdout);
+assert.equal(directCallWinArm64ReadinessBody.targetReadiness.ok, true);
+assert.equal(directCallWinArm64ReadinessBody.targetReadiness.buildable, true);
+assert.equal(directCallWinArm64ReadinessBody.targetReadiness.backend, "zero-coff-aarch64");
 
 let arm64NestedIndexExpr = "values[idx]";
 for (let i = 0; i < 32; i++) arm64NestedIndexExpr = `(+ 0_u32 ${arm64NestedIndexExpr})`;
@@ -2399,6 +2846,21 @@ assert(memoryGraphBody.requiresCapabilities.includes("memory"));
 assert(!memoryGraphBody.requiresCapabilities.includes("fs"));
 assert.equal(memoryGraphBody.targetSupport.fsAvailable, true);
 assert.equal(memoryGraphBody.targetSupport.requiredCapabilitySupport.status, "supported");
+// mathRuntime graph-JSON (target.c z_append_math_runtime_json): linux ELF resolves std.math
+// through libm via the runtime-object direct link plan — the same predicate that gates the
+// ELF-AArch64 runtime-object cache key. Pin the string fields so a regression in either is loud.
+assert.equal(memoryGraphBody.targetSupport.mathRuntime.status, "supported");
+assert.equal(memoryGraphBody.targetSupport.mathRuntime.provider, "libm");
+assert.equal(memoryGraphBody.targetSupport.mathRuntime.providerLink, "system-library");
+assert.deepEqual(memoryGraphBody.targetSupport.mathRuntime.systemLibraries, ["m"]);
+assert.match(memoryGraphBody.targetSupport.mathRuntime.reason, /linux ELF direct link plan resolves std\.math/);
+// Negative branch: COFF lacks the runtime-object direct link plan, so mathRuntime is unsupported
+// (mirrors the cache-key predicate that the ELF/Mach-O object backends satisfy and COFF does not).
+const winMathGraph = await execFileAsync(zero, ["graph", "--json", "--target", "win32-x64.exe", "examples/memory-package"]);
+const winMathGraphBody = JSON.parse(winMathGraph.stdout);
+assert.equal(winMathGraphBody.targetSupport.mathRuntime.status, "unsupported");
+assert.equal(winMathGraphBody.targetSupport.mathRuntime.provider, null);
+assert.match(winMathGraphBody.targetSupport.mathRuntime.reason, /requires the ELF or Mach-O direct object link plan/);
 assert.equal(memoryGraphBody.symbolCounts.public, 5);
 assert(memoryGraphBody.stdlibHelpers.some((helper) => helper.name === "std.mem.copy" && helper.targetSupport === "target-neutral"));
 assert(memoryGraphBody.stdlibHelpers.some((helper) => helper.name === "std.fs.createOrRaise" && helper.targetSupport === "host"));
@@ -2595,6 +3057,14 @@ assert.notEqual(targetProcUnsupportedJson.code, 0);
 const targetProcUnsupportedBody = JSON.parse(targetProcUnsupportedJson.stdout);
 assert.equal(targetProcUnsupportedBody.diagnostics[0].code, "TAR002");
 assert.match(targetProcUnsupportedBody.diagnostics[0].actual, /lacks Proc/);
+
+// std.fs.* against a target whose manifest omits the `fs` capability (linux-x64 gnu) must reject
+// with TAR002 rather than emit code for an absent capability.
+const targetFsUnsupportedJson = await execFileAsync(zero, ["check", "--json", "--target", "linux-x64", "conformance/native/fail/std-fs-target-unsupported.0"]).catch((error) => error);
+assert.notEqual(targetFsUnsupportedJson.code, 0);
+const targetFsUnsupportedBody = JSON.parse(targetFsUnsupportedJson.stdout);
+assert.equal(targetFsUnsupportedBody.diagnostics[0].code, "TAR002");
+assert.match(targetFsUnsupportedBody.diagnostics[0].actual, /lacks Fs/);
 
 const cHeaderGraph = await execFileAsync(zero, ["graph", "--json", "conformance/check/pass/c-header-import.0"]);
 const cHeaderGraphBody = JSON.parse(cHeaderGraph.stdout);
@@ -2929,6 +3399,7 @@ for (const runtimeFixture of [
   ["conformance/native/pass/match-choice-fallback.0", "match-choice-fallback", { stdout: "choice fallback ok\n" }],
   ["conformance/native/pass/null-maybe.0", "null-maybe", { stdout: /null maybe ok/ }],
   ["conformance/native/pass/std-args.0", "std-args", { stdout: "alpha\n", args: ["alpha", "beta"] }],
+  ["conformance/native/pass/std-args-libm.0", "std-args-libm-elf64", { stdout: "std args libm ok\n", args: ["hellofoo!"], libm: true }],
   ["conformance/native/pass/std-env.0", "std-env", { stdout: "env ok\n", env: { ZERO_CONFORMANCE_ENV: "agent-env" } }],
   ["conformance/native/pass/std-fs.0", "std-fs", { stdout: "fs ok\n", file: { name: "std-fs-write.txt", text: "zero write\n" } }],
   ["conformance/native/pass/std-fs-bytes.0", "std-fs-bytes", { stdout: "fs bytes ok\n", stderr: "fs bytes err ok\n" }],
@@ -2942,11 +3413,72 @@ for (const runtimeFixture of [
   ["conformance/native/pass/radix-suffix-literals.0", "radix-suffix-literals", { stdout: "radix suffix literals ok\n" }],
   ["conformance/native/pass/char-literals.0", "char-literals", { stdout: "char literals ok\n" }],
   ["conformance/native/pass/float-primitives.0", "float-primitives", { stdout: "float primitives ok\n" }],
+  ["conformance/native/pass/float-arith-add-f32.0", "float-arith-add-f32", { stdout: "float add f32 ok\n" }],
+  ["conformance/native/pass/float-arith-add-f64.0", "float-arith-add-f64", { stdout: "float add f64 ok\n" }],
+  ["conformance/native/pass/float-arith-sub-f32.0", "float-arith-sub-f32", { stdout: "float sub f32 ok\n" }],
+  ["conformance/native/pass/float-arith-sub-f64.0", "float-arith-sub-f64", { stdout: "float sub f64 ok\n" }],
+  ["conformance/native/pass/float-arith-mul-f32.0", "float-arith-mul-f32", { stdout: "float mul f32 ok\n" }],
+  ["conformance/native/pass/float-arith-mul-f64.0", "float-arith-mul-f64", { stdout: "float mul f64 ok\n" }],
+  ["conformance/native/pass/float-arith-div-f32.0", "float-arith-div-f32", { stdout: "float div f32 ok\n" }],
+  ["conformance/native/pass/float-arith-div-f64.0", "float-arith-div-f64", { stdout: "float div f64 ok\n" }],
+  ["conformance/native/pass/float-cast-f32-to-f64.0", "float-cast-f32-to-f64", { stdout: "float cast f32 to f64 ok\n" }],
+  ["conformance/native/pass/float-cast-f64-to-f32.0", "float-cast-f64-to-f32", { stdout: "float cast f64 to f32 ok\n" }],
+  ["conformance/native/pass/float-cast-f32-to-i32.0", "float-cast-f32-to-i32", { stdout: "float cast f32 to i32 ok\n" }],
+  ["conformance/native/pass/float-cast-f64-to-i32.0", "float-cast-f64-to-i32", { stdout: "float cast f64 to i32 ok\n" }],
+  ["conformance/native/pass/float-cast-i32-to-f32.0", "float-cast-i32-to-f32", { stdout: "float cast i32 to f32 ok\n" }],
+  ["conformance/native/pass/float-cast-i32-to-f64.0", "float-cast-i32-to-f64", { stdout: "float cast i32 to f64 ok\n" }],
+  ["conformance/native/pass/float-compare-eq-f32.0", "float-compare-eq-f32", { stdout: "float eq f32 ok\n" }],
+  ["conformance/native/pass/float-compare-eq-f64.0", "float-compare-eq-f64", { stdout: "float eq f64 ok\n" }],
+  ["conformance/native/pass/float-compare-ne-f32.0", "float-compare-ne-f32", { stdout: "float ne f32 ok\n" }],
+  ["conformance/native/pass/float-compare-ne-f64.0", "float-compare-ne-f64", { stdout: "float ne f64 ok\n" }],
+  ["conformance/native/pass/float-compare-lt-f32.0", "float-compare-lt-f32", { stdout: "float lt f32 ok\n" }],
+  ["conformance/native/pass/float-compare-lt-f64.0", "float-compare-lt-f64", { stdout: "float lt f64 ok\n" }],
+  ["conformance/native/pass/float-compare-le-f32.0", "float-compare-le-f32", { stdout: "float le f32 ok\n" }],
+  ["conformance/native/pass/float-compare-le-f64.0", "float-compare-le-f64", { stdout: "float le f64 ok\n" }],
+  ["conformance/native/pass/float-compare-gt-f32.0", "float-compare-gt-f32", { stdout: "float gt f32 ok\n" }],
+  ["conformance/native/pass/float-compare-gt-f64.0", "float-compare-gt-f64", { stdout: "float gt f64 ok\n" }],
+  ["conformance/native/pass/float-compare-ge-f32.0", "float-compare-ge-f32", { stdout: "float ge f32 ok\n" }],
+  ["conformance/native/pass/float-compare-ge-f64.0", "float-compare-ge-f64", { stdout: "float ge f64 ok\n" }],
+  ["conformance/native/pass/float-inf-arith.0", "float-inf-arith", { stdout: "float inf arith ok\n" }],
+  ["conformance/native/pass/float-nan-compare.0", "float-nan-compare", { stdout: "float nan compare ok\n" }],
+  ["conformance/native/pass/math-sqrtf-known-values.0", "math-sqrtf-known-values-elf64", { stdout: "math sqrtf ok\n", libm: true }],
+  ["conformance/native/pass/math-expf-known-values.0", "math-expf-known-values-elf64", { stdout: "math expf ok\n", libm: true }],
+  ["conformance/native/pass/math-cosf-sinf-identity.0", "math-cosf-sinf-identity-elf64", { stdout: "math cosf sinf ok\n", libm: true }],
+  ["conformance/native/pass/math-powf-known-values.0", "math-powf-known-values-elf64", { stdout: "math powf ok\n", libm: true }],
+  ["conformance/native/pass/math-absf-floorf.0", "math-absf-floorf-elf64", { stdout: "math absf floorf ok\n", libm: true }],
+  ["conformance/native/pass/math-isnanf.0", "math-isnanf-elf64", { stdout: "math isNaNf ok\n" }],
+  ["conformance/native/pass/math-matmul-span.0", "math-matmul-span-elf64", { stdout: "math matmul span ok\n" }],
+  ["conformance/native/pass/math-rmsnorm-smoke.0", "math-rmsnorm-smoke-elf64", { stdout: "math rmsnorm ok\n", libm: true }],
+  ["conformance/native/pass/math-rmsnorm-span.0", "math-rmsnorm-span-elf64", { stdout: "math rmsnorm span ok\n", libm: true }],
+  ["conformance/native/pass/math-softmax-smoke.0", "math-softmax-smoke-elf64", { stdout: "math softmax ok\n", libm: true }],
+  ["conformance/native/pass/math-softmax-span.0", "math-softmax-span-elf64", { stdout: "math softmax span ok\n", libm: true }],
+  ["conformance/native/pass/math-rope-span.0", "math-rope-span-elf64", { stdout: "math rope span ok\n", libm: true }],
+  ["conformance/native/pass/math-swiglu-span.0", "math-swiglu-span-elf64", { stdout: "math swiglu span ok\n", libm: true }],
   ["conformance/native/pass/recursive-fibonacci.0", "recursive-fibonacci", { stdout: "recursive fibonacci ok\n" }],
   ["conformance/native/pass/scratch-nested-index.0", "scratch-nested-index", { stdout: "scratch nested index ok\n" }],
   ["conformance/native/pass/checked-bounds-get.0", "checked-bounds-get", { stdout: "checked bounds get ok\n" }],
   ["conformance/native/pass/check-maybe-fallibility.0", "check-maybe-fallibility", { stdout: "check maybe fallibility ok\n" }],
   ["conformance/native/pass/fallibility-error-sets.0", "fallibility-error-sets", { stdout: "fallibility error sets ok\n" }],
+  ["conformance/native/pass/fallible-return-f32.0", "fallible-return-f32", { stdout: "fallible f32 ok\n" }],
+  ["conformance/native/pass/fallible-return-f64.0", "fallible-return-f64", { stdout: "fallible f64 ok\n" }],
+  ["conformance/native/pass/fallible-return-i64.0", "fallible-return-i64", { stdout: "fallible i64 ok\n" }],
+  ["conformance/native/pass/fallible-return-u64.0", "fallible-return-u64", { stdout: "fallible u64 ok\n" }],
+  ["conformance/native/pass/fallible-return-usize-wide.0", "fallible-return-usize-wide", { stdout: "fallible usize wide ok\n" }],
+  ["conformance/native/pass/fallible-void-fallthrough.0", "fallible-void-fallthrough", { stdout: "fallible void fallthrough ok\n" }],
+  // elf64: raising+record lowers on linux-musl-x64 — assert the full success stdout
+  // (six lines printed by the six per-path checks) when the runtime is available. Other backends
+  // that haven't ported yet still skip via BLD004 (the assertion is tolerated by the helper).
+  ["conformance/native/pass/fallible-return-record.0", "fallible-return-record-elf64", { stdout: "fallible record check ok\nfallible record rescue err ok\nfallible record rescue ok ok\nret check ok\nret rescue err ok\nret rescue ok ok\n" }],
+  // The discard variant propagates the error to the OS exit code (1); helper tolerates non-zero
+  // exit (treated as graceful failure) and skips the stdout check in that case.
+  ["conformance/native/pass/fallible-return-record-discard.0", "fallible-return-record-discard-elf64", { stdout: "" }],
+  // ref<Record> / mutref<Record> lowers on elf64 (linux-musl-x64) as well as the host
+  // macho64 backend — the build path is mandatory. Runtime exec runs natively on linux-musl-x64
+  // hosts; non-linux hosts skip exec (build-only verification) and the binary is also exercised
+  // via Docker amd64.
+  ["conformance/native/pass/ref-record-param.0", "ref-record-param-elf64", { stdout: "ref record param ok\n" }],
+  ["conformance/native/pass/mutref-record-param.0", "mutref-record-param-elf64", { stdout: "mutref record param ok\n" }],
+  ["conformance/native/pass/ref-record-span-field.0", "ref-record-span-field-elf64", { stdout: "ref record span field ok\n" }],
   ["conformance/native/pass/rescue-check.0", "rescue-check", { stdout: "rescue ok\n" }],
   ["conformance/native/pass/std-fs-fallible.0", "std-fs-fallible", { stdout: "fs named errors ok\n" }],
   ["conformance/native/pass/std-fs-fallible-resources.0", "std-fs-fallible-resources", { stdout: "fs fallible resources ok\n" }],
@@ -2991,6 +3523,36 @@ for (const runtimeFixture of [
   ["conformance/native/pass/indexed-mutation.0", "indexed-mutation", { stdout: "indexed mutation ok\n" }],
   ["conformance/native/pass/nested-lvalues.0", "nested-lvalues", { stdout: "nested lvalues ok\n" }],
   ["conformance/native/pass/mutable-spans.0", "mutable-spans", { stdout: "mutable spans ok\n" }],
+  ["conformance/native/pass/mem-bytes-as-spans.0", "mem-bytes-as-spans", { stdout: "bytes as spans ok\n" }],
+  ["conformance/native/pass/codec-le-reads.0", "codec-le-reads-elf64", { stdout: "codec le reads ok\n" }],
+  ["conformance/native/pass/codec-read-i32-le.0", "codec-read-i32-le", { stdout: "codec read i32 le ok\n" }],
+  ["conformance/native/pass/codec-read-u32-le.0", "codec-read-u32-le", { stdout: "codec read u32 le ok\n" }],
+  ["conformance/native/pass/codec-read-f32-le.0", "codec-read-f32-le", { stdout: "codec read f32 le ok\n" }],
+  ["conformance/native/pass/codec-read-f64-le.0", "codec-read-f64-le", { stdout: "codec read f64 le ok\n" }],
+  ["conformance/native/pass/codec-read-i32-le-offset.0", "codec-read-i32-le-offset", { stdout: "codec read i32 le offset ok\n" }],
+  ["conformance/native/pass/codec-read-f32-le-offset.0", "codec-read-f32-le-offset", { stdout: "codec read f32 le offset ok\n" }],
+  ["conformance/native/pass/codec-read-u16-le.0", "codec-read-u16-le", { stdout: "codec read u16 le ok\n" }],
+  ["conformance/native/pass/codec-read-i64-le.0", "codec-read-i64-le", { stdout: "codec read i64 le ok\n" }],
+  ["conformance/native/pass/codec-read-u64-le.0", "codec-read-u64-le", { stdout: "codec read u64 le ok\n" }],
+  ["conformance/native/pass/mem-bytes-as-i32.0", "mem-bytes-as-i32", { stdout: "mem bytes as i32 ok\n" }],
+  ["conformance/native/pass/mem-bytes-as-mut-i32.0", "mem-bytes-as-mut-i32", { stdout: "mem bytes as mut i32 ok\n" }],
+  ["conformance/native/pass/mem-bytes-as-f32.0", "mem-bytes-as-f32", { stdout: "mem bytes as f32 ok\n" }],
+  ["conformance/native/pass/mem-bytes-as-mut-f32.0", "mem-bytes-as-mut-f32", { stdout: "mem bytes as mut f32 ok\n" }],
+  ["conformance/native/pass/mem-bytes-as-f64.0", "mem-bytes-as-f64", { stdout: "mem bytes as f64 ok\n" }],
+  ["conformance/native/pass/mem-bytes-as-i8.0", "mem-bytes-as-i8", { stdout: "mem bytes as i8 ok\n" }],
+  ["conformance/native/pass/mem-bytes-as-mut-i8.0", "mem-bytes-as-mut-i8", { stdout: "mem bytes as mut i8 ok\n" }],
+  ["conformance/native/pass/mem-bytes-as-i64.0", "mem-bytes-as-i64", { stdout: "mem bytes as i64 ok\n" }],
+  ["conformance/native/pass/mem-bytes-as-u64.0", "mem-bytes-as-u64", { stdout: "mem bytes as u64 ok\n" }],
+  ["conformance/native/pass/mem-bytes-as-u8.0", "mem-bytes-as-u8", { stdout: "mem bytes as u8 ok\n" }],
+  ["conformance/native/pass/mem-bytes-as-mut-i64.0", "mem-bytes-as-mut-i64", { stdout: "mem bytes as mut i64 ok\n" }],
+  ["conformance/native/pass/mem-bytes-as-mut-u64.0", "mem-bytes-as-mut-u64", { stdout: "mem bytes as mut u64 ok\n" }],
+  ["conformance/native/pass/typed-span-f32.0", "typed-span-f32", { stdout: "typed span f32 ok\n" }],
+  ["conformance/native/pass/typed-span-i32.0", "typed-span-i32", { stdout: "typed span i32 ok\n" }],
+  ["conformance/native/pass/typed-span-from-array.0", "typed-span-from-array", { stdout: "typed span from array ok\n" }],
+  ["conformance/native/pass/mem-mut-span-array-store.0", "mem-mut-span-array-store", { stdout: "mem mut span array store ok\n" }],
+  ["conformance/native/pass/mem-mut-span-slice.0", "mem-mut-span-slice", { stdout: "mem mut span slice ok\n" }],
+  ["conformance/native/pass/mem-mut-span-u8-store.0", "mem-mut-span-u8-store", { stdout: "mem mut span u8 store ok\n" }],
+  ["conformance/native/pass/mem-bytes-as-mut-slice.0", "mem-bytes-as-mut-slice", { stdout: "bytes as mut slice ok\n" }],
   ["conformance/native/pass/mutref-indexed-lvalues.0", "mutref-indexed-lvalues", { stdout: "mutref indexed lvalues ok\n" }],
   ["conformance/native/pass/generic-mem.0", "generic-mem", { stdout: "generic mem ok\n" }],
   ["conformance/native/pass/generic-nested-calls.0", "generic-nested-calls", { stdout: "generic nested calls ok\n" }],
@@ -3006,18 +3568,463 @@ for (const runtimeFixture of [
   ["conformance/native/pass/borrow-primitives.0", "borrow-primitives", { stdout: "borrow primitives ok\n" }],
   ["conformance/native/pass/allocator-primitives.0", "allocator-primitives", { stdout: "allocator primitives ok\n" }],
   ["conformance/native/pass/owned-byte-buffer.0", "owned-byte-buffer", { stdout: "owned byte buffer ok\n" }],
+  ["conformance/native/pass/mem-fixed-buf-alloc.0", "mem-fixed-buf-alloc", { stdout: "mem fixed buf alloc ok\n" }],
+  ["conformance/native/pass/aggregate-shape-abi.0", "aggregate-shape-abi", { stdout: "aggregate shape abi ok\n" }],
+  ["conformance/native/pass/aggregate-float-field-sret.0", "aggregate-float-field-sret-elf64", { stdout: "aggregate float field sret ok\n" }],
+  ["conformance/native/pass/call-int-float.0", "call-int-float", { stdout: "call int float ok\n" }],
+  ["conformance/native/pass/generate-loop.0", "generate-loop", { stdout: "generate loop ok\n" }],
+  ["conformance/native/pass/sampler-sample.0", "sampler-sample", { stdout: "sampler sample ok\n" }],
+  ["conformance/native/pass/sampler-topk-topp.0", "sampler-topk-topp", { stdout: "sampler topk topp ok\n" }],
+  ["conformance/native/pass/tokenizer-encode.0", "tokenizer-encode", { stdout: "tokenizer encode ok\n" }],
+  ["conformance/native/pass/transformer-forward.0", "transformer-forward-elf64", { stdout: "transformer forward ok\n", libm: true }],
+  ["conformance/native/pass/generate-argmax.0", "generate-argmax-elf64", { stdout: "generate argmax ok\n", libm: true }],
+  ["conformance/native/pass/checkpoint-q-v2.0", "checkpoint-q-v2-elf64", { stdout: "checkpoint q v2 ok\n" }],
+  ["conformance/native/pass/ops-q-matmul.0", "ops-q-matmul-elf64", { stdout: "ops q matmul ok\n" }],
+  ["conformance/native/pass/ops-q-quantize.0", "ops-q-quantize-elf64", { stdout: "ops q quantize ok\n", libm: true }],
+  ["conformance/native/pass/transformer-forwardq.0", "transformer-forwardq-elf64", { stdout: "transformer forwardq ok\n", libm: true }],
+  ["conformance/native/pass/generate-argmax-q.0", "generate-argmax-q-elf64", { stdout: "generate argmax q ok\n", libm: true }],
+  ["conformance/native/pass/page-alloc-region.0", "page-alloc-region", { stdout: "page alloc region ok\n" }],
 ]) {
   await assertDirectRuntimeOrUnsupported(...runtimeFixture);
 }
 
-await assertBoundsTrap("conformance/native/fail/bounds-array-index.0", "bounds-array-index");
-await assertBoundsTrap("conformance/native/fail/bounds-span-index.0", "bounds-span-index");
-await assertBoundsTrap("conformance/native/fail/bounds-slice-end.0", "bounds-slice-end");
-await assertBoundsTrap("conformance/native/fail/bounds-slice-order.0", "bounds-slice-order");
-await assertBoundsTrap("conformance/native/fail/bounds-open-slice-start.0", "bounds-open-slice-start");
-await assertBoundsTrap("conformance/native/fail/index-string.0", "index-string");
-await assertBoundsTrap("conformance/native/fail/slice-string.0", "slice-string");
-await assertBoundsTrap("conformance/native/fail/indexed-mutation-oob.0", "indexed-mutation-oob");
+// aggregate-shape-abi exercises the full record ABI (sret return, span-in-record fields, record arg
+// by pointer) on the host backend. Build+run on the runnable host target so the macho64 (darwin-arm64)
+// and macho_x64 (darwin-x64) record paths get end-to-end coverage; ELF64 build+run is via the
+// assertDirectRuntimeOrUnsupported list above. COFF stays gated (BLD004 tolerated). The
+// cross-target sibling runners (darwin-x64 Rosetta, linux-arm64 Docker) cover the same fixture so
+// macho_x64 + aarch64_direct record paths also get end-to-end runtime coverage.
+{
+  const fixture = "conformance/native/pass/aggregate-shape-abi.0";
+  const name = "aggregate-shape-abi";
+  const expected = { stdout: "aggregate shape abi ok\n" };
+  await assertCommonRuntimeOrUnsupported(fixture, name, expected);
+  await assertLinuxArm64NativeOrUnsupported(fixture, name, expected);
+  await assertDarwinX64NativeOrUnsupported(fixture, name, expected);
+}
+
+// By-value record return where a FLOAT field lives at a non-zero offset (FloatBox{tag i32; value
+// f32}, WideBox{tag i32; value f64}). The float store through the saved sret pointer must honor
+// the field offset rather than always writing [sret + 0]; reading back both the int tag and the
+// float value would catch a store that clobbered the tag. Covered on the SysV float backends —
+// elf64 (linux-musl-x64) via the runtime list above, macho_x64 (darwin-x64 Rosetta), and native
+// macho64 (darwin-arm64). COFF stays gated (BLD004 tolerated).
+{
+  const fixture = "conformance/native/pass/aggregate-float-field-sret.0";
+  const name = "aggregate-float-field-sret";
+  const expected = { stdout: "aggregate float field sret ok\n" };
+  await assertCommonRuntimeOrUnsupported(fixture, name, expected);
+  await assertLinuxArm64NativeOrUnsupported(fixture, name, expected);
+  await assertDarwinX64NativeOrUnsupported(fixture, name, expected);
+}
+
+// safe-printf parity (run.c): a single-byte piece is emitted only when printable (0x20..0x7E) or
+// whitespace (0x09..0x0D); multi-byte pieces always pass through. The fixture emits 0x07 (lone
+// bell, suppressed), 'A' (kept), 0x0A (kept), then "\x07ok" (multi-byte, kept) — so the exact
+// output is the 5 bytes 41 0a 07 6f 6b. Pure program (no model, no World-param helper) so it runs
+// on every floated backend via the host + cross-target runners.
+{
+  const fixture = "conformance/run/pass/safe-piece-suppress.0";
+  const name = "safe-piece-suppress";
+  const expected = { stdout: "A\n\x07ok" };
+  await assertCommonRuntimeOrUnsupported(fixture, name, expected);
+  await assertLinuxArm64NativeOrUnsupported(fixture, name, expected);
+  await assertDarwinX64NativeOrUnsupported(fixture, name, expected);
+}
+
+// A record-returning function that also raises. The record flows via the sret pointer as
+// usual, the error tag rides in the second-return register (x1 on AArch64 / rdx on System V x64).
+// Lands on all four floated backends — macho64 (darwin-arm64), macho_x64 (darwin-x64), elf64
+// (linux-musl-x64), aarch64_direct (linux-musl-arm64). COFF stays gated (BLD004 tolerated).
+// The discard variant exercises STMT_CHECK (`check f()` with no `let` binding) which threads
+// the sret through a synthetic discard local; the success-path stdout write is gated by `if`
+// and is never reached on the error path — the program exits with the propagated error code.
+{
+  const fixture = "conformance/native/pass/fallible-return-record.0";
+  const name = "fallible-return-record";
+  const expected = { stdout: "fallible record check ok\nfallible record rescue err ok\nfallible record rescue ok ok\nret check ok\nret rescue err ok\nret rescue ok ok\n" };
+  await assertCommonRuntimeOrUnsupported(fixture, name, expected);
+  await assertLinuxArm64NativeOrUnsupported(fixture, name, expected);
+  await assertDarwinX64NativeOrUnsupported(fixture, name, expected);
+}
+{
+  const fixture = "conformance/native/pass/fallible-return-record-discard.0";
+  const name = "fallible-return-record-discard";
+  const expected = { stdout: "", exitCode: 1 };
+  await assertCommonRuntimeOrUnsupported(fixture, name, expected);
+  await assertLinuxArm64NativeOrUnsupported(fixture, name, expected);
+  await assertDarwinX64NativeOrUnsupported(fixture, name, expected);
+}
+
+// ref<Record> / mutref<Record> parameter ABI. The caller passes `&local` (or `&mut local`)
+// and the callee's prologue stashes the pointer in slot 0 of its frame slot instead of copying
+// the record bytes; field load/store dereference the stashed pointer at the field's offset.
+// Lowers on all four floated backends — macho64 (darwin-arm64), macho_x64 (darwin-x64),
+// elf64 (linux-musl-x64), elf_aarch64 (linux-arm64 via aarch64_direct). COFF (Windows) stays
+// gated. The scope is records-only — `ref<scalar>` is rejected with a dedicated diagnostic
+// (covered by the build-must-fail fixture below). The cross-target sibling runners also exercise
+// the macho_x64 / aarch64_direct ref/mutref paths.
+for (const [fixture, name, expected] of [
+  ["conformance/native/pass/ref-record-param.0", "ref-record-param", { stdout: "ref record param ok\n" }],
+  ["conformance/native/pass/mutref-record-param.0", "mutref-record-param", { stdout: "mutref record param ok\n" }],
+  ["conformance/native/pass/ref-record-span-field.0", "ref-record-span-field", { stdout: "ref record span field ok\n" }],
+]) {
+  await assertCommonRuntimeOrUnsupported(fixture, name, expected);
+  await assertLinuxArm64NativeOrUnsupported(fixture, name, expected);
+  await assertDarwinX64NativeOrUnsupported(fixture, name, expected);
+}
+
+// codec readI32Le/readU32Le/readF32Le/readF64Le lower on the AArch64 Mach-O host, System V ELF64,
+// x86_64 Mach-O, and AArch64 ELF. Build+run on the runnable host target here; the ELF64 build+run is
+// covered by the assertDirectRuntimeOrUnsupported list above. COFF stays gated (BLD004 tolerated).
+await assertCommonRuntimeOrUnsupported("conformance/native/pass/codec-le-reads.0", "codec-le-reads", { stdout: "codec le reads ok\n" });
+
+// Width completion: readU16Le / readI64Le / readU64Le ride the same IR_VALUE_BYTE_VIEW_READ_INT_LE
+// kind as the i32/u32 reads above. u16 lowers to LDRH/movzx-word; i64/u64 lower to a 64-bit load.
+await assertCommonRuntimeOrUnsupported("conformance/native/pass/codec-read-u16-le.0", "codec-read-u16-le", { stdout: "codec read u16 le ok\n" });
+await assertCommonRuntimeOrUnsupported("conformance/native/pass/codec-read-i64-le.0", "codec-read-i64-le", { stdout: "codec read i64 le ok\n" });
+await assertCommonRuntimeOrUnsupported("conformance/native/pass/codec-read-u64-le.0", "codec-read-u64-le", { stdout: "codec read u64 le ok\n" });
+// bytesAs* width completion: i64/u64/u8 reinterprets ride the existing IR_VALUE_BYTE_VIEW_REINTERPRET
+// kind. The host backends' index load/store dispatch already covers 8-byte and 1-byte elements;
+// bytesAsU8 is effectively a no-op that also strips mutability from a MutSpan<u8> source.
+await assertCommonRuntimeOrUnsupported("conformance/native/pass/mem-bytes-as-i64.0", "mem-bytes-as-i64", { stdout: "mem bytes as i64 ok\n" });
+await assertCommonRuntimeOrUnsupported("conformance/native/pass/mem-bytes-as-u64.0", "mem-bytes-as-u64", { stdout: "mem bytes as u64 ok\n" });
+await assertCommonRuntimeOrUnsupported("conformance/native/pass/mem-bytes-as-u8.0", "mem-bytes-as-u8", { stdout: "mem bytes as u8 ok\n" });
+await assertCommonRuntimeOrUnsupported("conformance/native/pass/mem-bytes-as-mut-i64.0", "mem-bytes-as-mut-i64", { stdout: "mem bytes as mut i64 ok\n" });
+await assertCommonRuntimeOrUnsupported("conformance/native/pass/mem-bytes-as-mut-u64.0", "mem-bytes-as-mut-u64", { stdout: "mem bytes as mut u64 ok\n" });
+// Typed-span-from-array (`let s Span<T> arr` / `let s MutSpan<T> arr`) lowers on all four
+// floated backends. ELF64 build+run is covered by the assertDirectRuntimeOrUnsupported tuple
+// above; the host call exercises macho64 darwin-arm64 / macho_x64 darwin-x64 via Rosetta.
+await assertCommonRuntimeOrUnsupported("conformance/native/pass/typed-span-from-array.0", "typed-span-from-array", { stdout: "typed span from array ok\n" });
+
+// std.fs.mmap/mappingBytes/munmap + std.mem.pageAlloc lower on the AArch64 Mach-O host via libSystem
+// (_open/_lseek/_mmap/_close/_munmap) through the obj+link path; the fixture maps a fixed input file
+// written here, checks a deliberately-missing path takes the has==false branch, and round-trips a
+// fresh anonymous page allocation. Other backends stay gated (BLD004 tolerated as skip). The
+// cross-target sibling runners cover: darwin-x64 routing the same libSystem obj+link path via
+// macho_x64 (Rosetta); linux-musl-arm64 using raw aarch64 syscalls via aarch64_direct, which the
+// default-routing heuristic excludes for fs-capable fixtures, so the helper forwards
+// `--backend zero-elf-aarch64`.
+await writeFile(`${outDir}/fs-mmap-page-input.bin`, Buffer.from([80, 54, 33, 10]));
+await assertCommonRuntimeOrUnsupported("conformance/native/pass/fs-mmap-page.0", "fs-mmap-page", { stdout: "fs mmap page ok\n" });
+// ELF64 lowers the same surface to raw Linux syscalls (openat/lseek/mmap/munmap/close, no libc) on
+// the direct-exe path. Build it explicitly for linux-musl-x64 (must succeed, generatedCBytes:0) and
+// run it only on a native linux-x64 host. The mapped input file was written just above.
+await assertElfDirectFsBuilds("conformance/native/pass/fs-mmap-page.0", "fs-mmap-page-elf64", { stdout: "fs mmap page ok\n" });
+await assertLinuxArm64NativeOrUnsupported("conformance/native/pass/fs-mmap-page.0", "fs-mmap-page", { stdout: "fs mmap page ok\n", backend: "zero-elf-aarch64" });
+await assertDarwinX64NativeOrUnsupported("conformance/native/pass/fs-mmap-page.0", "fs-mmap-page", { stdout: "fs mmap page ok\n" });
+
+// Math libm (sqrtf/expf/cosf/sinf/powf/fabsf/floorf) and float-inf-arith/float-nan-compare lower on
+// the AArch64 Mach-O host via libSystem and on ELF64 via libm (zig's bundled musl/compiler_rt). The
+// ELF64 build+run is covered by the assertDirectRuntimeOrUnsupported block above. Run them on the
+// host target here as well so the libSystem branch and the obj+link route are both exercised. The
+// cross-target runners cover too — darwin-x64 (Rosetta + macOS x86_64 SDK sysroot, exercises
+// macho_x64's libSystem math binding) and linux-musl-arm64 (Docker linux/arm64, exercises the
+// aarch64_direct R_AARCH64_CALL26 + zig musl libm route). Builds that aarch64_direct hasn't covered
+// yet gracefully gate-fail with BLD004/CGEN004 and surface in the summary trailer.
+for (const [fixture, name, expected] of [
+  ["conformance/native/pass/math-sqrtf-known-values.0", "math-sqrtf-known-values", { stdout: "math sqrtf ok\n", libm: true }],
+  ["conformance/native/pass/math-expf-known-values.0", "math-expf-known-values", { stdout: "math expf ok\n", libm: true }],
+  ["conformance/native/pass/math-cosf-sinf-identity.0", "math-cosf-sinf-identity", { stdout: "math cosf sinf ok\n", libm: true }],
+  ["conformance/native/pass/math-powf-known-values.0", "math-powf-known-values", { stdout: "math powf ok\n", libm: true }],
+  ["conformance/native/pass/math-absf-floorf.0", "math-absf-floorf", { stdout: "math absf floorf ok\n", libm: true }],
+  ["conformance/native/pass/math-isnanf.0", "math-isnanf", { stdout: "math isNaNf ok\n" }],
+  ["conformance/native/pass/math-matmul-span.0", "math-matmul-span", { stdout: "math matmul span ok\n" }],
+  ["conformance/native/pass/math-rmsnorm-smoke.0", "math-rmsnorm-smoke", { stdout: "math rmsnorm ok\n", libm: true }],
+  ["conformance/native/pass/math-rmsnorm-span.0", "math-rmsnorm-span", { stdout: "math rmsnorm span ok\n", libm: true }],
+  ["conformance/native/pass/math-softmax-smoke.0", "math-softmax-smoke", { stdout: "math softmax ok\n", libm: true }],
+  ["conformance/native/pass/math-softmax-span.0", "math-softmax-span", { stdout: "math softmax span ok\n", libm: true }],
+  ["conformance/native/pass/math-rope-span.0", "math-rope-span", { stdout: "math rope span ok\n", libm: true }],
+  ["conformance/native/pass/math-swiglu-span.0", "math-swiglu-span", { stdout: "math swiglu span ok\n", libm: true }],
+]) {
+  await assertCommonRuntimeOrUnsupported(fixture, name, expected);
+  await assertLinuxArm64NativeOrUnsupported(fixture, name, expected);
+  await assertDarwinX64NativeOrUnsupported(fixture, name, expected);
+}
+
+// transformer-forward / generate-argmax / std-args-libm exercise libm via the obj+link route on the
+// HOST (libSystem on darwin-arm64, musl libm on linux-musl-x64). The ELF64 build is in the runtime
+// list above; run them on the host target here too. std-args-libm needs an argv slot of length 9.
+// The cross-target sibling runners cover them too: transformer-forward + generate-argmax build clean
+// on darwin-x64 but lack args plumbing (BLD004) so they tolerate-skip on Rosetta; aarch64_direct
+// still lacks `while`/record CALL combinations they need so they also tolerate-skip on linux-arm64.
+// std-args-libm tolerates-skips on both via TAR002 (neither target declares the `args` capability).
+for (const [fixture, name, expected] of [
+  ["conformance/native/pass/transformer-forward.0", "transformer-forward", { stdout: "transformer forward ok\n", libm: true }],
+  ["conformance/native/pass/generate-argmax.0", "generate-argmax", { stdout: "generate argmax ok\n", libm: true }],
+  ["conformance/native/pass/std-args-libm.0", "std-args-libm", { stdout: "std args libm ok\n", args: ["hellofoo!"], libm: true }],
+]) {
+  await assertCommonRuntimeOrUnsupported(fixture, name, expected);
+  await assertLinuxArm64NativeOrUnsupported(fixture, name, expected);
+  await assertDarwinX64NativeOrUnsupported(fixture, name, expected);
+}
+
+// Int8 quantized (runq.c "version 2") conformance fixtures. checkpoint-q-v2 + ops-q-matmul are
+// pure direct-exe (libm-free); ops-q-quantize uses libm floorf via roundHA and absf, and
+// transformer-forwardq + generate-argmax-q exercise the full quantized forward pass (sqrtf, expf,
+// cosf, sinf, powf, floorf, absf). All five use the Q-opt path — `QWeight.q: Span<i8>` and
+// `QActs.q: MutSpan<i8>` — so signed-byte loads come directly via `bytesAsI8` with no decode
+// helper. The ELF64 build+run is in the runtime list above; the cross-target sibling runners
+// cover macho_x64 (Rosetta) and aarch64_direct (linux-arm64 Docker) as well, exercising the
+// quantized path on all four floated backends.
+for (const [fixture, name, expected] of [
+  ["conformance/native/pass/checkpoint-q-v2.0", "checkpoint-q-v2", { stdout: "checkpoint q v2 ok\n" }],
+  ["conformance/native/pass/ops-q-matmul.0", "ops-q-matmul", { stdout: "ops q matmul ok\n" }],
+  ["conformance/native/pass/ops-q-quantize.0", "ops-q-quantize", { stdout: "ops q quantize ok\n", libm: true }],
+  ["conformance/native/pass/transformer-forwardq.0", "transformer-forwardq", { stdout: "transformer forwardq ok\n", libm: true }],
+  ["conformance/native/pass/generate-argmax-q.0", "generate-argmax-q", { stdout: "generate argmax q ok\n", libm: true }],
+]) {
+  await assertCommonRuntimeOrUnsupported(fixture, name, expected);
+  await assertLinuxArm64NativeOrUnsupported(fixture, name, expected);
+  await assertDarwinX64NativeOrUnsupported(fixture, name, expected);
+}
+
+// std.fs.mmap variants: each mmap fixture builds on the macho-arm64 host (default direct, libSystem)
+// and on ELF64 via raw Linux syscalls (requires `--backend zero-elf64` explicitly because the default
+// direct-exe heuristic excludes the `fs` capability). The 12-byte mmap-f32le.bin holds three f32 LE
+// values [1.0, 2.0, 3.0] consumed by the mmap fixtures that read mapped bytes; written once here.
+// The cross-target sibling runners cover the mmap fixtures too: darwin-x64 routes the same
+// libSystem obj+link path via macho_x64 (default routing handles fs); linux-musl-arm64 needs
+// `--backend zero-elf-aarch64` explicitly (same self-host-subset-heuristic carve-out as ELF64).
+await writeFile(`${outDir}/mmap-f32le.bin`, Buffer.from([0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x40, 0x40]));
+for (const [fixture, name, expected] of [
+  ["conformance/native/pass/mmap-maybe-success.0", "mmap-maybe-success", { stdout: "mmap maybe success ok\n" }],
+  ["conformance/native/pass/mmap-file-notfound.0", "mmap-file-notfound", { stdout: "mmap notfound ok\n" }],
+  ["conformance/native/pass/mmap-file-readonly.0", "mmap-file-readonly", { stdout: "mmap file readonly ok\n" }],
+  ["conformance/native/pass/mmap-munmap-loop.0", "mmap-munmap-loop", { stdout: "mmap munmap loop ok\n" }],
+  ["conformance/native/pass/mmap-munmap-early-return.0", "mmap-munmap-early-return", { stdout: "mmap early return ok\n" }],
+  ["conformance/native/pass/page-alloc-region.0", "page-alloc-region-host", { stdout: "page alloc region ok\n" }],
+  ["conformance/native/pass/mem-bytes-as-f32-mmap.0", "mem-bytes-as-f32-mmap", { stdout: "mem bytes as f32 mmap ok\n" }],
+]) {
+  await assertCommonRuntimeOrUnsupported(fixture, name, expected);
+  await assertElfDirectFsBuilds(fixture, `${name}-elf64`, expected);
+  await assertLinuxArm64NativeOrUnsupported(fixture, name, { ...expected, backend: "zero-elf-aarch64" });
+  await assertDarwinX64NativeOrUnsupported(fixture, name, expected);
+}
+
+// mmap-maybe-4gib-len exercises the 64-bit `len` slot: a 4 GiB + 5 sparse file is mmap'd
+// and std.mem.len(bytes) is compared against 4294967301 (= 0x100000005). With only a 32-bit
+// `len` slot the low 32 bits would truncate to 5, masking the bug. The sparse file is created
+// once via truncate(2) (APFS/ext4 store it as a hole — actual disk usage ~0 bytes). Docker
+// bind-mounts the sparse file as-is — the kernel still reports the full size through fstat
+// regardless of how the container's filesystem layer reflects holes.
+const fourGibSparse = `${outDir}/mmap-maybe-4gib-sparse.bin`;
+{
+  const { open } = await import("node:fs/promises");
+  const handle = await open(fourGibSparse, "w");
+  try { await handle.truncate(4294967301); } finally { await handle.close(); }
+}
+await assertCommonRuntimeOrUnsupported("conformance/native/pass/mmap-maybe-4gib-len.0", "mmap-maybe-4gib-len", { stdout: "mmap maybe 4gib len ok\n" });
+await assertElfDirectFsBuilds("conformance/native/pass/mmap-maybe-4gib-len.0", "mmap-maybe-4gib-len-elf64", { stdout: "mmap maybe 4gib len ok\n" });
+await assertLinuxArm64NativeOrUnsupported("conformance/native/pass/mmap-maybe-4gib-len.0", "mmap-maybe-4gib-len", { stdout: "mmap maybe 4gib len ok\n", backend: "zero-elf-aarch64" });
+await assertDarwinX64NativeOrUnsupported("conformance/native/pass/mmap-maybe-4gib-len.0", "mmap-maybe-4gib-len", { stdout: "mmap maybe 4gib len ok\n" });
+
+// Cross-backend reruns of the remaining direct-exe fixtures across the macho_x64 (darwin-x64
+// Rosetta) and aarch64_direct (linux-musl-arm64 Docker) runtime branches. The records / libm /
+// mmap fixtures are already covered above; this block adds float arith/cast/compare/inf-nan,
+// codec individuals + width completion, mem typed-span/bytesAs* + width completion +
+// typed-span-from-array, typed-span aliases, mut-span, llama2-domain non-libm, fallible (incl.
+// fallible-float), exit-code, bounds traps, and the cross-target extension of the CGEN004
+// build-must-fail fixture. Each helper tolerates backend feature gates (BLD004 / CGEN004 /
+// TAR002) so backends that haven't covered some IR shape, instruction, or capability yet
+// gracefully no-op via the summary trailers — they never silently miscompile. The host elf64
+// build+run path stays in the pre-existing `assertDirectRuntimeOrUnsupported` and
+// `assertCommonRuntimeOrUnsupported` lists above; this block is purely additive cross-target
+// coverage.
+
+// Float arith / cast / compare / inf-nan. All pure direct-exe — no libm, no records, no mmap.
+// Build clean on both new backends (macho_x64 + aarch64_direct) per the P2b/B6 lowering.
+for (const [fixture, name, expected] of [
+  ["conformance/native/pass/float-arith-add-f32.0", "float-arith-add-f32", { stdout: "float add f32 ok\n" }],
+  ["conformance/native/pass/float-arith-add-f64.0", "float-arith-add-f64", { stdout: "float add f64 ok\n" }],
+  ["conformance/native/pass/float-arith-sub-f32.0", "float-arith-sub-f32", { stdout: "float sub f32 ok\n" }],
+  ["conformance/native/pass/float-arith-sub-f64.0", "float-arith-sub-f64", { stdout: "float sub f64 ok\n" }],
+  ["conformance/native/pass/float-arith-mul-f32.0", "float-arith-mul-f32", { stdout: "float mul f32 ok\n" }],
+  ["conformance/native/pass/float-arith-mul-f64.0", "float-arith-mul-f64", { stdout: "float mul f64 ok\n" }],
+  ["conformance/native/pass/float-arith-div-f32.0", "float-arith-div-f32", { stdout: "float div f32 ok\n" }],
+  ["conformance/native/pass/float-arith-div-f64.0", "float-arith-div-f64", { stdout: "float div f64 ok\n" }],
+  ["conformance/native/pass/float-cast-f32-to-f64.0", "float-cast-f32-to-f64", { stdout: "float cast f32 to f64 ok\n" }],
+  ["conformance/native/pass/float-cast-f32-to-i32.0", "float-cast-f32-to-i32", { stdout: "float cast f32 to i32 ok\n" }],
+  ["conformance/native/pass/float-cast-f64-to-f32.0", "float-cast-f64-to-f32", { stdout: "float cast f64 to f32 ok\n" }],
+  ["conformance/native/pass/float-cast-f64-to-i32.0", "float-cast-f64-to-i32", { stdout: "float cast f64 to i32 ok\n" }],
+  ["conformance/native/pass/float-cast-i32-to-f32.0", "float-cast-i32-to-f32", { stdout: "float cast i32 to f32 ok\n" }],
+  ["conformance/native/pass/float-cast-i32-to-f64.0", "float-cast-i32-to-f64", { stdout: "float cast i32 to f64 ok\n" }],
+  ["conformance/native/pass/float-compare-eq-f32.0", "float-compare-eq-f32", { stdout: "float eq f32 ok\n" }],
+  ["conformance/native/pass/float-compare-eq-f64.0", "float-compare-eq-f64", { stdout: "float eq f64 ok\n" }],
+  ["conformance/native/pass/float-compare-ne-f32.0", "float-compare-ne-f32", { stdout: "float ne f32 ok\n" }],
+  ["conformance/native/pass/float-compare-ne-f64.0", "float-compare-ne-f64", { stdout: "float ne f64 ok\n" }],
+  ["conformance/native/pass/float-compare-lt-f32.0", "float-compare-lt-f32", { stdout: "float lt f32 ok\n" }],
+  ["conformance/native/pass/float-compare-lt-f64.0", "float-compare-lt-f64", { stdout: "float lt f64 ok\n" }],
+  ["conformance/native/pass/float-compare-le-f32.0", "float-compare-le-f32", { stdout: "float le f32 ok\n" }],
+  ["conformance/native/pass/float-compare-le-f64.0", "float-compare-le-f64", { stdout: "float le f64 ok\n" }],
+  ["conformance/native/pass/float-compare-gt-f32.0", "float-compare-gt-f32", { stdout: "float gt f32 ok\n" }],
+  ["conformance/native/pass/float-compare-gt-f64.0", "float-compare-gt-f64", { stdout: "float gt f64 ok\n" }],
+  ["conformance/native/pass/float-compare-ge-f32.0", "float-compare-ge-f32", { stdout: "float ge f32 ok\n" }],
+  ["conformance/native/pass/float-compare-ge-f64.0", "float-compare-ge-f64", { stdout: "float ge f64 ok\n" }],
+  ["conformance/native/pass/float-inf-arith.0", "float-inf-arith", { stdout: "float inf arith ok\n" }],
+  ["conformance/native/pass/float-nan-compare.0", "float-nan-compare", { stdout: "float nan compare ok\n" }],
+]) {
+  await assertLinuxArm64NativeOrUnsupported(fixture, name, expected);
+  await assertDarwinX64NativeOrUnsupported(fixture, name, expected);
+}
+
+// Codec LE individual reads (i32/u32/f32/f64 at offset 0 + i32/f32 at non-zero offset) + the
+// width completion (u16/i64/u64). Pure direct-exe; lower on all 4 floated backends.
+for (const [fixture, name, expected] of [
+  ["conformance/native/pass/codec-le-reads.0", "codec-le-reads", { stdout: "codec le reads ok\n" }],
+  ["conformance/native/pass/codec-read-i32-le.0", "codec-read-i32-le", { stdout: "codec read i32 le ok\n" }],
+  ["conformance/native/pass/codec-read-u32-le.0", "codec-read-u32-le", { stdout: "codec read u32 le ok\n" }],
+  ["conformance/native/pass/codec-read-f32-le.0", "codec-read-f32-le", { stdout: "codec read f32 le ok\n" }],
+  ["conformance/native/pass/codec-read-f64-le.0", "codec-read-f64-le", { stdout: "codec read f64 le ok\n" }],
+  ["conformance/native/pass/codec-read-i32-le-offset.0", "codec-read-i32-le-offset", { stdout: "codec read i32 le offset ok\n" }],
+  ["conformance/native/pass/codec-read-f32-le-offset.0", "codec-read-f32-le-offset", { stdout: "codec read f32 le offset ok\n" }],
+  ["conformance/native/pass/codec-read-u16-le.0", "codec-read-u16-le", { stdout: "codec read u16 le ok\n" }],
+  ["conformance/native/pass/codec-read-i64-le.0", "codec-read-i64-le", { stdout: "codec read i64 le ok\n" }],
+  ["conformance/native/pass/codec-read-u64-le.0", "codec-read-u64-le", { stdout: "codec read u64 le ok\n" }],
+]) {
+  await assertLinuxArm64NativeOrUnsupported(fixture, name, expected);
+  await assertDarwinX64NativeOrUnsupported(fixture, name, expected);
+}
+
+// Mem typed-span / bytesAs* + width completion + typed-span-from-array. Pure direct-exe;
+// reinterpret a byte view as a typed Span<T>/MutSpan<T>. All 9 element widths
+// (u8/i8/i32/u32/usize/i64/u64/f32/f64) covered; bytesAs-mut-slice strips mutability from MutSpan<u8>.
+for (const [fixture, name, expected] of [
+  ["conformance/native/pass/mem-bytes-as-i32.0", "mem-bytes-as-i32", { stdout: "mem bytes as i32 ok\n" }],
+  ["conformance/native/pass/mem-bytes-as-mut-i32.0", "mem-bytes-as-mut-i32", { stdout: "mem bytes as mut i32 ok\n" }],
+  ["conformance/native/pass/mem-bytes-as-f32.0", "mem-bytes-as-f32", { stdout: "mem bytes as f32 ok\n" }],
+  ["conformance/native/pass/mem-bytes-as-mut-f32.0", "mem-bytes-as-mut-f32", { stdout: "mem bytes as mut f32 ok\n" }],
+  ["conformance/native/pass/mem-bytes-as-f64.0", "mem-bytes-as-f64", { stdout: "mem bytes as f64 ok\n" }],
+  ["conformance/native/pass/mem-bytes-as-i8.0", "mem-bytes-as-i8", { stdout: "mem bytes as i8 ok\n" }],
+  ["conformance/native/pass/mem-bytes-as-mut-i8.0", "mem-bytes-as-mut-i8", { stdout: "mem bytes as mut i8 ok\n" }],
+  ["conformance/native/pass/mem-bytes-as-i64.0", "mem-bytes-as-i64", { stdout: "mem bytes as i64 ok\n" }],
+  ["conformance/native/pass/mem-bytes-as-u64.0", "mem-bytes-as-u64", { stdout: "mem bytes as u64 ok\n" }],
+  ["conformance/native/pass/mem-bytes-as-u8.0", "mem-bytes-as-u8", { stdout: "mem bytes as u8 ok\n" }],
+  ["conformance/native/pass/mem-bytes-as-mut-i64.0", "mem-bytes-as-mut-i64", { stdout: "mem bytes as mut i64 ok\n" }],
+  ["conformance/native/pass/mem-bytes-as-mut-u64.0", "mem-bytes-as-mut-u64", { stdout: "mem bytes as mut u64 ok\n" }],
+  ["conformance/native/pass/mem-bytes-as-mut-slice.0", "mem-bytes-as-mut-slice", { stdout: "bytes as mut slice ok\n" }],
+  ["conformance/native/pass/typed-span-f32.0", "typed-span-f32", { stdout: "typed span f32 ok\n" }],
+  ["conformance/native/pass/typed-span-i32.0", "typed-span-i32", { stdout: "typed span i32 ok\n" }],
+  ["conformance/native/pass/typed-span-from-array.0", "typed-span-from-array", { stdout: "typed span from array ok\n" }],
+]) {
+  await assertLinuxArm64NativeOrUnsupported(fixture, name, expected);
+  await assertDarwinX64NativeOrUnsupported(fixture, name, expected);
+}
+
+// Mem mut-span — typed-mutable span operations: array-store / slice / u8-store. macho_x64 + the
+// linux-arm64 docker branch tolerate-skip the slice and u8-store fixtures (CGEN004 / BLD004 on
+// aarch64_direct's pre-existing IR coverage gaps); array-store builds cleanly on both.
+for (const [fixture, name, expected] of [
+  ["conformance/native/pass/mem-mut-span-array-store.0", "mem-mut-span-array-store", { stdout: "mem mut span array store ok\n" }],
+  ["conformance/native/pass/mem-mut-span-slice.0", "mem-mut-span-slice", { stdout: "mem mut span slice ok\n" }],
+  ["conformance/native/pass/mem-mut-span-u8-store.0", "mem-mut-span-u8-store", { stdout: "mem mut span u8 store ok\n" }],
+]) {
+  await assertLinuxArm64NativeOrUnsupported(fixture, name, expected);
+  await assertDarwinX64NativeOrUnsupported(fixture, name, expected);
+}
+
+// llama2-domain non-libm direct-exe fixtures. call-int-float exercises the general AAPCS
+// CALL path on aarch64_direct; the four remaining sampler/generate/tokenizer fixtures tolerate-skip
+// on linux-arm64 (aarch64_direct lacks `while` lowering — follow-on work) and partially
+// on darwin-x64 (tokenizer-encode trips a macho_x64 byte-view-length-on-call gate).
+for (const [fixture, name, expected] of [
+  ["conformance/native/pass/call-int-float.0", "call-int-float", { stdout: "call int float ok\n" }],
+  ["conformance/native/pass/generate-loop.0", "generate-loop", { stdout: "generate loop ok\n" }],
+  ["conformance/native/pass/sampler-sample.0", "sampler-sample", { stdout: "sampler sample ok\n" }],
+  ["conformance/native/pass/sampler-topk-topp.0", "sampler-topk-topp", { stdout: "sampler topk topp ok\n" }],
+  ["conformance/native/pass/tokenizer-encode.0", "tokenizer-encode", { stdout: "tokenizer encode ok\n" }],
+]) {
+  await assertLinuxArm64NativeOrUnsupported(fixture, name, expected);
+  await assertDarwinX64NativeOrUnsupported(fixture, name, expected);
+}
+
+// Misc fallible — packed-tag-in-high-32 ABI verification across the secondary backends. i64/u64/
+// usize-wide widths exercise the wide-scalar return; f32/f64 exercise the fallible-float lowering;
+// void-fallthrough exercises the no-tag fallible-void case.
+for (const [fixture, name, expected] of [
+  ["conformance/native/pass/fallible-return-i64.0", "fallible-return-i64", { stdout: "fallible i64 ok\n" }],
+  ["conformance/native/pass/fallible-return-u64.0", "fallible-return-u64", { stdout: "fallible u64 ok\n" }],
+  ["conformance/native/pass/fallible-return-usize-wide.0", "fallible-return-usize-wide", { stdout: "fallible usize wide ok\n" }],
+  ["conformance/native/pass/fallible-return-f32.0", "fallible-return-f32", { stdout: "fallible f32 ok\n" }],
+  ["conformance/native/pass/fallible-return-f64.0", "fallible-return-f64", { stdout: "fallible f64 ok\n" }],
+  ["conformance/native/pass/fallible-void-fallthrough.0", "fallible-void-fallthrough", { stdout: "fallible void fallthrough ok\n" }],
+]) {
+  await assertLinuxArm64NativeOrUnsupported(fixture, name, expected);
+  await assertDarwinX64NativeOrUnsupported(fixture, name, expected);
+}
+
+// exit-code-arithmetic computes a process exit code (42) through arithmetic + a helper call + a
+// branch; the freestanding `export c fn main` returns i32 directly into the platform exit path. No
+// stdout: the assertion checks only the exit code.
+await assertDirectExitCode("conformance/native/pass/exit-code-arithmetic.0", "exit-code-arithmetic", { exitCode: 42 });
+await assertLinuxArm64NativeOrUnsupported("conformance/native/pass/exit-code-arithmetic.0", "exit-code-arithmetic", { exitCode: 42 });
+await assertDarwinX64NativeOrUnsupported("conformance/native/pass/exit-code-arithmetic.0", "exit-code-arithmetic", { exitCode: 42 });
+
+// aggregate-record-arg-while is a build-must-fail fixture: the frontend (`check`) accepts it, but
+// every direct backend rejects a record-returning call inside a `while` condition because the
+// materialized record temp would be reused across iterations rather than rebuilt. The user must
+// hoist the call into a `let` inside the loop body. The gate is extended across all 4 backend
+// targets — each surfaces a backend-specific rejection (CGEN004 on linux-musl-x64 / darwin-x64
+// for the record-arg-while shape; BLD004 on linux-musl-arm64 for the broader `while` lowering
+// gap on aarch64_direct). The cross-target loop pins every backend to a known gate code so a
+// silent accept on any backend would regress this assertion.
+for (const [target, expectedCodes] of [
+  ["linux-musl-x64", ["CGEN004"]],
+  ["darwin-arm64", ["CGEN004"]],
+  ["darwin-x64", ["CGEN004"]],
+  ["linux-musl-arm64", ["BLD004", "CGEN004"]],
+]) {
+  const aggregateRecordArgWhile = await execFileAsync(zero, ["build", "--json", "--emit", "exe", "--target", target, "conformance/native/fail/aggregate-record-arg-while.0", "--out", `${outDir}/aggregate-record-arg-while-${target}`]).catch((error) => error);
+  assert.notEqual(aggregateRecordArgWhile.code, 0, `aggregate-record-arg-while.0 unexpectedly built on ${target}`);
+  const aggregateRecordArgWhileBody = JSON.parse(aggregateRecordArgWhile.stdout);
+  const code = aggregateRecordArgWhileBody.diagnostics?.[0]?.code;
+  assert.ok(expectedCodes.includes(code), `aggregate-record-arg-while.0 on ${target}: expected one of ${expectedCodes.join("/")}, got ${code}`);
+}
+
+// ref<Record> / mutref<Record> scope is records-only: `ref<scalar>` (here ref<i32>) is rejected
+// with a clear diagnostic at IR lowering time on every backend (the rejection runs before the
+// per-backend buildability gate). Pinning this gate ensures widening it to support scalar
+// references later is a reviewed step rather than a silent change.
+for (const target of ["darwin-arm64", "linux-musl-x64", "darwin-x64", "linux-musl-arm64"]) {
+  const refRecordRejectedScalar = await execFileAsync(zero, ["build", "--json", "--emit", "exe", "--target", target, "conformance/native/fail/ref-record-rejected-scalar.0", "--out", `${outDir}/ref-record-rejected-scalar-${target}`]).catch((error) => error);
+  assert.notEqual(refRecordRejectedScalar.code, 0, `expected ref-record-rejected-scalar.0 to fail build on ${target}`);
+  const refRecordRejectedScalarBody = JSON.parse(refRecordRejectedScalar.stdout);
+  assert.equal(refRecordRejectedScalarBody.diagnostics?.[0]?.code, "BLD004", `expected BLD004 for ref-record-rejected-scalar.0 on ${target}`);
+}
+
+// Bounds-trap fixtures: build for linux-musl-x64 + cross-target rebuilds for darwin-x64 (Rosetta)
+// and linux-musl-arm64 (Docker arm64). Each backend traps with its own faulting instruction —
+// x86_64 `ud2` → SIGILL → exit 132 on macho_x64/elf64; aarch64 `brk #0xc000` → SIGTRAP → exit
+// 133 on aarch64_direct/macho64. The helpers tolerate BLD004/CGEN004/TAR002 build-gate skips
+// and a missing "zero bounds check failed" stderr message (some traps short-circuit before
+// stderr flush). The codec/mem/typed-span variants in particular ride on the codec/typed-span
+// runtime range checks that lower on all 4 floated backends — promoted here through the
+// sibling runners alongside the existing host bounds-trap.
+for (const [fixture, name] of [
+  ["conformance/native/fail/bounds-array-index.0", "bounds-array-index"],
+  ["conformance/native/fail/bounds-span-index.0", "bounds-span-index"],
+  ["conformance/native/fail/bounds-bytes-as-index.0", "bounds-bytes-as-index"],
+  ["conformance/native/fail/bounds-slice-end.0", "bounds-slice-end"],
+  ["conformance/native/fail/bounds-slice-order.0", "bounds-slice-order"],
+  ["conformance/native/fail/bounds-open-slice-start.0", "bounds-open-slice-start"],
+  ["conformance/native/fail/index-string.0", "index-string"],
+  ["conformance/native/fail/slice-string.0", "slice-string"],
+  ["conformance/native/fail/indexed-mutation-oob.0", "indexed-mutation-oob"],
+  ["conformance/native/fail/codec-read-i32-le-bounds.0", "codec-read-i32-le-bounds"],
+  ["conformance/native/fail/codec-read-f32-le-bounds.0", "codec-read-f32-le-bounds"],
+  ["conformance/native/fail/codec-read-u16-le-bounds.0", "codec-read-u16-le-bounds"],
+  ["conformance/native/fail/codec-read-i64-le-bounds.0", "codec-read-i64-le-bounds"],
+  ["conformance/native/fail/mem-bytes-as-f32-bounds.0", "mem-bytes-as-f32-bounds"],
+  ["conformance/native/fail/mem-bytes-as-i32-bounds.0", "mem-bytes-as-i32-bounds"],
+  ["conformance/native/fail/mem-bytes-as-i8-bounds.0", "mem-bytes-as-i8-bounds"],
+  ["conformance/native/fail/mem-bytes-as-i64-bounds.0", "mem-bytes-as-i64-bounds"],
+  ["conformance/native/fail/mem-mut-span-u8-store-bounds.0", "mem-mut-span-u8-store-bounds"],
+  ["conformance/native/fail/typed-span-from-array-bounds.0", "typed-span-from-array-bounds"],
+]) {
+  await assertBoundsTrap(fixture, name);
+  await assertLinuxArm64BoundsTrap(fixture, name);
+  await assertDarwinX64BoundsTrap(fixture, name);
+}
 
 const failed = await execFileAsync(zero, ["check", "conformance/check/fail/unknown-name.0"]).catch((error) => error);
 assert.notEqual(failed.code, 0);
@@ -3572,6 +4579,23 @@ for (const [fixture, code] of [
   const result = await execFileAsync(zero, ["check", `conformance/native/fail/${fixture}`]).catch((error) => error);
   assert.notEqual(result.code, 0);
   assert.match(result.stderr, code);
+}
+
+if (libmSkipped.length > 0) {
+  console.warn(`warning: ${libmSkipped.length} libm-linked fixture path(s) skipped numerics validation on this host (BLD003): ${libmSkipped.join(", ")}`);
+  console.warn("warning: install a target-capable C toolchain (e.g. zig) to validate libm fixtures locally; otherwise rely on Linux CI / Vercel sandbox.");
+}
+
+if (runnableDirectTarget) {
+  console.log(`host native (${runnableDirectTarget}): ${hostNativeRan.length} fixture(s) ran, ${hostNativeSkipped.length} skipped (backend feature gated — BLD004)`);
+}
+
+if (dockerLinuxArm64) {
+  console.log(`linux-arm64 (docker): ${linuxArm64Ran.length} fixture(s) ran, ${linuxArm64Skipped.length} skipped (aarch64_direct backend feature gated — BLD004/CGEN004/TAR002)`);
+}
+
+if (canRunDarwinX64Rosetta) {
+  console.log(`darwin-x64 (rosetta): ${darwinX64Ran.length} fixture(s) ran, ${darwinX64Skipped.length} skipped (macho_x64 backend feature gated — BLD004/CGEN004/TAR002)`);
 }
 
 console.log("conformance ok");

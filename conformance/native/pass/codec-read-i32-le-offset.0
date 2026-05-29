@@ -1,0 +1,8 @@
+pub fn main Void world World !
+  let buf [12]u8 [1, 0, 0, 0, 0, 1, 0, 0, 255, 255, 255, 255]
+  let a i32 (std.codec.readI32Le buf 0)
+  let b i32 (std.codec.readI32Le buf 4)
+  let c i32 (std.codec.readI32Le buf 8)
+  let neg i32 (- 0 1)
+  if && (&& (== a 1) (== b 256)) (== c neg)
+    check world.out.write "codec read i32 le offset ok\n"

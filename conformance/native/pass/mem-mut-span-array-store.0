@@ -1,0 +1,34 @@
+pub fn main Void world World !
+  mut ubuf [4]u8 [0, 0, 0, 0]
+  let us MutSpan<u8> ubuf
+  set us[0] 10_u8
+  set us[3] 200_u8
+  let u0 u8 us[0]
+  let u3 u8 us[3]
+  let ten u8 10_u8
+  let twoHundred u8 200_u8
+  let okU Bool (&& (== (std.mem.len us) 4) (&& (== u0 ten) (== u3 twoHundred)))
+
+  mut ibufBytes [16]u8 [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  let is MutSpan<i32> std.mem.bytesAsMutI32 ibufBytes
+  set is[0] 100
+  set is[3] (- 0 5)
+  let i0 i32 is[0]
+  let i3 i32 is[3]
+  let hundred i32 100
+  let negFive i32 (- 0 5)
+  let okI Bool (&& (== (std.mem.len is) 4) (&& (== i0 hundred) (== i3 negFive)))
+
+  mut fbufBytes [16]u8 [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  let fs MutSpan<f32> std.mem.bytesAsMutF32 fbufBytes
+  let onePointFive f32 1.5
+  let threePointFive f32 3.5
+  let two f32 2.0
+  set fs[0] onePointFive
+  set fs[2] (+ fs[0] two)
+  let f0 f32 fs[0]
+  let f2 f32 fs[2]
+  let okF Bool (&& (== (std.mem.len fs) 4) (&& (== f0 onePointFive) (== f2 threePointFive)))
+
+  if && okU (&& okI okF)
+    check world.out.write "mem mut span array store ok\n"

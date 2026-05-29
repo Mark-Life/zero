@@ -1,0 +1,30 @@
+# Mirrors the llama2 example's `safe_printf` rule (run.c): a single-byte piece is
+# emitted only when it is printable (0x20..0x7E) or whitespace (0x09..0x0D);
+# multi-byte pieces always pass through. Exercises that predicate end-to-end so a
+# control byte produced by a `<0xNN>` fallback is suppressed exactly as C does.
+fn isSafePiece Bool piece Span<u8>
+  let n usize std.mem.len piece
+  if == n 1
+    let b u8 piece[0]
+    let printable Bool (&& (>= b (32 as u8)) (<= b (126 as u8)))
+    let tabFf Bool (&& (>= b (9 as u8)) (<= b (13 as u8)))
+    ret (|| printable tabFf)
+  ret true
+
+pub fn main Void world World !
+  # 0x07 (bell): single non-printable byte -> suppressed.
+  let bell Span<u8> std.mem.span "\x07"
+  if isSafePiece bell
+    check world.out.write bell
+  # 'A': single printable byte -> kept.
+  let a Span<u8> std.mem.span "A"
+  if isSafePiece a
+    check world.out.write a
+  # 0x0A newline: single whitespace byte -> kept.
+  let nl Span<u8> std.mem.span "\n"
+  if isSafePiece nl
+    check world.out.write nl
+  # multi-byte piece (leading control byte) -> kept verbatim.
+  let multi Span<u8> std.mem.span "\x07ok"
+  if isSafePiece multi
+    check world.out.write multi

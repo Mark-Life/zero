@@ -1,0 +1,17 @@
+pub fn main Void world World !
+  # 16 bytes packing little-endian u16s at offsets 0, 2, 5 (unaligned), 14.
+  # Layout: 1, 65535, then byte 4 isolates the unaligned [3,1]=259 at offset 5, then 1800 at 14.
+  let bytes [16]u8 [1, 0, 255, 255, 0, 3, 1, 0, 0, 0, 0, 0, 0, 0, 8, 7]
+  let off2 usize 2
+  let off5 usize 5
+  let off14 usize 14
+  let r0 u16 (std.codec.readU16Le bytes 0)
+  let r2 u16 (std.codec.readU16Le bytes off2)
+  let r5 u16 (std.codec.readU16Le bytes off5)
+  let r14 u16 (std.codec.readU16Le bytes off14)
+  let one u16 1_u16
+  let maxU16 u16 65535_u16
+  let unaligned u16 259_u16
+  let big u16 1800_u16
+  if && (== r0 one) (&& (== r2 maxU16) (&& (== r5 unaligned) (== r14 big)))
+    check world.out.write "codec read u16 le ok\n"

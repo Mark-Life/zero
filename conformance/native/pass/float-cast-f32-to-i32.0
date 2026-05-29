@@ -1,0 +1,5 @@
+pub fn main Void world World !
+  let frac f32 7.9
+  let truncated i32 frac as i32
+  if == truncated 7
+    check world.out.write "float cast f32 to i32 ok\n"

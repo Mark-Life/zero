@@ -1,0 +1,5 @@
+pub fn main Void world World !
+  let whole i32 1000
+  let asFloat f64 whole as f64
+  if == asFloat 1000.0
+    check world.out.write "float cast i32 to f64 ok\n"

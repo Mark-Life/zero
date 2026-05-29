@@ -1,0 +1,36 @@
+pub fn main Void world World !
+  mut bbytes [12]u8 [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  let buffer MutSpan<f32> std.mem.bytesAsMutF32 bbytes
+
+  mut xbytes [12]u8 [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  let input MutSpan<f32> std.mem.bytesAsMutF32 xbytes
+  set input[0] 1.0
+  set input[1] 2.0
+  set input[2] 3.0
+
+  mut maxv f32 input[0]
+  mut i usize 1
+  while < i 3
+    if > input[i] maxv
+      set maxv input[i]
+    set i + i 1
+  mut sum f32 0.0
+  mut j usize 0
+  while < j 3
+    let e f32 (std.math.expf (- input[j] maxv))
+    set buffer[j] e
+    set sum + sum e
+    set j + j 1
+  mut k usize 0
+  while < k 3
+    set buffer[k] / buffer[k] sum
+    set k + k 1
+
+  let total f32 (+ (+ buffer[0] buffer[1]) buffer[2])
+  let okSum Bool (&& (> total 0.999) (< total 1.001))
+  let ok0 Bool (&& (> buffer[0] 0.089) (< buffer[0] 0.091))
+  let ok1 Bool (&& (> buffer[1] 0.243) (< buffer[1] 0.246))
+  let ok2 Bool (&& (> buffer[2] 0.664) (< buffer[2] 0.667))
+  let ascending Bool (&& (< buffer[0] buffer[1]) (< buffer[1] buffer[2]))
+  if && (&& (&& (&& okSum ok0) ok1) ok2) ascending
+    check world.out.write "math softmax ok\n"

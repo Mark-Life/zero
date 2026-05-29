@@ -1,0 +1,23 @@
+# A `ref<Record>` parameter where the record carries a `Span<u8>` field. The
+# callee reads the span's ptr and len through the deref'd pointer (the span
+# field's ptr@field_offset and len@field_offset+8 both live inside the record
+# bytes, so the field load chases one extra pointer indirection).
+
+type Buffer
+  data Span<u8>
+  size usize
+
+fn dataLen usize p ref<Buffer>
+  ret std.mem.len p.data
+
+fn firstByte u8 p ref<Buffer>
+  ret p.data[0]
+
+pub fn main Void world World !
+  let bytes Span<u8> std.mem.span "hello world\n"
+  let n usize std.mem.len bytes
+  let buf Buffer . data bytes size n
+  let got usize dataLen (&buf)
+  let first u8 firstByte (&buf)
+  if && (== got 12) (== first 104)
+    check world.out.write "ref record span field ok\n"

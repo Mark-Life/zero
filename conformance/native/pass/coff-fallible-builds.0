@@ -1,0 +1,31 @@
+fn pickI32 i32 flag Bool ![Bad]
+  if flag
+    raise Bad
+  ret 42
+
+fn pickF32 f32 flag Bool ![Bad]
+  if flag
+    raise Bad
+  ret 2.5
+
+fn pickI64 i64 flag Bool ![Bad]
+  if flag
+    raise Bad
+  ret 1234567890123_i64
+
+fn helper u8 ![Bad]
+  let a i32 check (pickI32 false)
+  let b i32 rescue (pickI32 true) err 9
+  let c f32 check (pickF32 false)
+  let d f32 rescue (pickF32 true) err 9.0
+  let e i64 check (pickI64 false)
+  let f i64 rescue (pickI64 true) err 1_i64
+  if == a 42
+    if == b 9
+      if == c 2.5
+        if == d 9.0
+          ret 1_u8
+  ret 0_u8
+
+export c fn main u8
+  ret (rescue helper() err 0_u8)

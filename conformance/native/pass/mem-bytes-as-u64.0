@@ -1,0 +1,12 @@
+pub fn main Void world World !
+  # Three u64 values laid out little-endian in 24 bytes: 1, 0x0102030405060708, 0xFFFFFFFFFFFFFFFF.
+  let buf [24]u8 [1, 0, 0, 0, 0, 0, 0, 0, 8, 7, 6, 5, 4, 3, 2, 1, 255, 255, 255, 255, 255, 255, 255, 255]
+  let view Span<u64> std.mem.bytesAsU64 buf
+  let r0 u64 view[0]
+  let r1 u64 view[1]
+  let r2 u64 view[2]
+  let one u64 1_u64
+  let middle u64 72623859790382856_u64
+  let maxVal u64 18446744073709551615_u64
+  if && (== (std.mem.len view) 3) (&& (== r0 one) (&& (== r1 middle) (== r2 maxVal)))
+    check world.out.write "mem bytes as u64 ok\n"

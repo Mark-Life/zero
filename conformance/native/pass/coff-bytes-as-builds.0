@@ -1,0 +1,25 @@
+export c fn main u8
+  let buf [12]u8 [1_u8, 0_u8, 0_u8, 0_u8, 2_u8, 1_u8, 0_u8, 0_u8, 0_u8, 0_u8, 128_u8, 64_u8]
+  let intview Span<i32> std.mem.bytesAsI32 buf
+  let uintview Span<u32> std.mem.bytesAsU32 buf
+  let floatview Span<f32> std.mem.bytesAsF32 buf
+  let i8view Span<i8> std.mem.bytesAsI8 buf
+  let u8view Span<u8> std.mem.bytesAsU8 buf
+  let r0 i32 intview[0]
+  let r1 i32 intview[1]
+  let u0 u32 uintview[0]
+  let f2 f32 floatview[2]
+  let s0 i32 (i8view[0] as i32)
+  let b0 u32 (u8view[0] as u32)
+  let n_i32 usize (std.mem.len intview)
+  let n_u32 usize (std.mem.len uintview)
+  let n_f32 usize (std.mem.len floatview)
+  let n_i8 usize (std.mem.len i8view)
+  let n_u8 usize (std.mem.len u8view)
+  if == r0 1
+    if == r1 258
+      if == n_i32 3
+        if == n_f32 3
+          if == n_i8 12
+            ret 1_u8
+  ret 0_u8

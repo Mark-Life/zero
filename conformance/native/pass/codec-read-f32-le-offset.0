@@ -1,0 +1,10 @@
+pub fn main Void world World !
+  mut buf [12]u8 [0, 0, 128, 63, 0, 0, 0, 64, 0, 0, 64, 64]
+  let a f32 (std.codec.readF32Le buf 0)
+  let b f32 (std.codec.readF32Le buf 4)
+  let c f32 (std.codec.readF32Le buf 8)
+  let one f32 1.0
+  let two f32 2.0
+  let three f32 3.0
+  if && (&& (== a one) (== b two)) (== c three)
+    check world.out.write "codec read f32 le offset ok\n"

@@ -1,0 +1,29 @@
+# Direct-backend general user CALL. Exercises:
+#   - int-returning private fn called with three i32 args (AAPCS X0..X2 in, x0 out);
+#   - float-returning private fn called with one f32 arg (AAPCS V0 in/out);
+#   - Span<u8>-taking private fn that returns the second byte (ptr in X0, 32-bit len
+#     in W1 in, bounds-checked byte load in w0 out);
+# the i32 sum, f32 squared value, and second byte all participate in the success
+# Bool, with the if/else at main exit emitting "call int float ok" on success.
+
+fn add3 i32 a i32 b i32 c i32
+  ret + a (+ b c)
+
+fn sqr f32 x f32
+  ret * x x
+
+fn second u8 bytes Span<u8>
+  ret bytes[1]
+
+pub fn main Void world World !
+  let s i32 add3 2 3 4
+  let f f32 sqr 2.5
+  let abc Span<u8> std.mem.span "abc"
+  let mid u8 second abc
+  let okInt Bool == s 9
+  let okFloat Bool && (> f 6.24) (< f 6.26)
+  let okByte Bool == mid 98_u8
+  if && (&& okInt okFloat) okByte
+    check world.out.write "call int float ok\n"
+  else
+    check world.out.write "call int float fail\n"

@@ -1,0 +1,18 @@
+pub fn main Void world World !
+  # bytesAsU8 reinterprets a Span<u8> (or MutSpan<u8>) as Span<u8>: a no-op on bytes that
+  # also strips mutability from a MutSpan<u8> source. Verifies the lowering exists and
+  # produces an identical byte view.
+  let buf [6]u8 [10, 20, 30, 40, 50, 60]
+  let view Span<u8> std.mem.bytesAsU8 buf
+  let r0 u8 view[0]
+  let r5 u8 view[5]
+  mut heap PageAlloc std.mem.pageAlloc()
+  let region std.mem.allocBytes heap 8
+  if && region.has (&& (== (std.mem.len view) 6) (&& (== r0 10_u8) (== r5 60_u8)))
+    let mutBytes MutSpan<u8> region.value
+    set mutBytes[0] 99_u8
+    set mutBytes[7] 77_u8
+    # Strip mutability via bytesAsU8: the view points at the same backing memory.
+    let stripped Span<u8> std.mem.bytesAsU8 mutBytes
+    if && (== (std.mem.len stripped) 8) (&& (== stripped[0] 99_u8) (== stripped[7] 77_u8))
+      check world.out.write "mem bytes as u8 ok\n"

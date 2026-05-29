@@ -1,0 +1,179 @@
+# Self-contained sampler primitives.
+#
+# Self-contained mirror of examples/llama2/src/sampler.0, minus the temperature
+# path's softmax (which would pull in libm) — so this runs in CI with no
+# std.math, no fs. Covers the libm-free pieces:
+#   - argmax over a small logits span
+#   - the xorshift* PRNG (rngNext / randomF32) with XOR emulated via xor64,
+#     checked bit-exactly against a llama2.c reference (seed 1):
+#       rngNext(1)            = 33554433,            randomF32 ~ 0.28083503
+#       rngNext(33554433)     = 1126174793148417,    randomF32 ~ 0.67113721
+#   - sampleMult's CDF walk over a fixed distribution
+#   - parseF32's runtime decimal scan
+# Verifies u64 multiply/divide-by-power-of-two shift emulation and u64->f32
+# conversion on the direct backend.
+
+fn argmax i32 logits Span<f32>
+  let n usize std.mem.len logits
+  mut bestI i32 0
+  mut bestV f32 logits[0]
+  mut i usize 1
+  while < i n
+    let v f32 logits[i]
+    if > v bestV
+      set bestV v
+      set bestI (i as i32)
+    set i + i 1
+  ret bestI
+
+fn xor64 u64 a u64 b u64
+  mut result u64 0
+  mut place u64 1
+  mut x u64 a
+  mut y u64 b
+  mut i i32 0
+  while < i 64
+    let xb u64 % x 2
+    let yb u64 % y 2
+    let rb u64 % (+ xb yb) 2
+    set result + result (* rb place)
+    set x / x 2
+    set y / y 2
+    set place * place 2
+    set i + i 1
+  ret result
+
+fn rngNext u64 state u64
+  mut s u64 state
+  let a u64 / s 4096
+  set s xor64 s a
+  let b u64 * s 33554432
+  set s xor64 s b
+  let c u64 / s 134217728
+  set s xor64 s c
+  ret s
+
+fn randomF32 f32 state u64
+  let mul u64 2685821657736338717
+  let prod u64 * state mul
+  let hi32 u64 / prod 4294967296
+  let bits24 u64 / hi32 256
+  let asF f32 (bits24 as f32)
+  let denom f32 16777216.0
+  ret / asF denom
+
+fn sampleMult i32 probs Span<f32> coin f32
+  let n usize std.mem.len probs
+  mut cdf f32 0.0
+  mut i usize 0
+  while < i n
+    set cdf + cdf probs[i]
+    let hit Bool (< coin cdf)
+    if hit
+      ret (i as i32)
+    set i + i 1
+  let last usize - n 1
+  ret (last as i32)
+
+fn parseF32 f32 s Span<u8>
+  let n usize std.mem.len s
+  let zeroc u8 ('0' as u8)
+  let ninec u8 ('9' as u8)
+  let dotc u8 ('.' as u8)
+  let minusc u8 ('-' as u8)
+  mut i usize 0
+  mut neg Bool false
+  if > n 0
+    let c0 u8 s[0]
+    if == c0 minusc
+      set neg true
+      set i 1
+  mut value f32 0.0
+  mut frac f32 1.0
+  mut inFrac Bool false
+  while < i n
+    let c u8 s[i]
+    let isDot Bool (== c dotc)
+    if isDot
+      set inFrac true
+    if == isDot false
+      let below Bool (< c zeroc)
+      let above Bool (> c ninec)
+      let bad Bool (|| below above)
+      if == bad false
+        let d i32 - (c as i32) (zeroc as i32)
+        let df f32 (d as f32)
+        if inFrac
+          set frac / frac 10.0
+          set value + value (* df frac)
+        if == inFrac false
+          set value + (* value 10.0) df
+    set i + i 1
+  if neg
+    set value - 0.0 value
+  ret value
+
+pub fn main Void world World !
+  # argmax: largest logit index, including a negative-valued span.
+  mut la_bytes [16]u8 [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  let la MutSpan<f32> std.mem.bytesAsMutF32 la_bytes
+  set la[0] 0.1
+  set la[1] 0.5
+  set la[2] 0.3
+  set la[3] 0.2
+  let lasp Span<f32> std.mem.bytesAsF32 la_bytes
+  let okArg1 Bool (== (argmax lasp) 1)
+
+  mut lb_bytes [12]u8 [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  let lb MutSpan<f32> std.mem.bytesAsMutF32 lb_bytes
+  set lb[0] (- 0.0 1.0)
+  set lb[1] (- 0.0 0.5)
+  set lb[2] (- 0.0 2.0)
+  let lbsp Span<f32> std.mem.bytesAsF32 lb_bytes
+  let okArg2 Bool (== (argmax lbsp) 1)
+
+  # xorshift* PRNG vs llama2.c reference (seed 1).
+  let seed u64 1
+  let s1 u64 rngNext seed
+  let okS1 Bool (== s1 33554433_u64)
+  let s2 u64 rngNext s1
+  let okS2 Bool (== s2 1126174793148417_u64)
+  let f0 f32 randomF32 s1
+  let okF0 Bool (&& (> f0 0.2803) (< f0 0.2813))
+  let f1 f32 randomF32 s2
+  let okF1 Bool (&& (> f1 0.6706) (< f1 0.6716))
+
+  # sampleMult: walk the CDF of a fixed distribution.
+  mut pr_bytes [16]u8 [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  let pr MutSpan<f32> std.mem.bytesAsMutF32 pr_bytes
+  set pr[0] 0.1
+  set pr[1] 0.2
+  set pr[2] 0.3
+  set pr[3] 0.4
+  let prsp Span<f32> std.mem.bytesAsF32 pr_bytes
+  let okM0 Bool (== (sampleMult prsp 0.05) 0)
+  let okM2 Bool (== (sampleMult prsp 0.35) 2)
+  let okM3 Bool (== (sampleMult prsp 0.99) 3)
+
+  # parseF32: runtime decimal scan.
+  let b09 Span<u8> std.mem.span "0.9"
+  let v09 f32 parseF32 b09
+  let okP09 Bool (&& (> v09 0.8995) (< v09 0.9005))
+  let b15 Span<u8> std.mem.span "1.5"
+  let v15 f32 parseF32 b15
+  let okP15 Bool (&& (> v15 1.4995) (< v15 1.5005))
+  let b2 Span<u8> std.mem.span "2"
+  let v2 f32 parseF32 b2
+  let okP2 Bool (&& (> v2 1.9995) (< v2 2.0005))
+  let b0 Span<u8> std.mem.span "0"
+  let v0 f32 parseF32 b0
+  let okP0 Bool (&& (> v0 (- 0.0 0.0005)) (< v0 0.0005))
+
+  let okArg Bool (&& okArg1 okArg2)
+  let okRng Bool (&& okS1 (&& okS2 (&& okF0 okF1)))
+  let okMult Bool (&& okM0 (&& okM2 okM3))
+  let okParse Bool (&& okP09 (&& okP15 (&& okP2 okP0)))
+  let okAll Bool (&& okArg (&& okRng (&& okMult okParse)))
+  if okAll
+    check world.out.write "sampler sample ok\n"
+  ret

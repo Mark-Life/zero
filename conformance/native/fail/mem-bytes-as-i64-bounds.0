@@ -1,0 +1,9 @@
+pub fn main Void world World !
+  mut heap PageAlloc std.mem.pageAlloc()
+  let region std.mem.allocBytes heap 16
+  if region.has
+    let bytes MutSpan<u8> region.value
+    let ints MutSpan<i64> std.mem.bytesAsMutI64 bytes
+    let oob i64 ints[2]
+    if == oob 0_i64
+      check world.out.write "unreachable\n"

@@ -1,0 +1,26 @@
+# FixedBufAlloc + std.mem.allocBytes + Maybe<MutSpan<u8>>
+# .has/.value/[i] usage + Maybe<i32> literal. Validates the Maybe/allocator
+# subsystem on a backend. Two successful allocations exercise the bump path;
+# a Maybe<i32> null literal exercises MAYBE_SCALAR construction; writes
+# through Maybe.value (via a bound MutSpan<u8> local) exercise the indexed-
+# store path on a Maybe.value-rooted span.
+
+pub fn main Void world World !
+  mut backing [16]u8 [0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8]
+  mut alloc FixedBufAlloc std.mem.fixedBufAlloc backing
+  let first std.mem.allocBytes alloc 4
+  let second std.mem.allocBytes alloc 8
+
+  # Maybe<i32> literal — exercises MAYBE_SCALAR + .has on a scalar Maybe.
+  let maybeSeven Maybe<i32> null
+
+  if == maybeSeven.has false
+    if && first.has second.has
+      # Bind spans to locals first (indexed store requires a span local).
+      let firstBytes MutSpan<u8> first.value
+      let secondBytes MutSpan<u8> second.value
+      if && (== (std.mem.len firstBytes) 4) (== (std.mem.len secondBytes) 8)
+        set firstBytes[0] 65_u8
+        set secondBytes[7] 90_u8
+        if && (== backing[0] 65_u8) (== backing[11] 90_u8)
+          check world.out.write "mem fixed buf alloc ok\n"

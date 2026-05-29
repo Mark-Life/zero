@@ -1,0 +1,22 @@
+pub fn main Void world World !
+  mut heap PageAlloc std.mem.pageAlloc()
+  let region std.mem.allocBytes heap 4096
+  if region.has
+    let bytes MutSpan<u8> region.value
+    let ints MutSpan<u64> std.mem.bytesAsMutU64 bytes
+    set ints[0] 12345_u64
+    set ints[1] 18446744073709551615_u64
+    set ints[2] 1099511627776_u64
+    set ints[511] 9999999999_u64
+    let v0 u64 ints[0]
+    let v1 u64 ints[1]
+    let v2 u64 ints[2]
+    let v3 u64 ints[3]
+    let last u64 ints[511]
+    let small u64 12345_u64
+    let maxVal u64 18446744073709551615_u64
+    let oneTrillionish u64 1099511627776_u64
+    let zero u64 0_u64
+    let big u64 9999999999_u64
+    if && (== (std.mem.len ints) 512) (&& (== v0 small) (&& (== v1 maxVal) (&& (== v2 oneTrillionish) (&& (== v3 zero) (== last big)))))
+      check world.out.write "mem bytes as mut u64 ok\n"

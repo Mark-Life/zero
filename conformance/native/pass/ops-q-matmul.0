@@ -1,0 +1,155 @@
+# Quantized (int8) matmul kernel — exact integer products + per-group rescale.
+#
+# Self-contained mirror of `matmulQ` from examples/llama2/src/ops.0, exercised
+# on a tiny hand-computed case so it needs no filesystem and no libm and runs
+# in CI. `matmulQ` is the byte-for-byte port of `runq.c`'s quantized matmul:
+# W (d, n) @ x (n,) -> out (d,), both operands int8, accumulated as an exact
+# int32 dot product within each group of `gs` quants then rescaled to f32 by
+# that group's weight and activation scales.
+#
+# The case is d=2, n=4, gs=2 (so 2 groups per row, 4 weight scales, 2 activation
+# scales). Weight quants live in a `Span<i8>` view of raw bytes including values
+# >= 128 to exercise the two's-complement signed-load (each byte reads back as
+# its int8 value directly — no decode helper needed). Activation quants live in
+# a `MutSpan<i8>` (one byte per value, matching runq.c's `int8_t*`). Scales are
+# exact powers of two (and 0.25) so every product and sum below is exact in
+# f32, letting the assertions use exact `==`.
+#
+#   weight bytes  : [1, 2, 254, 128, 3, 0, 255, 127]
+#   signed (i8)   : [1, 2,  -2, -128, 3, 0,  -1, 127]
+#   weight scales : [0.5, 0.25, 2.0, 1.0]   (d*n/gs = 4)
+#   act quants    : [10, -3, 5, -7]         (n = 4, signed i8)
+#   act scales    : [0.5, 4.0]              (n/gs = 2)
+#
+# Row 0 (row = 0):
+#   group j=0: ival = 10*1 + (-3)*2          =   4; (4*0.5)*0.5      =     1.0
+#   group j=2: ival =  5*(-2) + (-7)*(-128)  = 886; (886*0.25)*4.0   =   886.0
+#   out[0] = 1.0 + 886.0                                             =   887.0
+# Row 1 (row = 4):
+#   group j=0: ival = 10*3 + (-3)*0          =  30; (30*2.0)*0.5     =    30.0
+#   group j=2: ival =  5*(-1) + (-7)*127     = -894; (-894*1.0)*4.0  = -3576.0
+#   out[1] = 30.0 + (-3576.0)                                        = -3546.0
+
+# One matrix's int8 quants (signed-byte view of the raw bytes) plus the f32
+# group scales. Mirrors `QWeight` in examples/llama2/src/checkpoint.0.
+type QWeight
+  q Span<i8>
+  s Span<f32>
+
+# Quantized-activation scratch: signed int8 quants as `MutSpan<i8>` (one byte
+# per value, matching runq.c's `int8_t*`) plus the f32 group scales. Mirrors
+# `QActs` in examples/llama2/src/ops.0.
+type QActs
+  q MutSpan<i8>
+  s MutSpan<f32>
+
+# Port of examples/llama2/src/ops.0 `matmulQ` (see there for the parity notes):
+# per-group int32 accumulate, reset each group, left-to-right f32 rescale.
+# Signed int8 loads via `(span[i] as i32)` produce the two's-complement value
+# directly, so no separate sign-decode helper is needed.
+fn matmulQ Void out MutSpan<f32> x QActs w QWeight gs usize
+  let xq MutSpan<i8> x.q
+  let xs MutSpan<f32> x.s
+  let wq Span<i8> w.q
+  let ws Span<f32> w.s
+  let d usize std.mem.len out
+  let n usize std.mem.len xq
+  mut i usize 0
+  while < i d
+    let row usize * i n
+    mut val f32 0.0
+    mut j usize 0
+    while < j n
+      mut ival i32 0
+      mut k usize 0
+      while < k gs
+        let idx usize + row (+ j k)
+        let jk usize + j k
+        let xqv i32 (xq[jk] as i32)
+        let wqv i32 (wq[idx] as i32)
+        set ival + ival (* xqv wqv)
+        set k + k 1
+      let rowj usize + row j
+      let wsi usize / rowj gs
+      let xsi usize / j gs
+      let wscale f32 ws[wsi]
+      let xscale f32 xs[xsi]
+      let ivalf f32 (ival as f32)
+      set val + val (* (* ivalf wscale) xscale)
+      set j + j gs
+    set out[i] val
+    set i + i 1
+
+pub fn main Void world World !
+  # Weight quants as raw bytes (incl. >= 128 for two's-complement signed-load)
+  # and f32 scales (stored in a byte buffer reinterpreted as MutSpan<f32>).
+  let wbytes [8]u8 [1, 2, 254, 128, 3, 0, 255, 127]
+  mut wscalebytes [16]u8 [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  let wsmut MutSpan<f32> std.mem.bytesAsMutF32 wscalebytes
+  set wsmut[0] 0.5
+  set wsmut[1] 0.25
+  set wsmut[2] 2.0
+  set wsmut[3] 1.0
+  let wq Span<i8> std.mem.bytesAsI8 wbytes
+  let ws Span<f32> std.mem.bytesAsF32 wscalebytes
+  let w QWeight . q wq s ws
+
+  # Activation quants live in a writable i8 region (mirrors the run state's
+  # `MutSpan<i8>`); activation scales in a writable f32 region.
+  mut heap PageAlloc std.mem.pageAlloc()
+  let qregion Maybe<MutSpan<u8>> std.mem.allocBytes heap 64
+  if == qregion.has false
+    ret
+  let sregion Maybe<MutSpan<u8>> std.mem.allocBytes heap 64
+  if == sregion.has false
+    ret
+  let qbase MutSpan<u8> qregion.value
+  let sbase MutSpan<u8> sregion.value
+  let qbytes MutSpan<i8> std.mem.bytesAsMutI8 qbase
+  let sflts MutSpan<f32> std.mem.bytesAsMutF32 sbase
+
+  # Activation quants [10, -3, 5, -7] over the first 4 i8 slots.
+  set qbytes[0] (10 as i8)
+  set qbytes[1] ((- 0 3) as i8)
+  set qbytes[2] (5 as i8)
+  set qbytes[3] ((- 0 7) as i8)
+  # Activation scales [0.5, 4.0] over the first 2 f32 slots.
+  set sflts[0] 0.5
+  set sflts[1] 4.0
+
+  let xq MutSpan<i8> qbytes[0..4]
+  let xs MutSpan<f32> sflts[0..2]
+  let x QActs . q xq s xs
+
+  # Output region: 2 f32.
+  let oregion Maybe<MutSpan<u8>> std.mem.allocBytes heap 64
+  if == oregion.has false
+    ret
+  let obase MutSpan<u8> oregion.value
+  let oflts MutSpan<f32> std.mem.bytesAsMutF32 obase
+  let out MutSpan<f32> oflts[0..2]
+
+  matmulQ out x w 2
+
+  # Both outputs are exact integers in f32 (all intermediates exact), so check
+  # them exactly against the hand-computed values.
+  let o0 f32 out[0]
+  let o1 f32 out[1]
+  let want0 f32 887.0
+  let want1 f32 (- 0.0 3546.0)
+  let okOut Bool (&& (== o0 want0) (== o1 want1))
+
+  # Signed-load sanity on the boundary bytes used above (no decode helper).
+  let s0 i32 (wq[3] as i32)
+  let s1 i32 (wq[2] as i32)
+  let s2 i32 (wq[7] as i32)
+  let s3 i32 (wq[5] as i32)
+  let want_s0 i32 (- 0 128)
+  let want_s1 i32 (- 0 2)
+  let want_s2 i32 127
+  let want_s3 i32 0
+  let okSign Bool (&& (&& (== s0 want_s0) (== s1 want_s1)) (&& (== s2 want_s2) (== s3 want_s3)))
+
+  if && okOut okSign
+    check world.out.write "ops q matmul ok\n"
+  ret

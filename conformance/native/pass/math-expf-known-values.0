@@ -1,0 +1,10 @@
+pub fn main Void world World !
+  let zero f32 0.0
+  let one f32 1.0
+  let r0 f32 (std.math.expf zero)
+  let r1 f32 (std.math.expf one)
+  let okZero Bool (== r0 1.0)
+  let okOneLo Bool (> r1 2.71)
+  let okOneHi Bool (< r1 2.72)
+  if && (&& okZero okOneLo) okOneHi
+    check world.out.write "math expf ok\n"

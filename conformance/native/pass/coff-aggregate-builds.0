@@ -1,0 +1,32 @@
+type Dims
+  width i32
+  height i32
+  shared Bool
+
+fn makeDims Dims w i32
+  let d Dims . width w height 3 shared true
+  ret d
+
+fn passDims Dims d Dims
+  ret d
+
+fn area i32 d Dims
+  ret * d.width d.height
+
+fn perimeter i32 a Dims b Dims
+  ret + a.width b.width
+
+export c fn main u8
+  let dims Dims makeDims 7
+  let dims2 Dims passDims dims
+  let a i32 area dims
+  let w i32 dims.width
+  let h i32 dims2.height
+  let two_dims Dims makeDims 4
+  let perim i32 perimeter dims two_dims
+  if == w 7
+    if == h 3
+      if == a 21
+        if == perim 11
+          ret 1_u8
+  ret 0_u8

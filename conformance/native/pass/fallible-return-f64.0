@@ -1,0 +1,13 @@
+fn pickF64 f64 flag Bool ![Bad]
+  if flag
+    raise Bad
+  let v f64 2.5
+  ret v
+
+pub fn main Void world World !
+  let ok f64 check (pickF64 false)
+  let fallback f64 rescue (pickF64 true) err 9.0
+  let expected f64 2.5
+  let nine f64 9.0
+  if && (== ok expected) (== fallback nine)
+    check world.out.write "fallible f64 ok\n"

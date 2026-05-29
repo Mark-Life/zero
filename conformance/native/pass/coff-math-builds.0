@@ -1,0 +1,23 @@
+export c fn main u8
+  let x f32 4.0
+  let y f32 2.0
+  let s f32 std.math.sqrtf x
+  let e f32 std.math.expf y
+  let c f32 std.math.cosf 0.0
+  let si f32 std.math.sinf 0.0
+  let p f32 std.math.powf x y
+  let a f32 std.math.absf (- 0.0 x)
+  let fl f32 std.math.floorf 3.7
+  let nan_input f32 (- 0.0 1.0)
+  let nan_attempt f32 std.math.sqrtf nan_input
+  let was_nan Bool std.math.isNaNf nan_attempt
+  let pi f32 (std.math.piF())
+  let euler f32 (std.math.eF())
+  let inf f32 (std.math.infinityF())
+  let n f32 (std.math.nanF())
+  if == s 2.0
+    if > e 7.0
+      if == fl 3.0
+        if was_nan
+          ret 1_u8
+  ret 0_u8

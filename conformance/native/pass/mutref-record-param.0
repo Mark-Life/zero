@@ -1,0 +1,18 @@
+# A function parameter typed `mutref<Record>` receives the caller's record by
+# pointer and may mutate fields in place. The caller passes `&mut local`; the
+# callee's `set p.field …` writes through the pointer so the mutation is
+# visible to the caller. Today this lowers on the darwin-arm64 backend; the
+# other floated backends gate it as BLD004 until their per-backend ports land.
+
+type Point
+  x i32
+  y i32
+
+fn shiftX Void p mutref<Point> dx i32
+  set p.x + p.x dx
+
+pub fn main Void world World !
+  mut pt Point . x 10 y 20
+  shiftX (&mut pt) 5
+  if && (== pt.x 15) (== pt.y 20)
+    check world.out.write "mutref record param ok\n"

@@ -1,0 +1,26 @@
+pub fn main Void world World !
+  let fs std.fs.host()
+  mut mapping Maybe<owned<Mapping>> std.fs.mmap fs ".zero/conformance/fs-mmap-page-input.bin"
+  if == mapping.has false
+    check world.out.write "fs mmap page failed\n"
+    ret
+  mut m owned<Mapping> mapping.value
+  let bytes Span<u8> std.fs.mappingBytes (&m)
+  let okmap Bool (&& (== (std.mem.len bytes) 4) (&& (== bytes[0] 80_u8) (== bytes[3] 10_u8)))
+  let bad Maybe<owned<Mapping>> std.fs.mmap fs ".zero/conformance/this-file-does-not-exist.bin"
+  let okbad Bool (== bad.has false)
+  mut heap PageAlloc std.mem.pageAlloc()
+  let region std.mem.allocBytes heap 64
+  mut okheap Bool false
+  if region.has
+    let mem MutSpan<u8> region.value
+    let words MutSpan<i32> std.mem.bytesAsMutI32 mem[0..8]
+    set words[0] 123456
+    set words[1] 654321
+    set okheap (&& (== (std.mem.len words) 2) (&& (== words[0] 123456) (== words[1] 654321)))
+  std.fs.munmap (&mut m)
+  if && okmap (&& okbad okheap)
+    check world.out.write "fs mmap page ok\n"
+  else
+    check world.out.write "fs mmap page mismatch\n"
+  ret

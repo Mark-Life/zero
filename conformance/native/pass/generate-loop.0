@@ -1,0 +1,114 @@
+# Self-contained generation-loop control flow + parseUsize.
+#
+# Mirrors the libm-free, fs-free pieces of examples/llama2/src/main.0's
+# generation loop so they run in CI (no std.math, no fs):
+#   - parseUsize: the runtime --tokens decimal scan
+#   - clampSteps: --tokens 0 or > seq_len clamps to seq_len
+#   - the prompt-force / sample / BOS-stop sequencing, including the no-break
+#     loop exit (the direct backend has no break, so the loop ends by setting
+#     pos = steps and guarding the emit instead).
+
+fn parseUsize usize s Span<u8>
+  let n usize std.mem.len s
+  let zeroc u8 ('0' as u8)
+  let ninec u8 ('9' as u8)
+  mut value usize 0
+  mut i usize 0
+  while < i n
+    let c u8 s[i]
+    let below Bool (< c zeroc)
+    let above Bool (> c ninec)
+    let bad Bool (|| below above)
+    if == bad false
+      let d i32 - (c as i32) (zeroc as i32)
+      let du usize (d as usize)
+      set value + (* value 10) du
+    set i + i 1
+  ret value
+
+fn clampSteps usize raw usize seq_len usize
+  mut steps usize raw
+  if == steps 0
+    set steps seq_len
+  if > steps seq_len
+    set steps seq_len
+  ret steps
+
+pub fn main Void world World !
+  # parseUsize: decimal scan over a runtime byte span. Hoist the span first;
+  # a nested std call as an arg trips CGEN004 on the direct backend.
+  let s256 Span<u8> std.mem.span "256"
+  let okP256 Bool (== (parseUsize s256) 256)
+  let s0 Span<u8> std.mem.span "0"
+  let okP0 Bool (== (parseUsize s0) 0)
+  let s42 Span<u8> std.mem.span "42"
+  let okP42 Bool (== (parseUsize s42) 42)
+  let s007 Span<u8> std.mem.span "007"
+  let okP7 Bool (== (parseUsize s007) 7)
+
+  # clampSteps: 0 and over-seq_len clamp to seq_len; in-range passes through.
+  let okC0 Bool (== (clampSteps 0 256) 256)
+  let okC8 Bool (== (clampSteps 8 256) 8)
+  let okCbig Bool (== (clampSteps 999 256) 256)
+
+  # Generation control flow over a fake model: prompt_tokens forces the prompt
+  # (echoing prompt_tokens[1..]), then genTokens supplies sampled tokens until
+  # a BOS (=1) ends it.
+  mut prompt_bytes [12]u8 [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  let pwriter MutSpan<i32> std.mem.bytesAsMutI32 prompt_bytes
+  set pwriter[0] 1
+  set pwriter[1] 5
+  set pwriter[2] 6
+  let psp Span<i32> std.mem.bytesAsI32 prompt_bytes
+  let n_prompt usize 3
+
+  mut gen_bytes [12]u8 [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  let gwriter MutSpan<i32> std.mem.bytesAsMutI32 gen_bytes
+  set gwriter[0] 7
+  set gwriter[1] 8
+  set gwriter[2] 1
+  let gsp Span<i32> std.mem.bytesAsI32 gen_bytes
+
+  mut emit_bytes [64]u8 [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  let esp MutSpan<i32> std.mem.bytesAsMutI32 emit_bytes
+  mut nEmit usize 0
+  mut gi usize 0
+
+  let steps usize clampSteps 10 64
+  mut token i32 psp[0]
+  mut pos usize 0
+  while < pos steps
+    # "forward" is a no-op here; pick next exactly as the example loop does.
+    mut next i32 0
+    let in_prompt Bool (< (+ pos 1) n_prompt)
+    if in_prompt
+      set next psp[(+ pos 1)]
+    if == in_prompt false
+      set next gsp[gi]
+      set gi + gi 1
+    set pos + pos 1
+    let stop Bool (== next 1)
+    if stop
+      set pos steps
+    if == stop false
+      set esp[nEmit] next
+      set nEmit + nEmit 1
+      set token next
+
+  # Expect emitted = [5, 6, 7, 8]: prompt echo (ids 5,6) then generation (7,8),
+  # stopping before the BOS that follows.
+  let okN Bool (== nEmit 4)
+  let ok0 Bool (== esp[0] 5)
+  let ok1 Bool (== esp[1] 6)
+  let ok2 Bool (== esp[2] 7)
+  let ok3 Bool (== esp[3] 8)
+  let okSeq Bool (&& ok0 (&& ok1 (&& ok2 ok3)))
+  let lastToken Bool (== token 8)
+
+  let okParse Bool (&& okP256 (&& okP0 (&& okP42 okP7)))
+  let okClamp Bool (&& okC0 (&& okC8 okCbig))
+  let okGen Bool (&& okN (&& okSeq lastToken))
+  let okAll Bool (&& okParse (&& okClamp okGen))
+  if okAll
+    check world.out.write "generate loop ok\n"
+  ret

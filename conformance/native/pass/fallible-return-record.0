@@ -1,0 +1,50 @@
+# A record-returning function can also raise: the record flows via the sret
+# pointer as usual, and the error tag rides in the second-return register
+# (x1 on AArch64 / rdx on System V x64). Today this combo is implemented on
+# the darwin-arm64 backend; the other floated backends gate it as BLD004
+# until their per-backend ports land.
+#
+# Three call sites exercise the ABI: a `let r Record = check f()` that binds
+# the record into a local on success, a `let r Record = f() rescue fallback`
+# that materializes a fallback record on error, and a tail-return wrapper
+# `ret check f()` / `ret rescue (f()) err fb` that routes the inner call's
+# sret straight into the outer function's sret target (no temporary local).
+
+type Point
+  x i32
+  y i32
+
+fn makePoint Point ax i32 ay i32 ![Bad]
+  if < ax 0
+    raise Bad
+  let p Point . x ax y ay
+  ret p
+
+fn wrapCheck Point ax i32 ay i32 ![Bad]
+  ret check (makePoint ax ay)
+
+fn wrapRescue Point ax i32 ay i32
+  let fb Point . x 7 y 8
+  ret rescue (makePoint ax ay) err fb
+
+pub fn main Void world World !
+  let r Point check (makePoint 3 4)
+  if && (== r.x 3) (== r.y 4)
+    check world.out.write "fallible record check ok\n"
+  let fallback Point . x 99 y 99
+  let neg i32 (- 0 1)
+  let s Point rescue (makePoint neg 4) err fallback
+  if && (== s.x 99) (== s.y 99)
+    check world.out.write "fallible record rescue err ok\n"
+  let t Point rescue (makePoint 5 6) err fallback
+  if && (== t.x 5) (== t.y 6)
+    check world.out.write "fallible record rescue ok ok\n"
+  let w Point check (wrapCheck 1 2)
+  if && (== w.x 1) (== w.y 2)
+    check world.out.write "ret check ok\n"
+  let v Point wrapRescue neg 4
+  if && (== v.x 7) (== v.y 8)
+    check world.out.write "ret rescue err ok\n"
+  let u Point wrapRescue 11 12
+  if && (== u.x 11) (== u.y 12)
+    check world.out.write "ret rescue ok ok\n"

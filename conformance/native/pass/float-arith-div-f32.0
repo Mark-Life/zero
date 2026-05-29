@@ -1,0 +1,6 @@
+pub fn main Void world World !
+  let a f32 10.0
+  let b f32 4.0
+  let r f32 (/ a b)
+  if == r 2.5
+    check world.out.write "float div f32 ok\n"

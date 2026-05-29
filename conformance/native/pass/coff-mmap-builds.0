@@ -1,0 +1,42 @@
+fn try_mmap u8 ![Bad]
+  let fs std.fs.host()
+  mut mapping Maybe<owned<Mapping>> std.fs.mmap fs "build-only-input.bin"
+  if == mapping.has false
+    ret 0_u8
+  mut m owned<Mapping> mapping.value
+  let bytes Span<u8> std.fs.mappingBytes (&m)
+  let n usize (std.mem.len bytes)
+  std.fs.munmap (&mut m)
+  if > n 0
+    ret 1_u8
+  ret 0_u8
+
+fn try_page u8
+  mut heap PageAlloc std.mem.pageAlloc()
+  let region std.mem.allocBytes heap 64
+  if region.has
+    let mem MutSpan<u8> region.value
+    let words MutSpan<i32> std.mem.bytesAsMutI32 mem[0..8]
+    set words[0] 1234
+    set words[1] 5678
+    if == (std.mem.len words) 2
+      ret 1_u8
+  ret 0_u8
+
+fn try_fixedbuf u8
+  mut storage [16]u8 [0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8]
+  mut alloc FixedBufAlloc std.mem.fixedBufAlloc storage
+  let first std.mem.allocBytes alloc 4
+  if first.has
+    if == (std.mem.len first.value) 4
+      ret 1_u8
+  ret 0_u8
+
+export c fn main u8
+  let a u8 (rescue try_mmap() err 0_u8)
+  let b u8 try_page()
+  let c u8 try_fixedbuf()
+  if == b 1_u8
+    if == c 1_u8
+      ret 1_u8
+  ret 0_u8

@@ -1,0 +1,7 @@
+pub fn main Void world World !
+  let bytes [4]u8 [0, 0, 0, 0]
+  # Offset 3 + 2 = 5 > len 4 → bounds trap.
+  let off usize 3
+  let oob u16 (std.codec.readU16Le bytes off)
+  if == oob 0_u16
+    check world.out.write "unreachable\n"

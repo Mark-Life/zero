@@ -1,0 +1,19 @@
+pub fn main Void world World !
+  mut heap PageAlloc std.mem.pageAlloc()
+  let region std.mem.allocBytes heap 4096
+  if region.has
+    let bytes MutSpan<u8> region.value
+    let floats MutSpan<f32> std.mem.bytesAsMutF32 bytes
+    let onePointFive f32 1.5
+    let twoPointFive f32 2.5
+    set floats[0] onePointFive
+    set floats[1] twoPointFive
+    set floats[3] (+ floats[0] floats[1])
+    let v0 f32 floats[0]
+    let v1 f32 floats[1]
+    let v2 f32 floats[2]
+    let v3 f32 floats[3]
+    let zero f32 0.0
+    let four f32 4.0
+    if && (== (std.mem.len floats) 1024) (&& (== v0 onePointFive) (&& (== v1 twoPointFive) (&& (== v2 zero) (== v3 four))))
+      check world.out.write "mem bytes as mut f32 ok\n"

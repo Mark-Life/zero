@@ -1,0 +1,477 @@
+# End-to-end forward pass on a tiny synthetic model.
+#
+# Self-contained mirror of examples/llama2 (checkpoint shapes + ops kernels +
+# transformer.forward), shrunk to dim=4/hidden=8/1 layer/2 heads/seq=2/vocab=3
+# with deterministic integer-filled weights. Runs two decoder steps (token 0 at
+# pos 0, then token 1 at pos 1 — exercising the KV-cache attention loop) and
+# checks the resulting logits against a libm C reference (-0.104507, 1.747386,
+# -0.142307). Exercises the real design: record params across calls, one zeroed
+# pageAlloc'd RunState region, and writable f32 sub-views obtained by slicing +
+# reinterpreting the mutable byte region.
+
+type Config
+  dim i32
+  hidden_dim i32
+  n_layers i32
+  n_heads i32
+  n_kv_heads i32
+  vocab_size i32
+  seq_len i32
+
+type Weights
+  token_embedding_table Span<f32>
+  rms_att_weight Span<f32>
+  wq Span<f32>
+  wk Span<f32>
+  wv Span<f32>
+  wo Span<f32>
+  rms_ffn_weight Span<f32>
+  w1 Span<f32>
+  w2 Span<f32>
+  w3 Span<f32>
+  rms_final_weight Span<f32>
+  wcls Span<f32>
+
+type RunState
+  base MutSpan<u8>
+  x_off usize
+  xb_off usize
+  xb2_off usize
+  hb_off usize
+  hb2_off usize
+  q_off usize
+  att_off usize
+  logits_off usize
+  key_off usize
+  value_off usize
+
+# ---- kernels ----
+
+fn rmsnorm Void output MutSpan<f32> input Span<f32> weights Span<f32> eps f32
+  let n usize std.mem.len input
+  mut ss f32 0.0
+  mut i usize 0
+  while < i n
+    let v f32 input[i]
+    set ss + ss (* v v)
+    set i + i 1
+  let nf f32 ((n as i32) as f32)
+  set ss / ss nf
+  set ss + ss eps
+  let inv f32 / 1.0 (std.math.sqrtf ss)
+  mut j usize 0
+  while < j n
+    set output[j] (* weights[j] (* inv input[j]))
+    set j + j 1
+
+fn matmul Void output MutSpan<f32> input Span<f32> weights Span<f32>
+  let d usize std.mem.len output
+  let n usize std.mem.len input
+  mut i usize 0
+  while < i d
+    let row usize * i n
+    mut val f32 0.0
+    mut j usize 0
+    while < j n
+      let idx usize + row j
+      set val + val (* weights[idx] input[j])
+      set j + j 1
+    set output[i] val
+    set i + i 1
+
+fn softmax Void x MutSpan<f32>
+  let n usize std.mem.len x
+  mut maxv f32 x[0]
+  mut i usize 1
+  while < i n
+    if > x[i] maxv
+      set maxv x[i]
+    set i + i 1
+  mut sum f32 0.0
+  mut j usize 0
+  while < j n
+    let e f32 std.math.expf (- x[j] maxv)
+    set x[j] e
+    set sum + sum e
+    set j + j 1
+  mut k usize 0
+  while < k n
+    set x[k] / x[k] sum
+    set k + k 1
+
+fn rope Void vec MutSpan<f32> pos i32 head_size usize
+  let n usize std.mem.len vec
+  let posf f32 (pos as f32)
+  let hsf f32 ((head_size as i32) as f32)
+  let base f32 10000.0
+  mut i usize 0
+  while < i n
+    let head_dim usize % i head_size
+    let hd f32 ((head_dim as i32) as f32)
+    let exponent f32 / hd hsf
+    let denom f32 std.math.powf base exponent
+    let freq f32 / 1.0 denom
+    let val f32 * posf freq
+    let fcr f32 std.math.cosf val
+    let fci f32 std.math.sinf val
+    let i1 usize + i 1
+    let v0 f32 vec[i]
+    let v1 f32 vec[i1]
+    set vec[i] (- (* v0 fcr) (* v1 fci))
+    set vec[i1] (+ (* v0 fci) (* v1 fcr))
+    set i + i 2
+
+fn swiglu Void hb MutSpan<f32> hb2 Span<f32>
+  let n usize std.mem.len hb
+  mut i usize 0
+  while < i n
+    let v f32 hb[i]
+    let negv f32 - 0.0 v
+    let e f32 std.math.expf negv
+    let denom f32 + 1.0 e
+    let sig f32 / 1.0 denom
+    let silu f32 * v sig
+    let g f32 hb2[i]
+    set hb[i] (* silu g)
+    set i + i 1
+
+# ---- run state ----
+
+fn kvDim usize cfg Config
+  let dim usize (cfg.dim as usize)
+  let n_heads usize (cfg.n_heads as usize)
+  let n_kv_heads usize (cfg.n_kv_heads as usize)
+  ret / (* dim n_kv_heads) n_heads
+
+fn runStateFloats usize cfg Config
+  let dim usize (cfg.dim as usize)
+  let hidden usize (cfg.hidden_dim as usize)
+  let n_layers usize (cfg.n_layers as usize)
+  let n_heads usize (cfg.n_heads as usize)
+  let vocab usize (cfg.vocab_size as usize)
+  let seq_len usize (cfg.seq_len as usize)
+  let kv_dim usize kvDim cfg
+  let cache usize * (* n_layers seq_len) kv_dim
+  mut total usize 0
+  set total + total dim
+  set total + total dim
+  set total + total dim
+  set total + total hidden
+  set total + total hidden
+  set total + total dim
+  set total + total (* n_heads seq_len)
+  set total + total vocab
+  set total + total cache
+  set total + total cache
+  ret total
+
+fn mallocRunState RunState base MutSpan<u8> cfg Config
+  let dim usize (cfg.dim as usize)
+  let hidden usize (cfg.hidden_dim as usize)
+  let n_layers usize (cfg.n_layers as usize)
+  let n_heads usize (cfg.n_heads as usize)
+  let vocab usize (cfg.vocab_size as usize)
+  let seq_len usize (cfg.seq_len as usize)
+  let kv_dim usize kvDim cfg
+  let cache usize * (* n_layers seq_len) kv_dim
+
+  mut off usize 0
+  let x_off usize off
+  set off + off dim
+  let xb_off usize off
+  set off + off dim
+  let xb2_off usize off
+  set off + off dim
+  let hb_off usize off
+  set off + off hidden
+  let hb2_off usize off
+  set off + off hidden
+  let q_off usize off
+  set off + off dim
+  let att_off usize off
+  set off + off (* n_heads seq_len)
+  let logits_off usize off
+  set off + off vocab
+  let key_off usize off
+  set off + off cache
+  let value_off usize off
+  set off + off cache
+
+  let s RunState . base base x_off x_off xb_off xb_off xb2_off xb2_off hb_off hb_off hb2_off hb2_off q_off q_off att_off att_off logits_off logits_off key_off key_off value_off value_off
+  ret s
+
+fn view MutSpan<f32> base MutSpan<u8> off usize count usize
+  let start usize * off 4
+  let end usize + start (* count 4)
+  ret std.mem.bytesAsMutF32 base[start..end]
+
+fn forward Void cfg Config w Weights s RunState token i32 pos i32
+  let dim usize (cfg.dim as usize)
+  let hidden usize (cfg.hidden_dim as usize)
+  let n_layers usize (cfg.n_layers as usize)
+  let n_heads usize (cfg.n_heads as usize)
+  let n_kv_heads usize (cfg.n_kv_heads as usize)
+  let vocab usize (cfg.vocab_size as usize)
+  let seq_len usize (cfg.seq_len as usize)
+  let kv_dim usize kvDim cfg
+  let kv_mul usize / n_heads n_kv_heads
+  let head_size usize / dim n_heads
+  let eps f32 0.00001
+  let posu usize (pos as usize)
+  let cache usize * (* n_layers seq_len) kv_dim
+
+  let base MutSpan<u8> s.base
+
+  let tet Span<f32> w.token_embedding_table
+  let rms_att Span<f32> w.rms_att_weight
+  let wq Span<f32> w.wq
+  let wk Span<f32> w.wk
+  let wv Span<f32> w.wv
+  let wo Span<f32> w.wo
+  let rms_ffn Span<f32> w.rms_ffn_weight
+  let w1 Span<f32> w.w1
+  let w2 Span<f32> w.w2
+  let w3 Span<f32> w.w3
+  let rms_final Span<f32> w.rms_final_weight
+  let wcls Span<f32> w.wcls
+
+  let x MutSpan<f32> view base s.x_off dim
+  let tokenu usize (token as usize)
+  let emb_start usize * tokenu dim
+  let emb_end usize + emb_start dim
+  let emb Span<f32> tet[emb_start..emb_end]
+  mut ce usize 0
+  while < ce dim
+    set x[ce] emb[ce]
+    set ce + ce 1
+
+  let sqrt_hs f32 std.math.sqrtf ((head_size as i32) as f32)
+
+  mut l usize 0
+  while < l n_layers
+    let loff usize * (* l seq_len) kv_dim
+
+    let xb MutSpan<f32> view base s.xb_off dim
+    let xb2 MutSpan<f32> view base s.xb2_off dim
+    let q MutSpan<f32> view base s.q_off dim
+    let hb MutSpan<f32> view base s.hb_off hidden
+    let hb2 MutSpan<f32> view base s.hb2_off hidden
+    let att MutSpan<f32> view base s.att_off (* n_heads seq_len)
+    let kc MutSpan<f32> view base s.key_off cache
+    let vc MutSpan<f32> view base s.value_off cache
+    let k_off usize + (+ s.key_off loff) (* posu kv_dim)
+    let v_off usize + (+ s.value_off loff) (* posu kv_dim)
+    let k MutSpan<f32> view base k_off kv_dim
+    let v MutSpan<f32> view base v_off kv_dim
+
+    let ra_lo usize * l dim
+    let ra_hi usize + ra_lo dim
+    let ra Span<f32> rms_att[ra_lo..ra_hi]
+    rmsnorm xb x ra eps
+
+    let wq_lo usize * (* l dim) dim
+    let wq_hi usize + wq_lo (* dim dim)
+    let wq_l Span<f32> wq[wq_lo..wq_hi]
+    matmul q xb wq_l
+
+    let wkv_stride usize * dim kv_dim
+    let wk_lo usize * l wkv_stride
+    let wk_hi usize + wk_lo wkv_stride
+    let wk_l Span<f32> wk[wk_lo..wk_hi]
+    matmul k xb wk_l
+
+    let wv_l Span<f32> wv[wk_lo..wk_hi]
+    matmul v xb wv_l
+
+    rope q pos head_size
+    rope k pos head_size
+
+    mut h usize 0
+    while < h n_heads
+      let qoff usize * h head_size
+      let aoff usize * h seq_len
+      let kvh usize * (/ h kv_mul) head_size
+
+      mut t usize 0
+      while <= t posu
+        let kbase usize + (+ loff (* t kv_dim)) kvh
+        mut score f32 0.0
+        mut i usize 0
+        while < i head_size
+          let qi usize + qoff i
+          let ki usize + kbase i
+          set score + score (* q[qi] kc[ki])
+          set i + i 1
+        set score / score sqrt_hs
+        set att[+ aoff t] score
+        set t + t 1
+
+      let sm_lo usize aoff
+      let sm_hi usize + (+ aoff posu) 1
+      let att_h MutSpan<f32> att[sm_lo..sm_hi]
+      softmax att_h
+
+      mut z usize 0
+      while < z head_size
+        set xb[+ qoff z] 0.0
+        set z + z 1
+      mut t2 usize 0
+      while <= t2 posu
+        let vbase usize + (+ loff (* t2 kv_dim)) kvh
+        let a f32 att[+ aoff t2]
+        mut i2 usize 0
+        while < i2 head_size
+          let xi usize + qoff i2
+          let vi usize + vbase i2
+          set xb[xi] + xb[xi] (* a vc[vi])
+          set i2 + i2 1
+        set t2 + t2 1
+      set h + h 1
+
+    let wo_lo usize * (* l dim) dim
+    let wo_hi usize + wo_lo (* dim dim)
+    let wo_l Span<f32> wo[wo_lo..wo_hi]
+    matmul xb2 xb wo_l
+    mut r1 usize 0
+    while < r1 dim
+      set x[r1] + x[r1] xb2[r1]
+      set r1 + r1 1
+
+    let rf_lo usize * l dim
+    let rf_hi usize + rf_lo dim
+    let rf Span<f32> rms_ffn[rf_lo..rf_hi]
+    rmsnorm xb x rf eps
+
+    let w13_stride usize * dim hidden
+    let w13_lo usize * l w13_stride
+    let w13_hi usize + w13_lo w13_stride
+    let w1_l Span<f32> w1[w13_lo..w13_hi]
+    matmul hb xb w1_l
+    let w3_l Span<f32> w3[w13_lo..w13_hi]
+    matmul hb2 xb w3_l
+    swiglu hb hb2
+    let w2_l Span<f32> w2[w13_lo..w13_hi]
+    matmul xb hb w2_l
+
+    mut r2 usize 0
+    while < r2 dim
+      set x[r2] + x[r2] xb[r2]
+      set r2 + r2 1
+
+    set l + l 1
+
+  rmsnorm x x rms_final eps
+  let logits MutSpan<f32> view base s.logits_off vocab
+  matmul logits x wcls
+
+# ---- synthetic weights ----
+
+# Fill params packed into a record — passing them individually would push
+# fillRange past the backend's 6 integer-register argument limit.
+type Fill
+  a usize
+  b usize
+  m usize
+  sub i32
+  scale f32
+
+fn fillw f32 i usize p Fill
+  let prod usize + (* i p.a) p.b
+  let md usize % prod p.m
+  let mdi i32 (md as i32)
+  let v i32 - mdi p.sub
+  let vf f32 (v as f32)
+  ret * vf p.scale
+
+fn fillrms f32 i usize
+  let r usize % i 3
+  let rf f32 ((r as i32) as f32)
+  let one f32 1.0
+  let step f32 0.05
+  ret + one (* rf step)
+
+fn fillRange Void buf MutSpan<f32> off usize count usize p Fill
+  mut i usize 0
+  while < i count
+    set buf[(+ off i)] (fillw i p)
+    set i + i 1
+
+fn fillRmsRange Void buf MutSpan<f32> off usize count usize
+  mut i usize 0
+  while < i count
+    set buf[(+ off i)] (fillrms i)
+    set i + i 1
+
+fn wview Span<f32> base MutSpan<u8> off usize count usize
+  let start usize * off 4
+  let end usize + start (* count 4)
+  ret std.mem.bytesAsF32 base[start..end]
+
+pub fn main Void world World !
+  let cfg Config . dim 4 hidden_dim 8 n_layers 1 n_heads 2 n_kv_heads 2 vocab_size 3 seq_len 2
+
+  # weights region: 184 f32 (tet 12, rms_att 4, wq 16, wk 16, wv 16, wo 16,
+  # rms_ffn 4, w1 32, w2 32, w3 32, rms_final 4) = 736 bytes.
+  let alloc PageAlloc std.mem.pageAlloc()
+  let wregion Maybe<MutSpan<u8>> std.mem.allocBytes alloc 736
+  if == wregion.has false
+    ret
+  let wbase MutSpan<u8> wregion.value
+  let wall MutSpan<f32> std.mem.bytesAsMutF32 wbase
+  let p_tet Fill . a 7 b 3 m 13 sub 6 scale 0.1
+  let p_q Fill . a 5 b 1 m 11 sub 5 scale 0.04
+  let p_k Fill . a 3 b 2 m 11 sub 5 scale 0.04
+  let p_v Fill . a 9 b 4 m 11 sub 5 scale 0.04
+  let p_o Fill . a 2 b 7 m 11 sub 5 scale 0.04
+  let p_w1 Fill . a 11 b 5 m 13 sub 6 scale 0.03
+  let p_w2 Fill . a 4 b 9 m 13 sub 6 scale 0.03
+  let p_w3 Fill . a 6 b 1 m 13 sub 6 scale 0.03
+  fillRange wall 0 12 p_tet
+  fillRmsRange wall 12 4
+  fillRange wall 16 16 p_q
+  fillRange wall 32 16 p_k
+  fillRange wall 48 16 p_v
+  fillRange wall 64 16 p_o
+  fillRmsRange wall 80 4
+  fillRange wall 84 32 p_w1
+  fillRange wall 116 32 p_w2
+  fillRange wall 148 32 p_w3
+  fillRmsRange wall 180 4
+
+  let tet Span<f32> wview wbase 0 12
+  let rms_att Span<f32> wview wbase 12 4
+  let wq Span<f32> wview wbase 16 16
+  let wk Span<f32> wview wbase 32 16
+  let wv Span<f32> wview wbase 48 16
+  let wo Span<f32> wview wbase 64 16
+  let rms_ffn Span<f32> wview wbase 80 4
+  let w1 Span<f32> wview wbase 84 32
+  let w2 Span<f32> wview wbase 116 32
+  let w3 Span<f32> wview wbase 148 32
+  let rms_final Span<f32> wview wbase 180 4
+  let weights Weights . token_embedding_table tet rms_att_weight rms_att wq wq wk wk wv wv wo wo rms_ffn_weight rms_ffn w1 w1 w2 w2 w3 w3 rms_final_weight rms_final wcls tet
+
+  let rs_floats usize runStateFloats cfg
+  let rs_bytes usize * rs_floats 4
+  let rsregion Maybe<MutSpan<u8>> std.mem.allocBytes alloc rs_bytes
+  if == rsregion.has false
+    ret
+  let rs_base MutSpan<u8> rsregion.value
+  let state RunState mallocRunState rs_base cfg
+
+  forward cfg weights state 0 0
+  forward cfg weights state 1 1
+
+  let vocab usize (cfg.vocab_size as usize)
+  let logits MutSpan<f32> view rs_base state.logits_off vocab
+  let l0 f32 logits[0]
+  let l1 f32 logits[1]
+  let l2 f32 logits[2]
+
+  # reference (libm C): -0.104507, 1.747386, -0.142307
+  let ok0 Bool (&& (> l0 (- 0.0 0.1055)) (< l0 (- 0.0 0.1035)))
+  let ok1 Bool (&& (> l1 1.7464) (< l1 1.7484))
+  let ok2 Bool (&& (> l2 (- 0.0 0.1433)) (< l2 (- 0.0 0.1413)))
+  if && ok0 (&& ok1 ok2)
+    check world.out.write "transformer forward ok\n"
+  ret

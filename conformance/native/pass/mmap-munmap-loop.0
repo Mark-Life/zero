@@ -1,0 +1,19 @@
+pub fn main Void world World !
+  let fs std.fs.host()
+  let one f32 1.0
+  let three f32 3.0
+  mut ok i32 0
+  mut i i32 0
+  while < i 1000
+    mut mapped Maybe<owned<Mapping>> std.fs.mmap fs ".zero/conformance/mmap-f32le.bin"
+    if mapped.has
+      mut m owned<Mapping> mapped.value
+      let bytes Span<u8> std.fs.mappingBytes (&m)
+      let v0 f32 (std.codec.readF32Le bytes 0)
+      let v2 f32 (std.codec.readF32Le bytes 8)
+      if && (&& (== (std.mem.len bytes) 12) (== v0 one)) (== v2 three)
+        set ok (+ ok 1)
+      std.fs.munmap (&mut m)
+    set i (+ i 1)
+  if == ok 1000
+    check world.out.write "mmap munmap loop ok\n"

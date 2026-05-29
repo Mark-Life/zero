@@ -1,0 +1,26 @@
+pub fn main Void world World !
+  mut heap PageAlloc std.mem.pageAlloc()
+  let region std.mem.allocBytes heap 256
+  if region.has
+    let buf MutSpan<u8> region.value
+    mut i usize 0
+    while < i 256
+      let v usize (% (+ (* i 7_usize) 3_usize) 256_usize)
+      set buf[i] (v as u8)
+      set i (+ i 1)
+    mut ok Bool true
+    mut j usize 0
+    while < j 256
+      let got u8 buf[j]
+      let want u8 ((% (+ (* j 7_usize) 3_usize) 256_usize) as u8)
+      if == got want
+        set ok ok
+      else
+        set ok false
+      set j (+ j 1)
+    let a u8 buf[0]
+    let b u8 buf[255]
+    let three u8 3_u8
+    let last u8 ((% (+ (* 255_usize 7_usize) 3_usize) 256_usize) as u8)
+    if && ok (&& (== (std.mem.len buf) 256) (&& (== a three) (== b last)))
+      check world.out.write "mem mut span u8 store ok\n"

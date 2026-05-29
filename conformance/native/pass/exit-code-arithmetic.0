@@ -1,0 +1,22 @@
+# A hand-written program produces a correct process exit code from computed
+# integer state, not just stdout. `export c fn main` is the freestanding entry:
+# the direct backends wire its `i32` return into the platform's program-exit
+# path (Mach-O `LC_MAIN`, ELF `_start`), so the value returned here becomes the
+# process status the shell observes in `$?`.
+#
+# The result is computed (arithmetic + a helper call + a branch) rather than a
+# bare literal, so a backend that mishandled register returns, call ABI, or
+# comparison branches would yield the wrong status. classify(7 * 6) =
+# classify(42): 42 is greater than 40 but not greater than 60, so the program
+# exits with status 42.
+
+fn classify i32 value i32
+  if > value 60
+    ret - value 60
+  if > value 40
+    ret value
+  ret 0
+
+export c fn main i32
+  let total i32 (* 7 6)
+  ret classify total

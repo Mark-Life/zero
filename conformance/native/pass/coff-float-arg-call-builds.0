@@ -1,0 +1,35 @@
+# Win64/COFF float arguments crossing a call boundary. Build-only (COFF is not executed on
+# CI hosts): proves the call-marshaling emitters route float args into the xmm bank at the
+# unified Win64 slot (xmm0↔rcx, xmm1↔rdx, …) instead of pushing garbage through a GPR.
+# Covers both the scalar-returning call path and the record-returning (sret) call path, plus
+# a mixed int/float ordering so the unified slot index is exercised, not just slot 0.
+
+type Pair
+  lo f32
+  hi f32
+
+fn addf f32 a f32 b f32
+  ret + a b
+
+# Mixed banks: i→rcx, x→xmm1, j→r8, y→xmm3 under Win64's shared slot numbering.
+fn mix f32 i i32 x f32 j i32 y f32
+  let s f32 (+ x y)
+  let n i32 (+ i j)
+  ret + s (n as f32)
+
+# Record-returning call carrying float args (sret pointer consumes slot 0 = rcx/xmm0).
+fn mkPair Pair a f32 b f32
+  let p Pair . lo a hi b
+  ret p
+
+export c fn main u8
+  let a f32 1.5
+  let b f32 2.5
+  let sum f32 addf a b
+  let blend f32 mix 3 a 4 b
+  let p Pair mkPair a b
+  if == sum 4.0
+    if > blend 0.0
+      if == p.lo 1.5
+        ret 1_u8
+  ret 0_u8

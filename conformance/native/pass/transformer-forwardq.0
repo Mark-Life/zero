@@ -1,0 +1,838 @@
+# llama2 int8 quantized forward pass — end-to-end runtime smoke.
+#
+# Self-contained sibling of transformer-forward.0 proving `forwardQ` runs to
+# completion at runtime over a complete, hand-authored "version 2" (runq.c) int8
+# checkpoint. Mirrors examples/llama2 (the checkpoint + ops shapes, the f32
+# kernels, the three int8 kernels, the v2 loaders, the quantized run state, and
+# `forwardQ`), shrunk to dim=4 / hidden=8 / 2 layers / 2 heads / 2 kv_heads /
+# vocab=4 / seq_len=8 / GS=2 (unshared classifier).
+#
+# Numeric parity vs a runq.c reference is a separate, heavier check; this is a
+# smoke. It runs two decoder steps (token 2 at pos 0, then token 1 at pos 1 —
+# exercising the KV cache across positions) and asserts the resulting logits are
+# (1) all finite, (2) nonzero in aggregate, and (3) deterministic — a fresh run
+# state fed the same (token, pos) yields identical logits. Needs libm (the
+# kernels call sqrtf/expf/cosf/sinf/powf/floorf/absf).
+
+# ---- shapes (ports of examples/llama2/src/checkpoint.0 + ops.0 + transformer.0) ----
+
+# Hyperparameters from the v2 header.
+type Config
+  dim i32
+  hidden_dim i32
+  n_layers i32
+  n_heads i32
+  n_kv_heads i32
+  vocab_size i32
+  seq_len i32
+  shared_weights Bool
+
+# One matrix's int8 quants (as a signed-byte span) plus the f32 group scales.
+type QWeight
+  q Span<i8>
+  s Span<f32>
+
+# Zero-copy description of a mapped v2 weight section: the f32 rmsnorm views plus
+# each quantized group's byte base (per-layer slicing recomputes the block stride
+# from the config + gs).
+type QuantizedWeights
+  bytes Span<u8>
+  gs usize
+  rms_att Span<f32>
+  rms_ffn Span<f32>
+  rms_final Span<f32>
+  qTokensBase usize
+  wqBase usize
+  wkBase usize
+  wvBase usize
+  woBase usize
+  w1Base usize
+  w2Base usize
+  w3Base usize
+  wclsBase usize
+
+# Quantized-activation scratch: signed int8 quants plus f32 group scales. Mirrors
+# runq.c's QuantizedTensor for the activation side.
+type QActs
+  q MutSpan<i8>
+  s MutSpan<f32>
+
+# Forward-pass activations + KV cache + quantized-activation scratch, as 4-byte
+# element offsets into one zeroed byte region. The four `*q*` offsets address
+# the quantized-activation scratch (int8 quants + f32 scales) for the dim-width
+# and hidden-width activations.
+type RunState
+  base MutSpan<u8>
+  x_off usize
+  xb_off usize
+  xb2_off usize
+  hb_off usize
+  hb2_off usize
+  q_off usize
+  att_off usize
+  logits_off usize
+  key_off usize
+  value_off usize
+  xq_off usize
+  xqs_off usize
+  hq_off usize
+  hqs_off usize
+
+# ---- f32 kernels (ports of examples/llama2/src/ops.0) ----
+
+fn rmsnorm Void output MutSpan<f32> input Span<f32> weights Span<f32> eps f32
+  let n usize std.mem.len input
+  mut ss f32 0.0
+  mut i usize 0
+  while < i n
+    let v f32 input[i]
+    set ss + ss (* v v)
+    set i + i 1
+  let nf f32 ((n as i32) as f32)
+  set ss / ss nf
+  set ss + ss eps
+  let inv f32 / 1.0 (std.math.sqrtf ss)
+  mut j usize 0
+  while < j n
+    set output[j] (* weights[j] (* inv input[j]))
+    set j + j 1
+
+fn softmax Void x MutSpan<f32>
+  let n usize std.mem.len x
+  mut maxv f32 x[0]
+  mut i usize 1
+  while < i n
+    if > x[i] maxv
+      set maxv x[i]
+    set i + i 1
+  mut sum f32 0.0
+  mut j usize 0
+  while < j n
+    let e f32 std.math.expf (- x[j] maxv)
+    set x[j] e
+    set sum + sum e
+    set j + j 1
+  mut k usize 0
+  while < k n
+    set x[k] / x[k] sum
+    set k + k 1
+
+fn rope Void vec MutSpan<f32> pos i32 head_size usize
+  let n usize std.mem.len vec
+  let posf f32 (pos as f32)
+  let hsf f32 ((head_size as i32) as f32)
+  let base f32 10000.0
+  mut i usize 0
+  while < i n
+    let head_dim usize % i head_size
+    let hd f32 ((head_dim as i32) as f32)
+    let exponent f32 / hd hsf
+    let denom f32 std.math.powf base exponent
+    let freq f32 / 1.0 denom
+    let val f32 * posf freq
+    let fcr f32 std.math.cosf val
+    let fci f32 std.math.sinf val
+    let i1 usize + i 1
+    let v0 f32 vec[i]
+    let v1 f32 vec[i1]
+    set vec[i] (- (* v0 fcr) (* v1 fci))
+    set vec[i1] (+ (* v0 fci) (* v1 fcr))
+    set i + i 2
+
+fn swiglu Void hb MutSpan<f32> hb2 Span<f32>
+  let n usize std.mem.len hb
+  mut i usize 0
+  while < i n
+    let v f32 hb[i]
+    let negv f32 - 0.0 v
+    let e f32 std.math.expf negv
+    let denom f32 + 1.0 e
+    let sig f32 / 1.0 denom
+    let silu f32 * v sig
+    let g f32 hb2[i]
+    set hb[i] (* silu g)
+    set i + i 1
+
+# ---- int8 kernels (ports of examples/llama2/src/ops.0) ----
+
+# Round half away from zero, matching C round() — used by the activation
+# quantizer because std.math has no roundf.
+fn roundHA i32 v f32
+  let half f32 0.5
+  let zero f32 0.0
+  if >= v zero
+    let r f32 std.math.floorf (+ v half)
+    ret (r as i32)
+  let neg f32 - zero v
+  let r2 f32 std.math.floorf (+ neg half)
+  let ri i32 (r2 as i32)
+  ret - 0 ri
+
+# Quantized matmul: W (d, n) @ x (n,) -> out (d,), with both operands int8 and a
+# shared group size gs. Per-group accumulate-then-rescale; the left-to-right
+# float multiply order ((ival * w_scale) * x_scale) and resetting the integer
+# accumulator each group are load-bearing for parity with runq.c.
+fn matmulQ Void out MutSpan<f32> x QActs w QWeight gs usize
+  let xq MutSpan<i8> x.q
+  let xs MutSpan<f32> x.s
+  let wq Span<i8> w.q
+  let ws Span<f32> w.s
+  let d usize std.mem.len out
+  let n usize std.mem.len xq
+  mut i usize 0
+  while < i d
+    let row usize * i n
+    mut val f32 0.0
+    mut j usize 0
+    while < j n
+      mut ival i32 0
+      mut k usize 0
+      while < k gs
+        let idx usize + row (+ j k)
+        let jk usize + j k
+        let xqv i32 (xq[jk] as i32)
+        let wqv i32 (wq[idx] as i32)
+        set ival + ival (* xqv wqv)
+        set k + k 1
+      let rowj usize + row j
+      let wsi usize / rowj gs
+      let xsi usize / j gs
+      let wscale f32 ws[wsi]
+      let xscale f32 xs[xsi]
+      let ivalf f32 (ival as f32)
+      set val + val (* (* ivalf wscale) xscale)
+      set j + j gs
+    set out[i] val
+    set i + i 1
+
+# Per-group symmetric activation quantizer (Q_MAX = 127), port of runq.c's
+# quantize. For each group the scale is max(|x|) / 127 over the group; each
+# value is quantized to round(x / scale) (round half away from zero — see
+# roundHA). No clamp (|x / scale| <= 127 by construction). gs must divide n.
+fn quantizeActs Void dst QActs x Span<f32> gs usize
+  let dq MutSpan<i8> dst.q
+  let ds MutSpan<f32> dst.s
+  let n usize std.mem.len x
+  let q_max f32 127.0
+  let num_groups usize / n gs
+  mut g usize 0
+  while < g num_groups
+    let gbase usize * g gs
+    mut wmax f32 0.0
+    mut i usize 0
+    while < i gs
+      let xi usize + gbase i
+      let xv f32 x[xi]
+      let v f32 std.math.absf xv
+      if > v wmax
+        set wmax v
+      set i + i 1
+    let scale f32 / wmax q_max
+    set ds[g] scale
+    mut j usize 0
+    while < j gs
+      let xj usize + gbase j
+      let q f32 / x[xj] scale
+      let qi i32 roundHA q
+      set dq[xj] (qi as i8)
+      set j + j 1
+    set g + g 1
+
+# Dequantize a single weight row: out[i] = w.q[row*n + i] * w.s[(row*n + i) / gs]
+# for i in 0..n. Used as the token-embedding gather (runq.c dequantizes the whole
+# vocab*dim token table to f32 at load, but the only row needed per step is the
+# embedded token's). gs must divide n.
+fn dequantRow Void out MutSpan<f32> w QWeight row usize n usize gs usize
+  let wq Span<i8> w.q
+  let ws Span<f32> w.s
+  let base usize * row n
+  mut i usize 0
+  while < i n
+    let idx usize + base i
+    let qv i32 (wq[idx] as i32)
+    let qf f32 (qv as f32)
+    let si usize / idx gs
+    let scale f32 ws[si]
+    set out[i] (* qf scale)
+    set i + i 1
+
+# ---- v2 loaders (ports of examples/llama2/src/checkpoint.0) ----
+
+# Read the seven hyperparameters and the explicit shared-classifier byte.
+fn readConfigV2 Config bytes Span<u8>
+  let dim i32 std.codec.readI32Le bytes 8
+  let hidden_dim i32 std.codec.readI32Le bytes 12
+  let n_layers i32 std.codec.readI32Le bytes 16
+  let n_heads i32 std.codec.readI32Le bytes 20
+  let n_kv_heads i32 std.codec.readI32Le bytes 24
+  let vocab i32 std.codec.readI32Le bytes 28
+  let seq_len i32 std.codec.readI32Le bytes 32
+
+  let shared_byte u8 bytes[36]
+  mut shared Bool false
+  if == shared_byte 1
+    set shared true
+
+  let cfg Config . dim dim hidden_dim hidden_dim n_layers n_layers n_heads n_heads n_kv_heads n_kv_heads vocab_size vocab seq_len seq_len shared_weights shared
+  ret cfg
+
+# The quantization group size (GS), from the header i32 at offset 37.
+fn groupSize usize bytes Span<u8>
+  let gs i32 std.codec.readI32Le bytes 37
+  ret (gs as usize)
+
+# Per-layer block size in bytes for a group of `se`-element tensors.
+fn qBlockBytes usize se usize gs usize
+  ret + se (* (/ se gs) 4)
+
+# Build the weight description: slice the three f32 rmsnorm groups from byte 256,
+# then record each quantized group's byte base and advance past its layers.
+fn mapWeightsQ QuantizedWeights bytes Span<u8> cfg Config gs usize
+  let dim usize (cfg.dim as usize)
+  let hidden usize (cfg.hidden_dim as usize)
+  let n_layers usize (cfg.n_layers as usize)
+  let n_heads usize (cfg.n_heads as usize)
+  let n_kv_heads usize (cfg.n_kv_heads as usize)
+  let vocab usize (cfg.vocab_size as usize)
+  let kv_dim usize / (* dim n_kv_heads) n_heads
+
+  let rms_count usize * n_layers dim
+  let att_start usize 256
+  let att_end usize + att_start (* rms_count 4)
+  let ffn_start usize att_end
+  let ffn_end usize + ffn_start (* rms_count 4)
+  let final_start usize ffn_end
+  let final_end usize + final_start (* dim 4)
+  let rms_att Span<f32> std.mem.bytesAsF32 bytes[att_start..att_end]
+  let rms_ffn Span<f32> std.mem.bytesAsF32 bytes[ffn_start..ffn_end]
+  let rms_final Span<f32> std.mem.bytesAsF32 bytes[final_start..final_end]
+
+  let q_tokens_se usize * vocab dim
+  let wq_se usize * dim dim
+  let wkv_se usize * dim kv_dim
+  let wo_se usize * dim dim
+  let w13_se usize * dim hidden
+  let w2_se usize * hidden dim
+
+  mut off usize final_end
+
+  let q_tokens_base usize off
+  set off + off (qBlockBytes q_tokens_se gs)
+  let wq_base usize off
+  set off + off (* n_layers (qBlockBytes wq_se gs))
+  let wk_base usize off
+  set off + off (* n_layers (qBlockBytes wkv_se gs))
+  let wv_base usize off
+  set off + off (* n_layers (qBlockBytes wkv_se gs))
+  let wo_base usize off
+  set off + off (* n_layers (qBlockBytes wo_se gs))
+  let w1_base usize off
+  set off + off (* n_layers (qBlockBytes w13_se gs))
+  let w2_base usize off
+  set off + off (* n_layers (qBlockBytes w2_se gs))
+  let w3_base usize off
+  set off + off (* n_layers (qBlockBytes w13_se gs))
+
+  mut wcls_base usize off
+  if cfg.shared_weights
+    set wcls_base q_tokens_base
+
+  let qw QuantizedWeights . bytes bytes gs gs rms_att rms_att rms_ffn rms_ffn rms_final rms_final qTokensBase q_tokens_base wqBase wq_base wkBase wk_base wvBase wv_base woBase wo_base w1Base w1_base w2Base w2_base w3Base w3_base wclsBase wcls_base
+  ret qw
+
+# ---- quantized run state + forwardQ (ports of examples/llama2/src/transformer.0) ----
+
+# Per-position key/value width: dim * n_kv_heads / n_heads.
+fn kvDim usize cfg Config
+  let dim usize (cfg.dim as usize)
+  let n_heads usize (cfg.n_heads as usize)
+  let n_kv_heads usize (cfg.n_kv_heads as usize)
+  ret / (* dim n_kv_heads) n_heads
+
+# Total 4-byte elements the f32 part of RunState needs.
+fn runStateFloats usize cfg Config
+  let dim usize (cfg.dim as usize)
+  let hidden usize (cfg.hidden_dim as usize)
+  let n_layers usize (cfg.n_layers as usize)
+  let n_heads usize (cfg.n_heads as usize)
+  let vocab usize (cfg.vocab_size as usize)
+  let seq_len usize (cfg.seq_len as usize)
+  let kv_dim usize kvDim cfg
+  let cache usize * (* n_layers seq_len) kv_dim
+  mut total usize 0
+  set total + total dim
+  set total + total dim
+  set total + total dim
+  set total + total hidden
+  set total + total hidden
+  set total + total dim
+  set total + total (* n_heads seq_len)
+  set total + total vocab
+  set total + total cache
+  set total + total cache
+  ret total
+
+# Total 4-byte elements the quantized RunState needs. Adds the quantized-
+# activation scratch: dim int8 quants (rounded up to whole 4-byte slots so the
+# scale buffer stays aligned) + dim/gs f32 scales for the dim-width activation,
+# and hidden + hidden/gs for the hidden-width activation.
+fn runStateFloatsQ usize cfg Config gs usize
+  let dim usize (cfg.dim as usize)
+  let hidden usize (cfg.hidden_dim as usize)
+  mut total usize runStateFloats cfg
+  set total + total (/ (+ dim 3) 4)
+  set total + total (/ dim gs)
+  set total + total (/ (+ hidden 3) 4)
+  set total + total (/ hidden gs)
+  ret total
+
+# Lay the quantized RunState out over an already-allocated, zeroed region.
+fn mallocRunStateQ RunState base MutSpan<u8> cfg Config gs usize
+  let dim usize (cfg.dim as usize)
+  let hidden usize (cfg.hidden_dim as usize)
+  let n_layers usize (cfg.n_layers as usize)
+  let n_heads usize (cfg.n_heads as usize)
+  let vocab usize (cfg.vocab_size as usize)
+  let seq_len usize (cfg.seq_len as usize)
+  let kv_dim usize kvDim cfg
+  let cache usize * (* n_layers seq_len) kv_dim
+
+  mut off usize 0
+  let x_off usize off
+  set off + off dim
+  let xb_off usize off
+  set off + off dim
+  let xb2_off usize off
+  set off + off dim
+  let hb_off usize off
+  set off + off hidden
+  let hb2_off usize off
+  set off + off hidden
+  let q_off usize off
+  set off + off dim
+  let att_off usize off
+  set off + off (* n_heads seq_len)
+  let logits_off usize off
+  set off + off vocab
+  let key_off usize off
+  set off + off cache
+  let value_off usize off
+  set off + off cache
+  let xq_off usize off
+  set off + off (/ (+ dim 3) 4)
+  let xqs_off usize off
+  set off + off (/ dim gs)
+  let hq_off usize off
+  set off + off (/ (+ hidden 3) 4)
+  let hqs_off usize off
+  set off + off (/ hidden gs)
+
+  let s RunState . base base x_off x_off xb_off xb_off xb2_off xb2_off hb_off hb_off hb2_off hb2_off q_off q_off att_off att_off logits_off logits_off key_off key_off value_off value_off xq_off xq_off xqs_off xqs_off hq_off hq_off hqs_off hqs_off
+  ret s
+
+# f32-element [off, off+count) of the region, as a writable view.
+fn view MutSpan<f32> base MutSpan<u8> off usize count usize
+  let start usize * off 4
+  let end usize + start (* count 4)
+  ret std.mem.bytesAsMutF32 base[start..end]
+
+# `count` signed bytes at [off*4, off*4 + count) of the region, as a writable
+# view — used for the quantized-activation quant buffers, which hold one int8
+# per quant. `off` is in 4-byte slot units; the span length is `count` bytes.
+fn viewI8 MutSpan<i8> base MutSpan<u8> off usize count usize
+  let start usize * off 4
+  let end usize + start count
+  ret std.mem.bytesAsMutI8 base[start..end]
+
+# The logits view (vocab_size f32) after a forward pass.
+fn logitsOf MutSpan<f32> s RunState cfg Config
+  let base MutSpan<u8> s.base
+  let vocab usize (cfg.vocab_size as usize)
+  ret view base s.logits_off vocab
+
+# Slice one layer's int8 weights out of a quantized group into a QWeight.
+fn layerQWeight QWeight qw QuantizedWeights base usize se usize l usize
+  let bytes Span<u8> qw.bytes
+  let gs usize qw.gs
+  let n_scales usize / se gs
+  let block usize + se (* n_scales 4)
+  let qstart usize + base (* l block)
+  let qend usize + qstart se
+  let sstart usize qend
+  let send usize + sstart (* n_scales 4)
+  let qbytes Span<u8> bytes[qstart..qend]
+  let sbytes Span<u8> bytes[sstart..send]
+  let qi8 Span<i8> std.mem.bytesAsI8 qbytes
+  let sf32 Span<f32> std.mem.bytesAsF32 sbytes
+  let w QWeight . q qi8 s sf32
+  ret w
+
+# int8 quantized forward — mirror of forward with quantize-then-matmulQ at each
+# matmul site; everything else is f32 and identical to the f32 forward.
+fn forwardQ Void cfg Config qw QuantizedWeights s RunState token i32 pos i32
+  let dim usize (cfg.dim as usize)
+  let hidden usize (cfg.hidden_dim as usize)
+  let n_layers usize (cfg.n_layers as usize)
+  let n_heads usize (cfg.n_heads as usize)
+  let n_kv_heads usize (cfg.n_kv_heads as usize)
+  let vocab usize (cfg.vocab_size as usize)
+  let seq_len usize (cfg.seq_len as usize)
+  let kv_dim usize kvDim cfg
+  let kv_mul usize / n_heads n_kv_heads
+  let head_size usize / dim n_heads
+  let eps f32 0.00001
+  let posu usize (pos as usize)
+  let cache usize * (* n_layers seq_len) kv_dim
+
+  let gs usize qw.gs
+  let base MutSpan<u8> s.base
+
+  let q_tokens_se usize * vocab dim
+  let wq_se usize * dim dim
+  let wkv_se usize * dim kv_dim
+  let wo_se usize * dim dim
+  let w13_se usize * dim hidden
+  let w2_se usize * hidden dim
+  let wcls_se usize * dim vocab
+
+  let rms_att Span<f32> qw.rms_att
+  let rms_ffn Span<f32> qw.rms_ffn
+  let rms_final Span<f32> qw.rms_final
+
+  let xq_q MutSpan<i8> viewI8 base s.xq_off dim
+  let xq_s MutSpan<f32> view base s.xqs_off (/ dim gs)
+  let xq QActs . q xq_q s xq_s
+  let hq_q MutSpan<i8> viewI8 base s.hq_off hidden
+  let hq_s MutSpan<f32> view base s.hqs_off (/ hidden gs)
+  let hq QActs . q hq_q s hq_s
+
+  let x MutSpan<f32> view base s.x_off dim
+  let tokW QWeight layerQWeight qw qw.qTokensBase q_tokens_se 0
+  dequantRow x tokW (token as usize) dim gs
+
+  let sqrt_hs f32 std.math.sqrtf ((head_size as i32) as f32)
+
+  mut l usize 0
+  while < l n_layers
+    let loff usize * (* l seq_len) kv_dim
+
+    let xb MutSpan<f32> view base s.xb_off dim
+    let xb2 MutSpan<f32> view base s.xb2_off dim
+    let q MutSpan<f32> view base s.q_off dim
+    let hb MutSpan<f32> view base s.hb_off hidden
+    let hb2 MutSpan<f32> view base s.hb2_off hidden
+    let att MutSpan<f32> view base s.att_off (* n_heads seq_len)
+    let kc MutSpan<f32> view base s.key_off cache
+    let vc MutSpan<f32> view base s.value_off cache
+    let k_off usize + (+ s.key_off loff) (* posu kv_dim)
+    let v_off usize + (+ s.value_off loff) (* posu kv_dim)
+    let k MutSpan<f32> view base k_off kv_dim
+    let v MutSpan<f32> view base v_off kv_dim
+
+    let ra_lo usize * l dim
+    let ra_hi usize + ra_lo dim
+    let ra Span<f32> rms_att[ra_lo..ra_hi]
+    rmsnorm xb x ra eps
+
+    quantizeActs xq xb gs
+    let wqL QWeight layerQWeight qw qw.wqBase wq_se l
+    matmulQ q xq wqL gs
+
+    let wkL QWeight layerQWeight qw qw.wkBase wkv_se l
+    matmulQ k xq wkL gs
+
+    let wvL QWeight layerQWeight qw qw.wvBase wkv_se l
+    matmulQ v xq wvL gs
+
+    rope q pos head_size
+    rope k pos head_size
+
+    mut h usize 0
+    while < h n_heads
+      let qoff usize * h head_size
+      let aoff usize * h seq_len
+      let kvh usize * (/ h kv_mul) head_size
+
+      mut t usize 0
+      while <= t posu
+        let kbase usize + (+ loff (* t kv_dim)) kvh
+        mut score f32 0.0
+        mut i usize 0
+        while < i head_size
+          let qi usize + qoff i
+          let ki usize + kbase i
+          set score + score (* q[qi] kc[ki])
+          set i + i 1
+        set score / score sqrt_hs
+        set att[+ aoff t] score
+        set t + t 1
+
+      let sm_lo usize aoff
+      let sm_hi usize + (+ aoff posu) 1
+      let att_h MutSpan<f32> att[sm_lo..sm_hi]
+      softmax att_h
+
+      mut z usize 0
+      while < z head_size
+        set xb[+ qoff z] 0.0
+        set z + z 1
+      mut t2 usize 0
+      while <= t2 posu
+        let vbase usize + (+ loff (* t2 kv_dim)) kvh
+        let a f32 att[+ aoff t2]
+        mut i2 usize 0
+        while < i2 head_size
+          let xi usize + qoff i2
+          let vi usize + vbase i2
+          set xb[xi] + xb[xi] (* a vc[vi])
+          set i2 + i2 1
+        set t2 + t2 1
+      set h + h 1
+
+    quantizeActs xq xb gs
+    let woL QWeight layerQWeight qw qw.woBase wo_se l
+    matmulQ xb2 xq woL gs
+    mut r1 usize 0
+    while < r1 dim
+      set x[r1] + x[r1] xb2[r1]
+      set r1 + r1 1
+
+    let rf_lo usize * l dim
+    let rf_hi usize + rf_lo dim
+    let rf Span<f32> rms_ffn[rf_lo..rf_hi]
+    rmsnorm xb x rf eps
+
+    quantizeActs xq xb gs
+    let w1L QWeight layerQWeight qw qw.w1Base w13_se l
+    matmulQ hb xq w1L gs
+    let w3L QWeight layerQWeight qw qw.w3Base w13_se l
+    matmulQ hb2 xq w3L gs
+    swiglu hb hb2
+    quantizeActs hq hb gs
+    let w2L QWeight layerQWeight qw qw.w2Base w2_se l
+    matmulQ xb hq w2L gs
+
+    mut r2 usize 0
+    while < r2 dim
+      set x[r2] + x[r2] xb[r2]
+      set r2 + r2 1
+
+    set l + l 1
+
+  rmsnorm x x rms_final eps
+  let logits MutSpan<f32> view base s.logits_off vocab
+  quantizeActs xq x gs
+  let wclsL QWeight layerQWeight qw qw.wclsBase wcls_se 0
+  matmulQ logits xq wclsL gs
+
+# ---- hand-authored tiny v2 model ----
+
+# Deterministic nonzero int8 quant byte (signed value cycles through -3..3 so no
+# group degenerates to all-zero and the per-group scale is well-defined).
+fn quantByte u8 i usize
+  let m usize % i 7
+  let mi i32 (m as i32)
+  let sv i32 - mi 3
+  let uv i32 + sv (* 256 (/ sv 128))
+  ret (uv as u8)
+
+# Deterministic positive nonzero scale in [0.02, 0.09].
+fn scaleVal f32 i usize
+  let m usize % i 8
+  let mf f32 ((m as i32) as f32)
+  let bias f32 0.02
+  let step f32 0.01
+  ret + bias (* mf step)
+
+# Deterministic rmsnorm weight near 1.0 (so rmsnorm neither zeroes nor explodes).
+fn rmsVal f32 i usize
+  let m usize % i 3
+  let mf f32 ((m as i32) as f32)
+  let one f32 1.0
+  let step f32 0.05
+  ret + one (* mf step)
+
+# Fill `count` quant bytes from byte offset `off` with quantByte.
+fn fillQuants Void buf MutSpan<u8> off usize count usize
+  mut i usize 0
+  while < i count
+    set buf[(+ off i)] (quantByte i)
+    set i + i 1
+
+# Fill `count` f32 scales starting at byte offset `boff` with scaleVal.
+fn fillScales Void buf MutSpan<u8> boff usize count usize
+  let bend usize + boff (* count 4)
+  let view32 MutSpan<f32> std.mem.bytesAsMutF32 buf[boff..bend]
+  mut i usize 0
+  while < i count
+    set view32[i] (scaleVal i)
+    set i + i 1
+
+# Fill one quantized group (count layers, se elements each) at byte base `base`.
+fn fillGroup Void buf MutSpan<u8> base usize se usize gs usize layers usize
+  let n_scales usize / se gs
+  let block usize + se (* n_scales 4)
+  mut l usize 0
+  while < l layers
+    let qoff usize + base (* l block)
+    fillQuants buf qoff se
+    let soff usize + qoff se
+    fillScales buf soff n_scales
+    set l + l 1
+
+# Fill `count` f32 rmsnorm weights starting at byte offset `boff` with rmsVal.
+fn fillRms Void buf MutSpan<u8> boff usize count usize
+  let bend usize + boff (* count 4)
+  let view32 MutSpan<f32> std.mem.bytesAsMutF32 buf[boff..bend]
+  mut i usize 0
+  while < i count
+    set view32[i] (rmsVal i)
+    set i + i 1
+
+# Compare two logit spans for exact equality (determinism check).
+fn sameLogits Bool a Span<f32> b Span<f32> n usize
+  mut ok Bool true
+  mut i usize 0
+  while < i n
+    if != a[i] b[i]
+      set ok false
+    set i + i 1
+  ret ok
+
+pub fn main Void world World !
+  # Tiny v2 config: dim=4, hidden=8, 2 layers, 2 heads, 2 kv_heads, vocab=4,
+  # seq_len=8, GS=2, unshared. kv_dim = 4, head_size = 2; total file = 1392 bytes.
+  let dim usize 4
+  let hidden usize 8
+  let n_layers usize 2
+  let vocab usize 4
+  let gs usize 2
+  let file_bytes usize 1392
+
+  let alloc PageAlloc std.mem.pageAlloc()
+  let region Maybe<MutSpan<u8>> std.mem.allocBytes alloc file_bytes
+  if == region.has false
+    ret
+  let buf MutSpan<u8> region.value
+
+  # Header: nine 4-byte-aligned i32 slots (bytes 0..36) — magic, version, dim,
+  # hidden, layers, heads, kv_heads, vocab, seq_len — then the shared byte (36)
+  # and the group_size i32 at unaligned byte 37 (GS=2 fits in the low byte).
+  let hdr MutSpan<i32> std.mem.bytesAsMutI32 buf[0..36]
+  set hdr[0] 0x616b3432
+  set hdr[1] 2
+  set hdr[2] 4
+  set hdr[3] 8
+  set hdr[4] 2
+  set hdr[5] 2
+  set hdr[6] 2
+  set hdr[7] 4
+  set hdr[8] 8
+  set buf[36] 0
+  set buf[37] 2
+  set buf[38] 0
+  set buf[39] 0
+  set buf[40] 0
+
+  # f32 rmsnorm groups from byte 256: rms_att (n_layers*dim=8), rms_ffn (8),
+  # rms_final (dim=4).
+  let rms_count usize * n_layers dim
+  let att_boff usize 256
+  fillRms buf att_boff rms_count
+  let ffn_boff usize + att_boff (* rms_count 4)
+  fillRms buf ffn_boff rms_count
+  let final_boff usize + ffn_boff (* rms_count 4)
+  fillRms buf final_boff dim
+
+  # Quantized groups, walked in format order from right after the rmsnorm block.
+  let kv_dim usize 4
+  let q_tokens_se usize * vocab dim
+  let wq_se usize * dim dim
+  let wkv_se usize * dim kv_dim
+  let wo_se usize * dim dim
+  let w13_se usize * dim hidden
+  let w2_se usize * hidden dim
+
+  mut off usize + final_boff (* dim 4)
+  fillGroup buf off q_tokens_se gs 1
+  set off + off (qBlockBytes q_tokens_se gs)
+  fillGroup buf off wq_se gs n_layers
+  set off + off (* n_layers (qBlockBytes wq_se gs))
+  fillGroup buf off wkv_se gs n_layers
+  set off + off (* n_layers (qBlockBytes wkv_se gs))
+  fillGroup buf off wkv_se gs n_layers
+  set off + off (* n_layers (qBlockBytes wkv_se gs))
+  fillGroup buf off wo_se gs n_layers
+  set off + off (* n_layers (qBlockBytes wo_se gs))
+  fillGroup buf off w13_se gs n_layers
+  set off + off (* n_layers (qBlockBytes w13_se gs))
+  fillGroup buf off w2_se gs n_layers
+  set off + off (* n_layers (qBlockBytes w2_se gs))
+  fillGroup buf off w13_se gs n_layers
+  set off + off (* n_layers (qBlockBytes w13_se gs))
+  # wcls (unshared): one tensor of se = dim*vocab.
+  let wcls_se usize * dim vocab
+  fillGroup buf off wcls_se gs 1
+
+  # Parse it back through the real loaders.
+  let bytes Span<u8> buf
+  let cfg Config readConfigV2 bytes
+  let gs_read usize groupSize bytes
+  let qw QuantizedWeights mapWeightsQ bytes cfg gs_read
+
+  # First run state: two decoder steps across positions to exercise the KV cache.
+  let rs_floats usize runStateFloatsQ cfg gs_read
+  let rs_byte_need usize * rs_floats 4
+  let rs_region Maybe<MutSpan<u8>> std.mem.allocBytes alloc rs_byte_need
+  if == rs_region.has false
+    ret
+  let rs_base MutSpan<u8> rs_region.value
+  let state RunState mallocRunStateQ rs_base cfg gs_read
+
+  forwardQ cfg qw state 2 0
+  forwardQ cfg qw state 1 1
+  let logits MutSpan<f32> logitsOf state cfg
+
+  # All logits finite (not NaN, within a large finite bound) and nonzero in
+  # aggregate (at least one differs from 0).
+  let bound f32 1000000.0
+  mut allFinite Bool true
+  mut anyNonzero Bool false
+  mut i usize 0
+  while < i vocab
+    let v f32 logits[i]
+    let isNan Bool std.math.isNaNf v
+    let negBound f32 - 0.0 bound
+    let tooBig Bool || (> v bound) (< v negBound)
+    if isNan
+      set allFinite false
+    if tooBig
+      set allFinite false
+    if != v 0.0
+      set anyNonzero true
+    set i + i 1
+
+  # Determinism: two fresh, zeroed run states fed the same first step (token 2 at
+  # pos 0) must produce identical logits.
+  let rs_region2 Maybe<MutSpan<u8>> std.mem.allocBytes alloc rs_byte_need
+  if == rs_region2.has false
+    ret
+  let rs_base2 MutSpan<u8> rs_region2.value
+  let state2 RunState mallocRunStateQ rs_base2 cfg gs_read
+  forwardQ cfg qw state2 2 0
+  let logits2 MutSpan<f32> logitsOf state2 cfg
+
+  let rs_region3 Maybe<MutSpan<u8>> std.mem.allocBytes alloc rs_byte_need
+  if == rs_region3.has false
+    ret
+  let rs_base3 MutSpan<u8> rs_region3.value
+  let state3 RunState mallocRunStateQ rs_base3 cfg gs_read
+  forwardQ cfg qw state3 2 0
+  let logits3 MutSpan<f32> logitsOf state3 cfg
+  let l2 Span<f32> logits2
+  let l3 Span<f32> logits3
+  let okDet Bool sameLogits l2 l3 vocab
+
+  if && allFinite (&& anyNonzero okDet)
+    check world.out.write "transformer forwardq ok\n"
+  ret

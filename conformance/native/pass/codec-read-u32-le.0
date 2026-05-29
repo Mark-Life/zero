@@ -1,0 +1,6 @@
+pub fn main Void world World !
+  let buf [4]u8 [255, 255, 255, 255]
+  let read u32 (std.codec.readU32Le buf 0)
+  let expected u32 4294967295_u32
+  if == read expected
+    check world.out.write "codec read u32 le ok\n"

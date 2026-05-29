@@ -1,0 +1,8 @@
+pub fn main Void world World !
+  let small f64 1.0
+  let big f64 2.0
+  let trueCase Bool (> big small)
+  let falseCase Bool (> small big)
+  let equalCase Bool (> small small)
+  if && (&& trueCase (== falseCase false)) (== equalCase false)
+    check world.out.write "float gt f64 ok\n"

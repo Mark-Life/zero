@@ -1,0 +1,6 @@
+pub fn main Void world World !
+  mut buf [8]u8 [0, 0, 0, 0, 0, 0, 248, 63]
+  let read f64 (std.codec.readF64Le buf 0)
+  let expected f64 1.5
+  if == read expected
+    check world.out.write "codec read f64 le ok\n"

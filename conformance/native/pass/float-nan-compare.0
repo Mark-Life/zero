@@ -1,0 +1,29 @@
+pub fn main Void world World !
+  let zero f32 0.0
+  let one f32 1.0
+  let nan f32 / zero zero
+  let isNaN Bool (std.math.isNaNf nan)
+  let nanGtFinite Bool (> nan one)
+  let nanGeFinite Bool (>= nan one)
+  let finiteGtNan Bool (> one nan)
+  let finiteGeNan Bool (>= one nan)
+  let nanEqNan Bool (== nan nan)
+  let nanEqFinite Bool (== nan one)
+  let finiteEqNan Bool (== one nan)
+  let nanNeNan Bool (!= nan nan)
+  let nanNeFinite Bool (!= nan one)
+  let finiteNeNan Bool (!= one nan)
+  let nanLtFinite Bool (< nan one)
+  let nanLeFinite Bool (<= nan one)
+  let finiteLtNan Bool (< one nan)
+  let finiteLeNan Bool (<= one nan)
+  let c0 Bool (&& (== nanGtFinite false) (== nanGeFinite false))
+  let c1 Bool (&& (== finiteGtNan false) (== finiteGeNan false))
+  let c2 Bool (&& (== nanEqNan false) (== nanEqFinite false))
+  let c3 Bool (&& (== finiteEqNan false) (== nanLtFinite false))
+  let c4 Bool (&& (== nanLeFinite false) (== finiteLtNan false))
+  let c5 Bool (== finiteLeNan false)
+  let cmpsFalse Bool (&& (&& (&& (&& (&& c0 c1) c2) c3) c4) c5)
+  let cmpsTrue Bool (&& (&& nanNeNan nanNeFinite) finiteNeNan)
+  if && (&& isNaN cmpsFalse) cmpsTrue
+    check world.out.write "float nan compare ok\n"

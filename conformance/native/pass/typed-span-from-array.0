@@ -1,0 +1,31 @@
+fn sum3 i32 values Span<i32>
+  ret (+ (+ values[0] values[1]) values[2])
+
+fn setLast Void values MutSpan<i32>
+  set values[3] 99
+
+fn pickAt u32 values Span<u32> index usize
+  ret values[index]
+
+pub fn main Void world World !
+  let ints [5]i32 [10, 20, 30, 40, 50]
+  let intSpan Span<i32> ints
+  let totalInts i32 sum3 intSpan
+  let intLen usize std.mem.len intSpan
+  let intMid Span<i32> ints[1..4]
+
+  mut writable [4]i32 [1, 2, 3, 4]
+  let writeSpan MutSpan<i32> writable
+  set writeSpan[1] 200
+  setLast writeSpan
+  let writeRo Span<i32> writeSpan
+
+  let uvals [3]u32 [7, 8, 9]
+  let uSpan Span<u32> uvals
+  let uPick u32 pickAt uSpan 2
+
+  let bytes [4]u8 [65, 66, 67, 68]
+  let byteSpan Span<u8> bytes
+
+  if && (&& (&& (&& (&& (&& (&& (&& (== totalInts 60) (== intLen 5)) (== intMid[0] 20)) (== intMid[2] 40)) (== writable[1] 200)) (== writable[3] 99)) (== writeRo[3] 99)) (== uPick 9)) (== byteSpan[1] 66)
+    check world.out.write "typed span from array ok\n"

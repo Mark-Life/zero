@@ -1,0 +1,8 @@
+pub fn main Void world World !
+  let a f64 1.5
+  let b f64 1.5
+  let c f64 2.5
+  let sameNe Bool (!= a b)
+  let diffNe Bool (!= a c)
+  if && (== sameNe false) diffNe
+    check world.out.write "float ne f64 ok\n"

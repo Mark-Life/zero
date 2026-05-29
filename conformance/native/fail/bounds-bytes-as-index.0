@@ -1,0 +1,5 @@
+pub fn main Void world World !
+  mut bytes [16]u8 [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  let ints MutSpan<i32> std.mem.bytesAsMutI32 bytes
+  if == ints[4] 0
+    check world.out.write "unreachable\n"

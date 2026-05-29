@@ -1,0 +1,6 @@
+pub fn main Void world World !
+  let a f64 1.25
+  let b f64 2.75
+  let r f64 (+ a b)
+  if == r 4.0
+    check world.out.write "float add f64 ok\n"

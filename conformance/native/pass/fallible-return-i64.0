@@ -1,0 +1,19 @@
+# A fallible i64 return: the function declares `i64` and raises; the caller
+# uses `check` + `rescue` to read the value (or fallback). Coverage gates the
+# i64 type through the fallible call/return machinery and the rescue value
+# slot. The success value fits in the lower 32 bits because the upstream
+# direct backends pack the ok/err tag in the high 32 bits of the value GPR.
+
+fn pickI64 i64 flag Bool ![Bad]
+  if flag
+    raise Bad
+  let v i64 12345
+  ret v
+
+pub fn main Void world World !
+  let ok i64 check (pickI64 false)
+  let fallback i64 rescue (pickI64 true) err 7
+  let expected i64 12345
+  let seven i64 7
+  if && (== ok expected) (== fallback seven)
+    check world.out.write "fallible i64 ok\n"

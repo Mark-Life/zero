@@ -1,0 +1,15 @@
+pub fn main Void world World !
+  let fs std.fs.host()
+  mut mapped Maybe<owned<Mapping>> std.fs.mmap fs ".zero/conformance/mmap-maybe-4gib-sparse.bin"
+  if == mapped.has false
+    check world.out.write "mmap maybe 4gib len skip\n"
+    ret
+  mut m owned<Mapping> mapped.value
+  let bytes Span<u8> std.fs.mappingBytes (&m)
+  let actual u64 ((std.mem.len bytes) as u64)
+  let expected u64 4294967301
+  if == actual expected
+    check world.out.write "mmap maybe 4gib len ok\n"
+  else
+    check world.out.write "mmap maybe 4gib len mismatch\n"
+  std.fs.munmap (&mut m)

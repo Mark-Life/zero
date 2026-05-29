@@ -1,0 +1,9 @@
+pub fn main Void world World !
+  let small f32 1.0
+  let same f32 1.0
+  let big f32 2.0
+  let lessThan Bool (<= small big)
+  let equal Bool (<= small same)
+  let greater Bool (<= big small)
+  if && (&& lessThan equal) (== greater false)
+    check world.out.write "float le f32 ok\n"

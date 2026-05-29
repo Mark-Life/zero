@@ -1,0 +1,11 @@
+pub fn main Void world World !
+  mut bytes [16]u8 [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  let region MutSpan<u8> bytes
+  let head MutSpan<i32> std.mem.bytesAsMutI32 region[0..8]
+  let tail MutSpan<i32> std.mem.bytesAsMutI32 region[8..16]
+  set head[0] 42
+  set head[1] 99
+  set tail[0] 7
+  let total i32 (+ (+ head[0] head[1]) tail[0])
+  if && (&& (== total 148) (== (std.mem.len head) 2)) (== (std.mem.len tail) 2)
+    check world.out.write "bytes as mut slice ok\n"

@@ -1,0 +1,17 @@
+export c fn main u8
+  let buf [16]u8 [1_u8, 0_u8, 0_u8, 0_u8, 2_u8, 1_u8, 0_u8, 0_u8, 0_u8, 0_u8, 128_u8, 64_u8, 255_u8, 255_u8, 255_u8, 255_u8]
+  let view Span<u8> std.mem.bytesAsU8 buf
+  let i_low i32 std.codec.readI32Le view 0
+  let i_mid i32 std.codec.readI32Le view 4
+  let u_lo u32 std.codec.readU32Le view 0
+  let u16 u16 std.codec.readU16Le view 4
+  let f_at_8 f32 std.codec.readF32Le view 8
+  let i64v i64 std.codec.readI64Le view 0
+  let u64v u64 std.codec.readU64Le view 0
+  let i_neg i32 std.codec.readI32Le view 12
+  if == i_low 1
+    if == i_mid 258
+      if == u_lo 1
+        if == u16 258_u16
+          ret 1_u8
+  ret 0_u8

@@ -1,0 +1,42 @@
+# Direct-backend by-value record return where a FLOAT field sits at a non-zero
+# offset. The `return <shape literal>` lowering stores each field through the
+# saved sret pointer; the float store must honor the field's byte offset rather
+# than always writing [sret + 0]. Two variants cover f32 and f64:
+#   - FloatBox: i32 tag (offset 0) then f32 value (non-zero offset);
+#   - WideBox:  i32 tag (offset 0) then f64 value (non-zero offset).
+# Both the integer tag and the float value are read back and checked, so a float
+# store that ignored the offset (clobbering the tag at offset 0) would fail.
+
+type FloatBox
+  tag i32
+  value f32
+
+type WideBox
+  tag i32
+  value f64
+
+# Returns a record by value via sret with a non-zero-offset f32 field. The shape
+# literal is built into a local that is then returned (copied through the saved
+# sret pointer), so the float field's byte offset must be honored on the way out.
+fn makeFloatBox FloatBox t i32 v f32
+  let b FloatBox . tag t value v
+  ret b
+
+# Same, with the float field widened to f64 at a non-zero offset.
+fn makeWideBox WideBox t i32 v f64
+  let b WideBox . tag t value v
+  ret b
+
+pub fn main Void world World !
+  let fb FloatBox makeFloatBox 7 2.5
+  let wb WideBox makeWideBox 9 4.25
+
+  let okFloatTag Bool == fb.tag 7
+  let okFloatVal Bool && (> fb.value 2.49) (< fb.value 2.51)
+  let okWideTag Bool == wb.tag 9
+  let okWideVal Bool && (> wb.value 4.24) (< wb.value 4.26)
+
+  if && (&& okFloatTag okFloatVal) (&& okWideTag okWideVal)
+    check world.out.write "aggregate float field sret ok\n"
+  else
+    check world.out.write "aggregate float field sret fail\n"

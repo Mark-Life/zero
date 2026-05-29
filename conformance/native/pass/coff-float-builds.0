@@ -1,0 +1,23 @@
+export c fn main u8
+  let a f32 1.25
+  let b f32 2.75
+  let sum f32 (+ a b)
+  let diff f32 (- a b)
+  let prod f32 (* a b)
+  let quot f32 (/ a b)
+  let trunc i32 (sum as i32)
+  let widen f64 (sum as f64)
+  let narrow f32 (widen as f32)
+  let na f64 12345.678
+  let nb f64 0.5
+  let nadd f64 (+ na nb)
+  let nsub f64 (- na nb)
+  let nmul f64 (* na nb)
+  let ndiv f64 (/ na nb)
+  let asint i32 (narrow as i32)
+  if == sum 4.0
+    if != diff 0.0
+      if < diff sum
+        if >= sum 4.0
+          ret 1_u8
+  ret 0_u8

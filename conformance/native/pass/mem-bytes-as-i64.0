@@ -1,0 +1,12 @@
+pub fn main Void world World !
+  # Three i64 values laid out little-endian in 24 bytes: 1, 257, -1.
+  let buf [24]u8 [1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255]
+  let view Span<i64> std.mem.bytesAsI64 buf
+  let r0 i64 view[0]
+  let r1 i64 view[1]
+  let r2 i64 view[2]
+  let one i64 1_i64
+  let twoFiftySeven i64 257_i64
+  let negOne i64 (- 0_i64 1_i64)
+  if && (== (std.mem.len view) 3) (&& (== r0 one) (&& (== r1 twoFiftySeven) (== r2 negOne)))
+    check world.out.write "mem bytes as i64 ok\n"

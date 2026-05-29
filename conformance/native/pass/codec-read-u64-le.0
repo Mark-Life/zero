@@ -1,0 +1,10 @@
+pub fn main Void world World !
+  # 16 bytes packing two u64s LE: 0x0102030405060708, 0xFFFFFFFFFFFFFFFF.
+  let bytes [16]u8 [8, 7, 6, 5, 4, 3, 2, 1, 255, 255, 255, 255, 255, 255, 255, 255]
+  let off8 usize 8
+  let r0 u64 (std.codec.readU64Le bytes 0)
+  let r8 u64 (std.codec.readU64Le bytes off8)
+  let middle u64 72623859790382856_u64
+  let maxVal u64 18446744073709551615_u64
+  if && (== r0 middle) (== r8 maxVal)
+    check world.out.write "codec read u64 le ok\n"

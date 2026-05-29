@@ -1,0 +1,20 @@
+pub fn main Void world World !
+  let buf [16]u8 [0, 0, 0, 0, 0, 0, 240, 63, 0, 0, 0, 0, 0, 0, 0, 64]
+  let view Span<f64> std.mem.bytesAsF64 buf
+  let r0 f64 view[0]
+  let r1 f64 view[1]
+  let one f64 1.0
+  let two f64 2.0
+  mut heap PageAlloc std.mem.pageAlloc()
+  let region std.mem.allocBytes heap 4096
+  if && region.has (&& (== (std.mem.len view) 2) (&& (== r0 one) (== r1 two)))
+    let bytes MutSpan<u8> region.value
+    let doubles MutSpan<f64> std.mem.bytesAsMutF64 bytes
+    let onePointTwoFive f64 1.25
+    let sixPointFive f64 6.5
+    set doubles[0] onePointTwoFive
+    set doubles[511] sixPointFive
+    let a f64 doubles[0]
+    let b f64 doubles[511]
+    if && (== (std.mem.len doubles) 512) (&& (== a onePointTwoFive) (== b sixPointFive))
+      check world.out.write "mem bytes as f64 ok\n"

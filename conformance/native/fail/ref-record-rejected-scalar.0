@@ -1,0 +1,13 @@
+# Ref and mutref are records-only. A `ref<scalar>` (here `ref<i32>`) is a valid
+# type at the frontend (the checker accepts it), but the direct backend
+# rejects it at IR lowering time with a clear scope diagnostic. This fixture
+# pins that gate so widening it later (to support scalar references) is an
+# intentional, reviewed step.
+
+fn readInt i32 p ref<i32>
+  ret 0
+
+pub fn main Void world World !
+  mut n i32 42
+  let r i32 readInt (&n)
+  check world.out.write "unreachable\n"

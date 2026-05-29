@@ -1,0 +1,20 @@
+# `check f()` as a discard statement (no `let` binding) where f returns a
+# record and raises. The sret target is a synthetic discard local reserved
+# at lowering time; the CHECK wrapper then propagates a non-zero tag back
+# to the caller. Exercises the error path: main exits with the propagated
+# error code, and the success-path write is never reached.
+
+type Point
+  x i32
+  y i32
+
+fn makePoint Point ax i32 ay i32 ![Bad]
+  if < ax 0
+    raise Bad
+  let p Point . x ax y ay
+  ret p
+
+pub fn main Void world World !
+  let neg i32 (- 0 1)
+  check makePoint neg 4
+  check world.out.write "unreachable\n"

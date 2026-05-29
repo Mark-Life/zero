@@ -1,0 +1,18 @@
+# A function parameter typed `ref<Record>` receives the caller's record by
+# pointer (no by-value copy at the callee's prologue). Field reads inside the
+# callee dereference that pointer at the field's offset. Today this lowers on
+# the darwin-arm64 backend; the other floated backends gate it as BLD004
+# until their per-backend ports land.
+
+type Point
+  x i32
+  y i32
+
+fn distance i32 p ref<Point>
+  ret + p.x p.y
+
+pub fn main Void world World !
+  let pt Point . x 3 y 4
+  let d i32 distance (&pt)
+  if == d 7
+    check world.out.write "ref record param ok\n"

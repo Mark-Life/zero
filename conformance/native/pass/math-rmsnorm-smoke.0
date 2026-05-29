@@ -1,0 +1,46 @@
+pub fn main Void world World !
+  mut bbytes [16]u8 [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  let buffer MutSpan<f32> std.mem.bytesAsMutF32 bbytes
+
+  mut xbytes [16]u8 [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  let input MutSpan<f32> std.mem.bytesAsMutF32 xbytes
+  set input[0] 3.0
+  set input[1] 4.0
+  set input[2] 0.0
+  set input[3] 0.0
+
+  mut wbytes [16]u8 [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  let weights MutSpan<f32> std.mem.bytesAsMutF32 wbytes
+  set weights[0] 1.0
+  set weights[1] 1.0
+  set weights[2] 1.0
+  set weights[3] 1.0
+
+  mut ss f32 0.0
+  mut i usize 0
+  while < i 4
+    let v f32 input[i]
+    set ss + ss (* v v)
+    set i + i 1
+  let nf f32 4.0
+  set ss / ss nf
+  let eps f32 0.00001
+  set ss + ss eps
+  let inv f32 / 1.0 (std.math.sqrtf ss)
+  mut j usize 0
+  while < j 4
+    set buffer[j] (* weights[j] (* inv input[j]))
+    set j + j 1
+
+  let lo0 f32 1.199
+  let hi0 f32 1.201
+  let lo1 f32 1.599
+  let hi1 f32 1.601
+  let zeroLo f32 (- 0.0 0.001)
+  let zeroHi f32 0.001
+  let ok0 Bool (&& (> buffer[0] lo0) (< buffer[0] hi0))
+  let ok1 Bool (&& (> buffer[1] lo1) (< buffer[1] hi1))
+  let ok2 Bool (&& (> buffer[2] zeroLo) (< buffer[2] zeroHi))
+  let ok3 Bool (&& (> buffer[3] zeroLo) (< buffer[3] zeroHi))
+  if && (&& (&& ok0 ok1) ok2) ok3
+    check world.out.write "math rmsnorm ok\n"

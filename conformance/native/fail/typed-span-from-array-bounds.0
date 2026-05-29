@@ -1,0 +1,6 @@
+pub fn main Void world World !
+  let ints [3]i32 [10, 20, 30]
+  let span Span<i32> ints
+  let idx usize 5
+  let probe i32 span[idx]
+  check world.out.write "unreachable\n"

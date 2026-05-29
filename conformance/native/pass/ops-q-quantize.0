@@ -1,0 +1,184 @@
+# Quantized (int8) activation quantizer — per-group symmetric quantize + round.
+#
+# Self-contained mirror of `quantizeActs` (and the `roundHA` half-away-from-zero
+# rounder) from examples/llama2/src/ops.0, exercised on hand-computed groups.
+# Needs libm (floorf via roundHA, absf via the per-element magnitude). A small
+# inline dequant checks the round-trip stays within the quantization step.
+#
+# `quantizeActs` is the byte-for-byte port of runq.c's `quantize`: per group of
+# `gs` values, scale = max(|x|) / 127, quant = round(x / scale) with C round()
+# (half away from zero). No clamp — |x / scale| <= 127 by construction.
+#
+# Two groups, gs = 4:
+#
+#   Group 0 — clean scale, away from rounding boundaries:
+#     x = [4.0, -3.0, 1.5, 0.5];  wmax = 4.0;  scale = 4/127 ~ 0.031496
+#       q[0] = round(4.0   / scale) = round(127.0)  = 127
+#       q[1] = round(-3.0  / scale) = round(-95.25) = -95
+#       q[2] = round(1.5   / scale) = round(47.625) =  48
+#       q[3] = round(0.5   / scale) = round(15.875) =  16
+#     dequant(q[i]) = q[i] * scale is within `scale` of x[i] (checked below).
+#
+#   Group 1 — exact +/-0.5 rounding probe. wmax = 127.0 makes scale = 1.0
+#   exactly, so x / scale = x with no rounding error, pinning the half-away-
+#   from-zero rule:
+#     x = [2.5, -2.5, 0.5, 127.0]
+#       q[0] = round(2.5)   =   3   (2.5 rounds AWAY from zero, not to even 2)
+#       q[1] = round(-2.5)  =  -3
+#       q[2] = round(0.5)   =   1
+#       q[3] = round(127.0) = 127
+
+# Quantized-activation scratch: signed int8 quants plus f32 group scales.
+# Mirrors `QActs` in examples/llama2/src/ops.0.
+type QActs
+  q MutSpan<i8>
+  s MutSpan<f32>
+
+# Round half away from zero, matching C round() — std.math has no roundf. For
+# the quantizer's operating range this is exact: |v| <= 127, and a float of
+# that magnitude has well over one fractional mantissa bit so v + 0.5 is exact
+# and floorf(v + 0.5) equals round((double) v). Negatives mirror through zero
+# so the .5 boundary rounds AWAY from zero (e.g. 2.5 -> 3, -2.5 -> -3), not
+# toward even.
+fn roundHA i32 v f32
+  let half f32 0.5
+  let zero f32 0.0
+  if >= v zero
+    let r f32 std.math.floorf (+ v half)
+    ret (r as i32)
+  let neg f32 - zero v
+  let r2 f32 std.math.floorf (+ neg half)
+  let ri i32 (r2 as i32)
+  ret - 0 ri
+
+# Port of examples/llama2/src/ops.0 quantizeActs (the byte-for-byte port of
+# runq.c's quantize): per-group symmetric scale = max(|x|) / 127, quant =
+# round(x / scale). No clamp; gs must divide n.
+fn quantizeActs Void dst QActs x Span<f32> gs usize
+  let dq MutSpan<i8> dst.q
+  let ds MutSpan<f32> dst.s
+  let n usize std.mem.len x
+  let q_max f32 127.0
+  let num_groups usize / n gs
+  mut g usize 0
+  while < g num_groups
+    let gbase usize * g gs
+    mut wmax f32 0.0
+    mut i usize 0
+    while < i gs
+      let xi usize + gbase i
+      let xv f32 x[xi]
+      let v f32 std.math.absf xv
+      if > v wmax
+        set wmax v
+      set i + i 1
+    let scale f32 / wmax q_max
+    set ds[g] scale
+    mut j usize 0
+    while < j gs
+      let xj usize + gbase j
+      let q f32 / x[xj] scale
+      let qi i32 roundHA q
+      set dq[xj] (qi as i8)
+      set j + j 1
+    set g + g 1
+
+pub fn main Void world World !
+  # Standalone +/-0.5 rounding probe on roundHA, independent of any scale,
+  # pinning C round() semantics (ties go away from zero).
+  let n25 f32 (- 0.0 2.5)
+  let n05 f32 (- 0.0 0.5)
+  let n14 f32 (- 0.0 1.4)
+  let rA i32 roundHA 2.5
+  let rB i32 roundHA n25
+  let rC i32 roundHA 0.5
+  let rD i32 roundHA n05
+  let rE i32 roundHA 1.4
+  let rF i32 roundHA n14
+  let rG i32 roundHA 0.0
+  let okRound Bool (&& (== rA 3) (&& (== rB (- 0 3)) (&& (== rC 1) (&& (== rD (- 0 1)) (&& (== rE 1) (&& (== rF (- 0 1)) (== rG 0)))))))
+
+  # Quant + scale scratch in writable regions (mirrors the run state). Also
+  # the input x region — using a MutSpan keeps the negative-literal stores
+  # imperative (no in-array-literal negation needed).
+  mut heap PageAlloc std.mem.pageAlloc()
+  let xregion Maybe<MutSpan<u8>> std.mem.allocBytes heap 64
+  if == xregion.has false
+    ret
+  let qregion Maybe<MutSpan<u8>> std.mem.allocBytes heap 64
+  if == qregion.has false
+    ret
+  let sregion Maybe<MutSpan<u8>> std.mem.allocBytes heap 64
+  if == sregion.has false
+    ret
+  let xbase MutSpan<u8> xregion.value
+  let qbase MutSpan<u8> qregion.value
+  let sbase MutSpan<u8> sregion.value
+  let xflts MutSpan<f32> std.mem.bytesAsMutF32 xbase
+  let qints MutSpan<i8> std.mem.bytesAsMutI8 qbase
+  let sflts MutSpan<f32> std.mem.bytesAsMutF32 sbase
+
+  # Input vector: group 0 then group 1 (gs = 4).
+  #   group 0 = [4.0, -3.0, 1.5, 0.5]
+  #   group 1 = [2.5, -2.5, 0.5, 127.0]
+  set xflts[0] 4.0
+  set xflts[1] (- 0.0 3.0)
+  set xflts[2] 1.5
+  set xflts[3] 0.5
+  set xflts[4] 2.5
+  set xflts[5] (- 0.0 2.5)
+  set xflts[6] 0.5
+  set xflts[7] 127.0
+
+  let x Span<f32> xflts[0..8]
+  let dq MutSpan<i8> qints[0..8]
+  let ds MutSpan<f32> sflts[0..2]
+  let dst QActs . q dq s ds
+
+  quantizeActs dst x 4
+
+  # Scales: group 0 = 4/127 (tight tolerance), group 1 = 1.0 exactly.
+  let q_max f32 127.0
+  let wantScale0 f32 / 4.0 q_max
+  let s0 f32 ds[0]
+  let s1 f32 ds[1]
+  let dScale0 f32 - s0 wantScale0
+  let nEps f32 (- 0.0 0.00001)
+  let okScale0 Bool (&& (> dScale0 nEps) (< dScale0 0.00001))
+  let okScale1 Bool (== s1 1.0)
+  let okScales Bool (&& okScale0 okScale1)
+
+  # Quants are exact integers — check against the hand-computed values. dq[i]
+  # reads back as i8 (per QActs.q), so widen each to i32 for the comparison.
+  let q0 i32 (dq[0] as i32)
+  let q1 i32 (dq[1] as i32)
+  let q2 i32 (dq[2] as i32)
+  let q3 i32 (dq[3] as i32)
+  let q4 i32 (dq[4] as i32)
+  let q5 i32 (dq[5] as i32)
+  let q6 i32 (dq[6] as i32)
+  let q7 i32 (dq[7] as i32)
+  let okQ0 Bool (&& (== q0 127) (&& (== q1 (- 0 95)) (&& (== q2 48) (== q3 16))))
+  let okQ1 Bool (&& (== q4 3) (&& (== q5 (- 0 3)) (&& (== q6 1) (== q7 127))))
+  let okQuants Bool (&& okQ0 okQ1)
+
+  # Dequant round-trip: |dequant(q[i]) - x[i]| <= scale for each value.
+  mut okDeq Bool true
+  mut i usize 0
+  while < i 8
+    let gi usize / i 4
+    let scale f32 ds[gi]
+    let qi32 i32 (dq[i] as i32)
+    let qf f32 (qi32 as f32)
+    let recon f32 * qf scale
+    let xi f32 xflts[i]
+    let err f32 - recon xi
+    let negScale f32 - 0.0 scale
+    let within Bool (&& (> err negScale) (< err scale))
+    if == within false
+      set okDeq false
+    set i + i 1
+
+  if && okRound (&& okScales (&& okQuants okDeq))
+    check world.out.write "ops q quantize ok\n"
+  ret

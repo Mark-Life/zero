@@ -1,0 +1,5 @@
+pub fn main Void world World !
+  let wide f64 2.25
+  let narrow f32 wide as f32
+  if == narrow 2.25
+    check world.out.write "float cast f64 to f32 ok\n"

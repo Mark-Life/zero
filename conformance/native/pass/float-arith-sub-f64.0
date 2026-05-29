@@ -1,0 +1,6 @@
+pub fn main Void world World !
+  let a f64 5.5
+  let b f64 1.25
+  let r f64 (- a b)
+  if == r 4.25
+    check world.out.write "float sub f64 ok\n"

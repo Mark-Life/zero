@@ -1,0 +1,13 @@
+pub fn main Void world World !
+  # 24 bytes packing three i64s LE: 1, -2, 9223372036854775807 (i64 max).
+  let bytes [24]u8 [1, 0, 0, 0, 0, 0, 0, 0, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 127]
+  let off8 usize 8
+  let off16 usize 16
+  let r0 i64 (std.codec.readI64Le bytes 0)
+  let r8 i64 (std.codec.readI64Le bytes off8)
+  let r16 i64 (std.codec.readI64Le bytes off16)
+  let one i64 1_i64
+  let negTwo i64 (- 0_i64 2_i64)
+  let maxPos i64 9223372036854775807_i64
+  if && (== r0 one) (&& (== r8 negTwo) (== r16 maxPos))
+    check world.out.write "codec read i64 le ok\n"

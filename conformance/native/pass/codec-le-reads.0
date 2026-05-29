@@ -1,0 +1,13 @@
+pub fn main Void world World !
+  let bytes [20]u8 [0, 0, 192, 63, 0, 4, 3, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64]
+  let off5 usize 5
+  let off12 usize 12
+  let i0 i32 (std.codec.readI32Le bytes 0)
+  let i5 i32 (std.codec.readI32Le bytes off5)
+  let u5 u32 (std.codec.readU32Le bytes off5)
+  let f0 f32 (std.codec.readF32Le bytes 0)
+  let d12 f64 (std.codec.readF64Le bytes off12)
+  let exp_f32 f32 1.5
+  let exp_f64 f64 2.0
+  if && (&& (&& (&& (== i0 1069547520) (== i5 16909060)) (== u5 16909060_u32)) (== f0 exp_f32)) (== d12 exp_f64)
+    check world.out.write "codec le reads ok\n"

@@ -1,0 +1,24 @@
+fn sumThree i32 values Span<i32>
+  ret (+ (+ values[0] values[1]) values[2])
+
+fn setLast Void out MutSpan<i32> value i32
+  set out[2] value
+
+fn copyThree Void src Span<i32> dst MutSpan<i32>
+  set dst[0] src[0]
+  set dst[1] src[1]
+  set dst[2] src[2]
+
+pub fn main Void world World !
+  mut bufBytes [12]u8 [10, 0, 0, 0, 20, 0, 0, 0, 30, 0, 0, 0]
+  mut destBytes [12]u8 [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  let srcSpan Span<i32> std.mem.bytesAsI32 bufBytes
+  let mutSpan MutSpan<i32> std.mem.bytesAsMutI32 bufBytes
+  let dstSpan MutSpan<i32> std.mem.bytesAsMutI32 destBytes
+  setLast mutSpan 99
+  copyThree srcSpan dstSpan
+  let total i32 (sumThree srcSpan)
+  let okSum Bool (== total 129)
+  let okCopy Bool (&& (&& (== dstSpan[0] 10) (== dstSpan[1] 20)) (== dstSpan[2] 99))
+  if && okSum okCopy
+    check world.out.write "typed span i32 ok\n"
