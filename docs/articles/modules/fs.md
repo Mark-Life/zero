@@ -30,9 +30,15 @@ Runnable today:
 | `std.fs.tempName(buffer, prefix)` | `Maybe<String>` | Writes a temporary path into caller storage. |
 | `std.fs.atomicWrite(path, temp, bytes)` | `Bool` | Writes through a caller-provided temporary path and renames. |
 | `std.fs.close(&mut file)` | `Void` | Closes an owned file handle explicitly; remaining owned files are cleaned up deterministically. |
+| `std.fs.mmap(fs, path)` | `Maybe<owned<Mapping>>` | Memory-maps a file read-only. Returns `null` when the file is absent or unreadable; otherwise an owned `Mapping` that releases the mapping at end-of-scope (or explicit `munmap`). |
+| `std.fs.mappingBytes(&m)` | `Span<u8>` | Borrows the mapped bytes from an owned `Mapping`. Zero-copy; combine with `std.mem.bytesAs*` to read typed views. |
+| `std.fs.munmap(&mut m)` | `Void` | Explicitly releases the mapping. |
 
 Current limits:
 
+- Mappings are read-only and `MAP_PRIVATE` only. No writable / shared mmap yet.
+- 32-bit mapping length (sufficient for all current targets; >4 GiB files
+  return their first 4 GiB).
 - Richer permissions and platform-specific file modes.
 - Directory walking.
 - Async or nonblocking I/O.
@@ -51,6 +57,33 @@ pub fn main Void world World ![NotFound TooLarge Io]
       if std.fs.remove ".zero/out/example-renamed.txt"
         check world.out.write "fs ok\n"
 ```
+
+## Mmap Example
+
+Read a small file into a typed view via `mmap` + `bytesAs*` with no intermediate
+copy:
+
+```zero
+pub fn main Void world World !
+  let fs Fs std.fs.host()
+  let region Maybe<owned<Mapping>> std.fs.mmap fs "data.bin"
+  if == region.has false
+    ret
+  let m owned<Mapping> region.value
+  let bytes Span<u8> std.fs.mappingBytes (&m)
+  let words Span<f32> std.mem.bytesAsF32 bytes
+  if > (std.mem.len words) 0
+    check world.out.write "mmap ok\n"
+  std.fs.munmap (&mut m)
+```
+
+On `darwin-arm64` and `darwin-x64`, `mmap`/`munmap` lower to `libSystem` calls;
+the build routes through the runtime obj+link path so libSystem binds
+automatically. On `linux-musl-x64` and `linux-musl-arm64`, the same surface
+lowers to raw `mmap`/`munmap`/`openat`/`lseek`/`close` syscalls and stays on
+the pure direct-exe path — but the `fs` capability is excluded from the default
+direct-exe heuristic, so the explicit `--backend` flag is required
+(`zero-elf64` for `linux-musl-x64`, `zero-elf-aarch64` for `linux-musl-arm64`).
 
 ## Design Notes
 

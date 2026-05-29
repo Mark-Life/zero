@@ -154,6 +154,14 @@ export const docs: Doc[] = [
     section: "Modules",
   },
   {
+    slug: "module-math",
+    title: "std.math",
+    description: "Single-precision libm helpers (sqrtf/expf/cosf/sinf/powf/absf/floorf), inline NaN predicate, and float constants.",
+    path: "/modules/math",
+    sourcePath: "/articles/modules/math.md",
+    section: "Modules",
+  },
+  {
     slug: "module-mem",
     title: "std.mem",
     description: "Span metadata, copy and equality helpers, and the allocator surface.",

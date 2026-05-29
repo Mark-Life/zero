@@ -10,12 +10,28 @@ Runnable today:
 | `std.mem.span(value)` | `Span<u8>` | Builds a native `Span<u8>` view over a string literal. |
 | `std.mem.len(bytes)` | `usize` | Returns the length of a fixed array, `Span<T>`, or `MutSpan<T>`. |
 | `std.mem.eqlBytes(a, b)` | `Bool` | Compares two `Span<T>`/`MutSpan<T>` values with the same element type. |
+| `std.mem.bytesAsI32(bytes)` | `Span<i32>` | Reinterprets a `Span<u8>` as a typed `Span<i32>`; zero-copy, element count = byte length / 4. |
+| `std.mem.bytesAsU32(bytes)` | `Span<u32>` | Same as `bytesAsI32`, unsigned. |
+| `std.mem.bytesAsF32(bytes)` | `Span<f32>` | Reinterprets a `Span<u8>` as a typed `Span<f32>`; zero-copy, element count = byte length / 4. |
+| `std.mem.bytesAsF64(bytes)` | `Span<f64>` | Reinterprets a `Span<u8>` as a typed `Span<f64>`; zero-copy, element count = byte length / 8. |
+| `std.mem.bytesAsI64(bytes)` | `Span<i64>` | Reinterprets a `Span<u8>` as a typed `Span<i64>`; zero-copy, element count = byte length / 8. |
+| `std.mem.bytesAsU64(bytes)` | `Span<u64>` | Same as `bytesAsI64`, unsigned. |
+| `std.mem.bytesAsI8(bytes)` | `Span<i8>` | Reinterprets a `Span<u8>` as a typed `Span<i8>`; element count equals byte length. |
+| `std.mem.bytesAsU8(bytes)` | `Span<u8>` | Reinterprets a byte view as a typed `Span<u8>`; element count equals byte length. Strips mutability. |
+| `std.mem.bytesAsMutI32(bytes)` | `MutSpan<i32>` | Mutable form of `bytesAsI32`. Slicing a `MutSpan<u8>` first preserves mutability through the reinterpret. |
+| `std.mem.bytesAsMutU32(bytes)` | `MutSpan<u32>` | Mutable form of `bytesAsU32`. |
+| `std.mem.bytesAsMutF32(bytes)` | `MutSpan<f32>` | Mutable form of `bytesAsF32`. |
+| `std.mem.bytesAsMutF64(bytes)` | `MutSpan<f64>` | Mutable form of `bytesAsF64`. |
+| `std.mem.bytesAsMutI64(bytes)` | `MutSpan<i64>` | Mutable form of `bytesAsI64`. |
+| `std.mem.bytesAsMutU64(bytes)` | `MutSpan<u64>` | Mutable form of `bytesAsU64`. |
+| `std.mem.bytesAsMutI8(bytes)` | `MutSpan<i8>` | Mutable form of `bytesAsI8`. |
+| `std.mem.bytesAsMutU8(bytes)` | `MutSpan<u8>` | Mutable form of `bytesAsU8`. Takes a `MutSpan<u8>` and preserves mutability. |
 | `std.mem.nullAlloc()` | `NullAlloc` | Creates an allocator that always returns `null`, useful for proving code does not allocate. |
 | `std.mem.fixedBufAlloc(buffer)` | `FixedBufAlloc` | Creates a mutable fixed-buffer allocator from caller-owned `MutSpan<u8>` bytes. |
 | `std.mem.arena(buffer)` | `FixedBufAlloc` | Arena-style alias over the fixed-buffer allocator model; `reset` rewinds the caller-owned storage. |
-| `std.mem.pageAlloc()` | `PageAlloc` | Explicit host allocator handle metadata; it never creates an ambient global allocator. |
+| `std.mem.pageAlloc()` | `PageAlloc` | Anonymous-page allocator backed by `mmap(MAP_ANON\|MAP_PRIVATE)`. Each `allocBytes` call returns a fresh page-aligned region (calloc semantics, not bump). |
 | `std.mem.generalAlloc()` | `GeneralAlloc` | Explicit general allocator handle metadata; callers still pass allocator state deliberately. |
-| `std.mem.allocBytes(alloc, len)` | `Maybe<MutSpan<u8>>` | Allocates bytes from `NullAlloc` or a mutable `FixedBufAlloc` binding. |
+| `std.mem.allocBytes(alloc, len)` | `Maybe<MutSpan<u8>>` | Allocates bytes from `NullAlloc`, a mutable `FixedBufAlloc` binding, or a `PageAlloc` (host page allocator on `darwin-arm64` and `darwin-x64` via libSystem, and on `linux-musl-x64` and `linux-musl-arm64` via raw Linux syscalls). |
 | `std.mem.byteBuf(alloc, len)` | `Maybe<owned<ByteBuf>>` | Creates an owned byte buffer backed by explicit caller-provided allocator storage. |
 | `std.mem.bufBytes(&buf)` | `MutSpan<u8>` | Borrows writable bytes from an owned `ByteBuf`. |
 | `std.mem.bufLen(&buf)` | `usize` | Returns the live length of a `ByteBuf`. |
@@ -58,6 +74,28 @@ pub fn main Void world World !
   if bytes.has
     set bytes.value[0] 90
     check world.out.write "fixed buffer allocated\n"
+```
+
+## Reinterpret Example
+
+`bytesAs*` and `bytesAsMut*` take a byte view and produce a typed `Span<T>` /
+`MutSpan<T>` over the same memory, with the element count rescaled by `sizeof T`.
+The pointer is unchanged and no copy occurs — the reinterpret is purely a type
+view. Slicing a `MutSpan<u8>` first preserves mutability through the reinterpret,
+so a borrowed sub-range of a byte region stays writable as a typed slice.
+
+```zero
+pub fn main Void world World !
+  let alloc PageAlloc std.mem.pageAlloc()
+  let region Maybe<MutSpan<u8>> std.mem.allocBytes alloc 16
+  if == region.has false
+    ret
+  let bytes MutSpan<u8> region.value
+  let view MutSpan<f32> std.mem.bytesAsMutF32 bytes
+  set view[0] 1.5
+  set view[1] 2.5
+  if && (== view[0] 1.5) (== view[1] 2.5)
+    check world.out.write "reinterpret ok\n"
 ```
 
 Effects: none beyond writes performed by caller code.

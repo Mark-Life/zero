@@ -42,7 +42,7 @@ describe("docs registry", () => {
   it("declares module pages with source files", async () => {
     const moduleDocs = docs.filter((doc) => doc.section === "Modules");
 
-    assert.equal(moduleDocs.length, 15);
+    assert.equal(moduleDocs.length, 16);
     assert.ok(moduleDocs.every((doc) => doc.path.startsWith("/modules/")));
 
     await Promise.all(

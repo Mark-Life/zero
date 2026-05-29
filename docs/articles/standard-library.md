@@ -15,6 +15,7 @@ Runnable modules:
 - `std.path`: fixed-buffer path joining.
 - `std.parse`: allocation-free ASCII scanners and unsigned integer parsers.
 - `std.codec`: byte-oriented integer encoding, varint length, and CRC-32 helpers.
+- `std.math`: single-precision libm helpers (`sqrtf`/`expf`/`cosf`/`sinf`/`powf`/`absf`/`floorf`), inline NaN predicate, and float constants.
 - `std.json`: string and byte-span validation, streaming token counts, explicit-allocator parsing, and caller-buffer string writing.
 - `std.time`: duration math plus target-gated monotonic and wall-clock helpers.
 - `std.rand`: explicit deterministic random sources and target entropy helpers.
