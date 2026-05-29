@@ -1,0 +1,385 @@
+# llama2.zero — checkpoint parsing.
+#
+# Parses a Karpathy `llama2.c` checkpoint that has already been mmap'd into a
+# byte span: the 7×int32 header becomes a `Config`, and the weight section is
+# sliced into zero-copy `Span<f32>` views (a `TransformerWeights`). Offsets are
+# computed exactly as `llama2.c` `memory_map_weights`, including the legacy
+# freq_cis skip and the shared-classifier flag (sign of `vocab_size`).
+
+# Hyperparameters from the checkpoint header. Mirrors `llama2.c` `Config` (7
+# int32 fields) plus a derived `shared_weights` flag: the reference keeps that
+# as a local in `read_checkpoint`, but the split here (readConfig + mapWeights)
+# needs to carry it. `vocab_size` is stored as its absolute value.
+type Config
+  dim i32
+  hidden_dim i32
+  n_layers i32
+  n_heads i32
+  n_kv_heads i32
+  vocab_size i32
+  seq_len i32
+  shared_weights Bool
+
+# Zero-copy views into the mapped weight section. Field order and tensor shapes
+# match `llama2.c` `TransformerWeights`; `wcls` aliases `token_embedding_table`
+# when the classifier is shared.
+type TransformerWeights
+  token_embedding_table Span<f32>
+  rms_att_weight Span<f32>
+  wq Span<f32>
+  wk Span<f32>
+  wv Span<f32>
+  wo Span<f32>
+  rms_ffn_weight Span<f32>
+  w1 Span<f32>
+  w2 Span<f32>
+  w3 Span<f32>
+  rms_final_weight Span<f32>
+  wcls Span<f32>
+
+# Read the 7×int32 little-endian header. A negative `vocab_size` is the
+# reference's hacky signal for unshared classifier weights; store its absolute
+# value and record the flag. Assumes `bytes` holds at least 28 bytes.
+pub fn readConfig Config bytes Span<u8>
+  let dim i32 std.codec.readI32Le bytes 0
+  let hidden_dim i32 std.codec.readI32Le bytes 4
+  let n_layers i32 std.codec.readI32Le bytes 8
+  let n_heads i32 std.codec.readI32Le bytes 12
+  let n_kv_heads i32 std.codec.readI32Le bytes 16
+  let raw_vocab i32 std.codec.readI32Le bytes 20
+  let seq_len i32 std.codec.readI32Le bytes 24
+
+  mut shared Bool false
+  if > raw_vocab 0
+    set shared true
+  mut vocab i32 raw_vocab
+  if < raw_vocab 0
+    set vocab (- 0 raw_vocab)
+
+  let cfg Config . dim dim hidden_dim hidden_dim n_layers n_layers n_heads n_heads n_kv_heads n_kv_heads vocab_size vocab seq_len seq_len shared_weights shared
+  ret cfg
+
+# Slice the byte span [off, off+count) — measured in f32 elements from the
+# start of the file — into a typed `Span<f32>` view. No copy; offsets are
+# 4-aligned because the header is 28 bytes and every region is f32-sized.
+fn weightView Span<f32> bytes Span<u8> off usize count usize
+  let start usize * off 4
+  let end usize + start (* count 4)
+  ret std.mem.bytesAsF32 bytes[start..end]
+
+# Build the weight views from a mapped checkpoint, walking the regions in the
+# exact order and with the exact sizes of `llama2.c` `memory_map_weights`. The
+# running cursor `off` is in f32 elements and starts at 7 (past the header).
+pub fn mapWeights TransformerWeights bytes Span<u8> cfg Config
+  let dim usize (cfg.dim as usize)
+  let hidden usize (cfg.hidden_dim as usize)
+  let n_layers usize (cfg.n_layers as usize)
+  let n_heads usize (cfg.n_heads as usize)
+  let n_kv_heads usize (cfg.n_kv_heads as usize)
+  let vocab usize (cfg.vocab_size as usize)
+  let seq_len usize (cfg.seq_len as usize)
+  let head_size usize / dim n_heads
+
+  # Region sizes, named once and reused for both the cursor advance and the view.
+  let tet_count usize * vocab dim
+  let rms_count usize * n_layers dim
+  let wq_count usize * (* n_layers dim) (* n_heads head_size)
+  let wkv_count usize * (* n_layers dim) (* n_kv_heads head_size)
+  let wo_count usize * (* n_layers (* n_heads head_size)) dim
+  let w13_count usize * (* n_layers dim) hidden
+  let w2_count usize * (* n_layers hidden) dim
+  let rope_half usize / (* seq_len head_size) 2
+
+  mut off usize 7
+
+  let tet_off usize off
+  set off + off tet_count
+  let rms_att_off usize off
+  set off + off rms_count
+  let wq_off usize off
+  set off + off wq_count
+  let wk_off usize off
+  set off + off wkv_count
+  let wv_off usize off
+  set off + off wkv_count
+  let wo_off usize off
+  set off + off wo_count
+  let rms_ffn_off usize off
+  set off + off rms_count
+  let w1_off usize off
+  set off + off w13_count
+  let w2_off usize off
+  set off + off w2_count
+  let w3_off usize off
+  set off + off w13_count
+  let rms_final_off usize off
+  set off + off dim
+  set off + off rope_half
+  set off + off rope_half
+
+  mut wcls_off usize off
+  if cfg.shared_weights
+    set wcls_off tet_off
+
+  let token_embedding_table Span<f32> weightView bytes tet_off tet_count
+  let rms_att_weight Span<f32> weightView bytes rms_att_off rms_count
+  let wq Span<f32> weightView bytes wq_off wq_count
+  let wk Span<f32> weightView bytes wk_off wkv_count
+  let wv Span<f32> weightView bytes wv_off wkv_count
+  let wo Span<f32> weightView bytes wo_off wo_count
+  let rms_ffn_weight Span<f32> weightView bytes rms_ffn_off rms_count
+  let w1 Span<f32> weightView bytes w1_off w13_count
+  let w2 Span<f32> weightView bytes w2_off w2_count
+  let w3 Span<f32> weightView bytes w3_off w13_count
+  let rms_final_weight Span<f32> weightView bytes rms_final_off dim
+  let wcls Span<f32> weightView bytes wcls_off tet_count
+
+  let w TransformerWeights . token_embedding_table token_embedding_table rms_att_weight rms_att_weight wq wq wk wk wv wv wo wo rms_ffn_weight rms_ffn_weight w1 w1 w2 w2 w3 w3 rms_final_weight rms_final_weight wcls wcls
+  ret w
+
+# Total f32-element count of a well-formed checkpoint file: the 7-element header
+# plus every region `memory_map_weights` walks (including the legacy freq_cis
+# tables it skips), plus a separate classifier block only when not shared. Used
+# to validate a mapping's byte length against the parsed header.
+pub fn expectedFileFloats usize cfg Config
+  let dim usize (cfg.dim as usize)
+  let hidden usize (cfg.hidden_dim as usize)
+  let n_layers usize (cfg.n_layers as usize)
+  let n_heads usize (cfg.n_heads as usize)
+  let n_kv_heads usize (cfg.n_kv_heads as usize)
+  let vocab usize (cfg.vocab_size as usize)
+  let seq_len usize (cfg.seq_len as usize)
+  let head_size usize / dim n_heads
+
+  mut total usize 7
+  set total + total (* vocab dim)
+  set total + total (* n_layers dim)
+  set total + total (* (* n_layers dim) (* n_heads head_size))
+  set total + total (* (* n_layers dim) (* n_kv_heads head_size))
+  set total + total (* (* n_layers dim) (* n_kv_heads head_size))
+  set total + total (* (* n_layers (* n_heads head_size)) dim)
+  set total + total (* n_layers dim)
+  set total + total (* (* n_layers dim) hidden)
+  set total + total (* (* n_layers hidden) dim)
+  set total + total (* (* n_layers dim) hidden)
+  set total + total dim
+  set total + total (/ (* seq_len head_size) 2)
+  set total + total (/ (* seq_len head_size) 2)
+  if == cfg.shared_weights false
+    set total + total (* vocab dim)
+  ret total
+
+# Quantized (int8) checkpoint format — the `runq.c` "version 2" layout.
+#
+# A second on-disk format that stores the matmul weights as int8 with per-group
+# f32 scales (a 4x size cut over f32), while keeping the 1-D rmsnorm weights in
+# f32. It is self-describing: a fixed 256-byte header carries a magic number, a
+# version, the same seven hyperparameters as the legacy header, an explicit
+# shared-classifier flag, and the quantization group size. The two formats are
+# told apart by the magic number, so a single reader can dispatch on it; the
+# legacy f32 path above is untouched.
+#
+# Header (256 bytes):
+#   off 0   u32  magic = 0x616b3432  ("ak42", little-endian on disk)
+#   off 4   i32  version = 2
+#   off 8   i32  dim
+#   off 12  i32  hidden_dim
+#   off 16  i32  n_layers
+#   off 20  i32  n_heads
+#   off 24  i32  n_kv_heads
+#   off 28  i32  vocab_size      (always positive; no sign trick)
+#   off 32  i32  seq_len
+#   off 36  u8   shared_classifier (1 => wcls aliases the token table)
+#   off 37  i32  group_size      (GS; quants are scaled per contiguous run of GS)
+#   off 41  ..   zero padding to 256
+#   off 256 ..   weight section
+#
+# Weight section: first the f32 rmsnorm groups (rms_att, rms_ffn, rms_final, in
+# that order — note this differs from the legacy file, which interleaves them),
+# then the quantized matmul tensors. Each logical weight is stored as one
+# QuantizedTensor per layer (a single tensor for the token table / classifier).
+# A QuantizedTensor of `size_each` elements is laid out quants-then-scales:
+#
+#   int8 q[size_each]              size_each bytes
+#   f32  s[size_each / GS]         (size_each / GS) * 4 bytes
+#   per-layer block bytes = size_each + (size_each / GS) * 4
+#
+# and a group's layers are stored back to back (`[L0.q L0.s][L1.q L1.s]...`), so
+# the per-layer stride is a byte stride, not an f32-element stride.
+
+# A single matrix's quantized weights, sliced zero-copy out of the mapped file:
+# the int8 quants as a `Span<i8>` (a signed-byte view of the mapped bytes — each
+# element reads back directly as its two's-complement value -128..127) and the f32
+# group scales (one per run of `group_size` quants). Mirrors `runq.c`
+# `QuantizedTensor`.
+type QWeight
+  q Span<i8>
+  s Span<f32>
+
+# Zero-copy description of a mapped v2 checkpoint's weight section. The f32
+# rmsnorm groups are exposed directly as `Span<f32>` views (sliced exactly like
+# the f32 path, but from byte 256 in the new front-loaded order). The quantized
+# matmul tensors are described by the byte offset of each group's first layer;
+# per-layer slicing into a `QWeight` happens at use time, recomputing the block
+# stride from the config and `gs` (every group's `size_each` is fully derivable,
+# so only the base offset needs storing). `bytes` and `gs` are retained so a
+# consumer can perform that slicing. `wclsBase` equals `qTokensBase` when the
+# classifier is shared, matching the f32 path's `wcls` aliasing.
+type QuantizedWeights
+  bytes Span<u8>
+  gs usize
+  rms_att Span<f32>
+  rms_ffn Span<f32>
+  rms_final Span<f32>
+  qTokensBase usize
+  wqBase usize
+  wkBase usize
+  wvBase usize
+  woBase usize
+  w1Base usize
+  w2Base usize
+  w3Base usize
+  wclsBase usize
+
+# True iff the mapped file begins with the v2 quantized magic number
+# (`0x616b3432`, "ak42"). Lets a reader auto-detect the format and pick the
+# quantized path; a legacy f32 checkpoint starts with a small `dim` value and so
+# never collides. Assumes `bytes` holds at least 4 bytes.
+pub fn isQuantizedV2 Bool bytes Span<u8>
+  let magic u32 0x616b3432
+  let head u32 std.codec.readU32Le bytes 0
+  ret == head magic
+
+# Read the seven hyperparameters from a v2 header and the explicit
+# shared-classifier flag. Unlike the legacy header, `vocab_size` is stored as a
+# plain positive integer and the shared flag is its own byte at offset 36 (the
+# reference's negative-`vocab_size` trick is gone). Reuses the shared `Config`
+# shape. Assumes `bytes` holds at least 37 bytes.
+pub fn readConfigV2 Config bytes Span<u8>
+  let dim i32 std.codec.readI32Le bytes 8
+  let hidden_dim i32 std.codec.readI32Le bytes 12
+  let n_layers i32 std.codec.readI32Le bytes 16
+  let n_heads i32 std.codec.readI32Le bytes 20
+  let n_kv_heads i32 std.codec.readI32Le bytes 24
+  let vocab i32 std.codec.readI32Le bytes 28
+  let seq_len i32 std.codec.readI32Le bytes 32
+
+  let shared_byte u8 bytes[36]
+  mut shared Bool false
+  if == shared_byte 1
+    set shared true
+
+  let cfg Config . dim dim hidden_dim hidden_dim n_layers n_layers n_heads n_heads n_kv_heads n_kv_heads vocab_size vocab seq_len seq_len shared_weights shared
+  ret cfg
+
+# The quantization group size (GS) from the header, as a `usize`. Weights are
+# scaled per contiguous run of GS quants, so the matmul walks its inner
+# dimension in steps of GS and indexes the scale array at `.../GS`. GS is chosen
+# at export so it divides every matmul inner dimension; read it, never hardcode
+# it. Assumes `bytes` holds at least 41 bytes.
+pub fn groupSize usize bytes Span<u8>
+  let gs i32 std.codec.readI32Le bytes 37
+  ret (gs as usize)
+
+# Per-layer block size in bytes for a quantized group whose tensors each hold
+# `se` elements: `se` int8 quants followed by `se / gs` f32 scales. Used to step
+# from one layer's block to the next within a group.
+fn qBlockBytes usize se usize gs usize
+  ret + se (* (/ se gs) 4)
+
+# Build the weight description from a mapped v2 checkpoint, walking the weight
+# section in the exact order of the format: the three f32 rmsnorm groups from
+# byte 256 (rms_att, rms_ffn, rms_final), then the quantized matmul tensors. The
+# rmsnorm groups are sliced into `Span<f32>` views; for each quantized group we
+# record the byte offset of its first layer's block and advance the cursor by
+# `count * per-layer-block`. When the classifier is shared, `wcls` reuses the
+# token table's base.
+pub fn mapWeightsQ QuantizedWeights bytes Span<u8> cfg Config gs usize
+  let dim usize (cfg.dim as usize)
+  let hidden usize (cfg.hidden_dim as usize)
+  let n_layers usize (cfg.n_layers as usize)
+  let n_heads usize (cfg.n_heads as usize)
+  let n_kv_heads usize (cfg.n_kv_heads as usize)
+  let vocab usize (cfg.vocab_size as usize)
+  let kv_dim usize / (* dim n_kv_heads) n_heads
+
+  # f32 rmsnorm groups, contiguous from byte 256 in the v2 order.
+  let rms_count usize * n_layers dim
+  let att_start usize 256
+  let att_end usize + att_start (* rms_count 4)
+  let ffn_start usize att_end
+  let ffn_end usize + ffn_start (* rms_count 4)
+  let final_start usize ffn_end
+  let final_end usize + final_start (* dim 4)
+  let rms_att Span<f32> std.mem.bytesAsF32 bytes[att_start..att_end]
+  let rms_ffn Span<f32> std.mem.bytesAsF32 bytes[ffn_start..ffn_end]
+  let rms_final Span<f32> std.mem.bytesAsF32 bytes[final_start..final_end]
+
+  # Per-group element counts (size_each) for the quantized tensors.
+  let q_tokens_se usize * vocab dim
+  let wq_se usize * dim dim
+  let wkv_se usize * dim kv_dim
+  let wo_se usize * dim dim
+  let w13_se usize * dim hidden
+  let w2_se usize * hidden dim
+
+  # Quantized section starts right after the rmsnorm groups; record each
+  # group's byte base, then advance by all of its layers.
+  mut off usize final_end
+
+  let q_tokens_base usize off
+  set off + off (qBlockBytes q_tokens_se gs)
+  let wq_base usize off
+  set off + off (* n_layers (qBlockBytes wq_se gs))
+  let wk_base usize off
+  set off + off (* n_layers (qBlockBytes wkv_se gs))
+  let wv_base usize off
+  set off + off (* n_layers (qBlockBytes wkv_se gs))
+  let wo_base usize off
+  set off + off (* n_layers (qBlockBytes wo_se gs))
+  let w1_base usize off
+  set off + off (* n_layers (qBlockBytes w13_se gs))
+  let w2_base usize off
+  set off + off (* n_layers (qBlockBytes w2_se gs))
+  let w3_base usize off
+  set off + off (* n_layers (qBlockBytes w13_se gs))
+
+  mut wcls_base usize off
+  if cfg.shared_weights
+    set wcls_base q_tokens_base
+
+  let qw QuantizedWeights . bytes bytes gs gs rms_att rms_att rms_ffn rms_ffn rms_final rms_final qTokensBase q_tokens_base wqBase wq_base wkBase wk_base wvBase wv_base woBase wo_base w1Base w1_base w2Base w2_base w3Base w3_base wclsBase wcls_base
+  ret qw
+
+# Total byte length of a well-formed v2 checkpoint: the 256-byte header, the
+# three f32 rmsnorm groups, and every quantized group's blocks (each group's
+# per-layer block is `se + (se / gs) * 4`, summed over its layers), with the
+# classifier block present only when it is not shared. Mirrors
+# `expectedFileFloats`; used to validate a mapping's byte length against the
+# parsed header.
+pub fn expectedFileBytesQ usize cfg Config gs usize
+  let dim usize (cfg.dim as usize)
+  let hidden usize (cfg.hidden_dim as usize)
+  let n_layers usize (cfg.n_layers as usize)
+  let n_heads usize (cfg.n_heads as usize)
+  let n_kv_heads usize (cfg.n_kv_heads as usize)
+  let vocab usize (cfg.vocab_size as usize)
+  let kv_dim usize / (* dim n_kv_heads) n_heads
+
+  mut total usize 256
+  # f32 rmsnorm groups: rms_att, rms_ffn, rms_final.
+  set total + total (* (* n_layers dim) 4)
+  set total + total (* (* n_layers dim) 4)
+  set total + total (* dim 4)
+  # Quantized matmul groups.
+  set total + total (qBlockBytes (* vocab dim) gs)
+  set total + total (* n_layers (qBlockBytes (* dim dim) gs))
+  set total + total (* n_layers (qBlockBytes (* dim kv_dim) gs))
+  set total + total (* n_layers (qBlockBytes (* dim kv_dim) gs))
+  set total + total (* n_layers (qBlockBytes (* dim dim) gs))
+  set total + total (* n_layers (qBlockBytes (* dim hidden) gs))
+  set total + total (* n_layers (qBlockBytes (* hidden dim) gs))
+  set total + total (* n_layers (qBlockBytes (* dim hidden) gs))
+  if == cfg.shared_weights false
+    set total + total (qBlockBytes (* dim vocab) gs)
+  ret total

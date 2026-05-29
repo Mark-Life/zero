@@ -1,0 +1,367 @@
+# llama2.zero — sampler.
+#
+# Selects the next token from the forward-pass logits, ported from llama2.c
+# run.c: greedy argmax when temperature is 0, otherwise temperature-scaled
+# softmax then sampling driven by the xorshift* PRNG (random_u32 /
+# random_f32). Sampling is plain multinomial, top-p (nucleus), or top-k —
+# dispatched in sample from a Sampler record. top-p mirrors sample_topp
+# byte-for-byte (parity vs llama2.c); top-k has no run.c reference and is a
+# renormalized-prefix draw.
+#
+# Two adaptations to a backend with no bitwise operators (^, <<, >>, &, |) —
+# only +, -, *, /, %:
+#   - the PRNG's shifts become unsigned multiply/divide by powers of two
+#     (x >> n == x / 2^n, x << n == x * 2^n mod 2^64 — the backend's u64
+#     imul/div already truncate/wrap to 64 bits), and its XOR is emulated
+#     bit-by-bit in xor64. The PRNG is drawn once per token, so the 64-step
+#     loop never matters for throughput.
+#   - --temperature text is parsed by a small pure-Zero parseF32: std.parse
+#     folds only string literals at compile time, so a runtime value needs a
+#     hand-rolled scan, like the --tokens digit check in main.
+
+use ops
+
+# Sampling config plus the reusable scratch the top-p / top-k paths sort over.
+# prob/index are vocab-sized parallel arrays — the split form of llama2.c's
+# ProbIndex[] (records nest one level, so a Span of two-field records isn't
+# available; parallel arrays carry the same (prob, original-index) pairs). They
+# are allocated once in main (anonymous mmap, like RunState) and reused per
+# token. Passed by pointer (one int reg), keeping sample within the arg-reg cap.
+type Sampler
+  prob MutSpan<f32>
+  index MutSpan<i32>
+  temperature f32
+  topp f32
+  topk i32
+
+# Index of the largest logit — the greedy, deterministic next token used when
+# temperature is 0. Mirrors sample_argmax; assumes a non-empty span.
+pub fn argmax i32 logits Span<f32>
+  let n usize std.mem.len logits
+  mut bestI i32 0
+  mut bestV f32 logits[0]
+  mut i usize 1
+  while < i n
+    let v f32 logits[i]
+    if > v bestV
+      set bestV v
+      set bestI (i as i32)
+    set i + i 1
+  ret bestI
+
+# Bitwise XOR of two u64s, built from arithmetic because the language exposes no
+# ^. Walks all 64 bit positions: each result bit is (a_bit + b_bit) % 2,
+# scaled back by its place value. place wraps to 0 after the top bit, which is
+# harmless — the backend's u64 multiply truncates and the value is then unused.
+fn xor64 u64 a u64 b u64
+  mut result u64 0
+  mut place u64 1
+  mut x u64 a
+  mut y u64 b
+  mut i i32 0
+  while < i 64
+    let xb u64 % x 2
+    let yb u64 % y 2
+    let rb u64 % (+ xb yb) 2
+    set result + result (* rb place)
+    set x / x 2
+    set y / y 2
+    set place * place 2
+    set i + i 1
+  ret result
+
+# Advance the xorshift state by one round — the three shift/xor steps of
+# random_u32. Shifts are mul/div by powers of two: >> 12 == / 4096,
+# << 25 == * 33554432 (mod 2^64), >> 27 == / 134217728.
+pub fn rngNext u64 state u64
+  mut s u64 state
+  let a u64 / s 4096
+  set s xor64 s a
+  let b u64 * s 33554432
+  set s xor64 s b
+  let c u64 / s 134217728
+  set s xor64 s c
+  ret s
+
+# The float in [0, 1) for an already-advanced state — the output half of
+# random_f32. random_u32 returns (state * MUL) >> 32: the high 32 bits of
+# the 64-bit product the backend's u64 multiply keeps in the low 64 bits. Then
+# >> 8 and / 2^24 map it into [0, 1). MUL = 0x2545F4914F6CDD1D.
+pub fn randomF32 f32 state u64
+  let mul u64 2685821657736338717
+  let prod u64 * state mul
+  let hi32 u64 / prod 4294967296
+  let bits24 u64 / hi32 256
+  let asF f32 (bits24 as f32)
+  let denom f32 16777216.0
+  ret / asF denom
+
+# Sample an index from a distribution that sums to 1, given a coin in [0, 1).
+# Mirrors sample_mult: walk the CDF and take the first bucket the coin falls
+# into; the trailing index guards against floating-point rounding drift.
+pub fn sampleMult i32 probs Span<f32> coin f32
+  let n usize std.mem.len probs
+  mut cdf f32 0.0
+  mut i usize 0
+  while < i n
+    set cdf + cdf probs[i]
+    let hit Bool (< coin cdf)
+    if hit
+      ret (i as i32)
+    set i + i 1
+  let last usize - n 1
+  ret (last as i32)
+
+# Parse a decimal float such as "0.9", "1", or "1.5". std.parse only folds
+# literals at compile time, so the runtime --temperature value needs this
+# scan. A leading '-' is honored; any other non-digit, non-dot byte is skipped.
+# There is no exponent form (temperatures never use one).
+pub fn parseF32 f32 s Span<u8>
+  let n usize std.mem.len s
+  let zeroc u8 ('0' as u8)
+  let ninec u8 ('9' as u8)
+  let dotc u8 ('.' as u8)
+  let minusc u8 ('-' as u8)
+  mut i usize 0
+  mut neg Bool false
+  if > n 0
+    let c0 u8 s[0]
+    if == c0 minusc
+      set neg true
+      set i 1
+  mut value f32 0.0
+  mut frac f32 1.0
+  mut inFrac Bool false
+  while < i n
+    let c u8 s[i]
+    let isDot Bool (== c dotc)
+    if isDot
+      set inFrac true
+    if == isDot false
+      let below Bool (< c zeroc)
+      let above Bool (> c ninec)
+      let bad Bool (|| below above)
+      if == bad false
+        let d i32 - (c as i32) (zeroc as i32)
+        let df f32 (d as f32)
+        if inFrac
+          set frac / frac 10.0
+          set value + value (* df frac)
+        if == inFrac false
+          set value + (* value 10.0) df
+    set i + i 1
+  if neg
+    set value - 0.0 value
+  ret value
+
+# Sort prob[0..count] descending in place, moving index[0..count] in
+# lockstep (every swap moves BOTH arrays). Heapsort with a MIN-heap: build the
+# heap, then repeatedly swap the min (root) to the back of the live region and
+# sift down — the back fills smallest-first, so the array ends up largest-first
+# (descending), which is what the top-p / top-k walks consume. Index arithmetic
+# only (no bitwise): child = i*2+1 / i*2+2. No recursion; sift-down ends via a
+# sentinel flag (the backend has no break). The parent index is never computed,
+# and the down-counters are +1-shifted (bp, ep), so usize never underflows.
+# Not stable — llama2.c's qsort isn't either; callers use distinct probs where
+# order matters. ~O(count log count); count is the cropped/vocab candidate set.
+fn sortDescByProb Void prob MutSpan<f32> index MutSpan<i32> count usize
+  if < count 2
+    ret
+  # Build the min-heap: sift down each internal node, high index first. bp is
+  # a +1-shifted counter (count/2 .. 1), so the real node bp - 1 stays >= 0.
+  mut bp usize / count 2
+  while > bp 0
+    let startNode usize - bp 1
+    mut pos usize startNode
+    mut sifting Bool true
+    while sifting
+      let left usize + (* pos 2) 1
+      let right usize + (* pos 2) 2
+      mut smallest usize pos
+      if < left count
+        let pl f32 prob[left]
+        let ps f32 prob[smallest]
+        if < pl ps
+          set smallest left
+      if < right count
+        let pr f32 prob[right]
+        let ps2 f32 prob[smallest]
+        if < pr ps2
+          set smallest right
+      let moved Bool (!= smallest pos)
+      if moved
+        let tp f32 prob[pos]
+        set prob[pos] prob[smallest]
+        set prob[smallest] tp
+        let ti i32 index[pos]
+        set index[pos] index[smallest]
+        set index[smallest] ti
+        set pos smallest
+      if == moved false
+        set sifting false
+    set bp - bp 1
+  # Extract: swap root (current min) to the back, shrink the live region, and
+  # sift the new root down. ep is a +1-shifted counter (count .. 2), so the
+  # last live index end = ep - 1 stays >= 1.
+  mut ep usize count
+  while > ep 1
+    let end usize - ep 1
+    let tp2 f32 prob[0]
+    set prob[0] prob[end]
+    set prob[end] tp2
+    let ti2 i32 index[0]
+    set index[0] index[end]
+    set index[end] ti2
+    let bound usize end
+    mut pos2 usize 0
+    mut sift2 Bool true
+    while sift2
+      let left2 usize + (* pos2 2) 1
+      let right2 usize + (* pos2 2) 2
+      mut small2 usize pos2
+      if < left2 bound
+        let pl2 f32 prob[left2]
+        let psA f32 prob[small2]
+        if < pl2 psA
+          set small2 left2
+      if < right2 bound
+        let pr2 f32 prob[right2]
+        let psB f32 prob[small2]
+        if < pr2 psB
+          set small2 right2
+      let moved2 Bool (!= small2 pos2)
+      if moved2
+        let sp f32 prob[pos2]
+        set prob[pos2] prob[small2]
+        set prob[small2] sp
+        let si i32 index[pos2]
+        set index[pos2] index[small2]
+        set index[small2] si
+        set pos2 small2
+      if == moved2 false
+        set sift2 false
+    set ep - ep 1
+
+# Nucleus (top-p) sampling, ported from llama2.c sample_topp. Crops tokens
+# below (1 - topp)/(n - 1) (they cannot enter the nucleus), sorts the survivors
+# descending into the scratch, finds the shortest prefix whose probabilities sum
+# past topp, and draws from that prefix with coin. Byte-identical to
+# sample_topp so the top-p path reproduces llama2.c token-for-token. probs
+# (the softmaxed logits) is the read source; sampler.prob/.index the scratch.
+# The C break after crossing topp becomes a found sentinel that holds
+# cumulative at the sum through last_idx — the exact value that scales coin.
+pub fn sampleTopp i32 sampler Sampler probs Span<f32> topp f32 coin f32
+  let prob MutSpan<f32> sampler.prob
+  let index MutSpan<i32> sampler.index
+  let n usize std.mem.len probs
+  let nf f32 ((n as i32) as f32)
+  let denom f32 - nf 1.0
+  let one f32 1.0
+  let cutoff f32 / (- one topp) denom
+  mut n0 usize 0
+  mut i usize 0
+  while < i n
+    let p f32 probs[i]
+    let keep Bool (>= p cutoff)
+    if keep
+      set prob[n0] p
+      set index[n0] (i as i32)
+      set n0 + n0 1
+    set i + i 1
+  sortDescByProb prob index n0
+  mut cumulative f32 0.0
+  mut last_idx usize 0
+  if > n0 0
+    set last_idx - n0 1
+  mut found Bool false
+  mut j usize 0
+  while < j n0
+    if == found false
+      set cumulative + cumulative prob[j]
+      let over Bool (> cumulative topp)
+      if over
+        set last_idx j
+        set found true
+        set j n0
+    if == found false
+      set j + j 1
+  let r f32 * coin cumulative
+  mut cdf f32 0.0
+  mut k usize 0
+  while <= k last_idx
+    set cdf + cdf prob[k]
+    let hit Bool (< r cdf)
+    if hit
+      ret index[k]
+    set k + k 1
+  ret index[last_idx]
+
+# Top-k sampling — no llama2.c reference. Sorts the full distribution
+# descending into the scratch, then draws from the renormalized top-k prefix:
+# coin scaled by the prefix mass, walked against the prefix CDF. topk is
+# clamped to the vocab size.
+pub fn sampleTopk i32 sampler Sampler probs Span<f32> coin f32
+  let prob MutSpan<f32> sampler.prob
+  let index MutSpan<i32> sampler.index
+  let n usize std.mem.len probs
+  mut i usize 0
+  while < i n
+    set prob[i] probs[i]
+    set index[i] (i as i32)
+    set i + i 1
+  sortDescByProb prob index n
+  let kk i32 sampler.topk
+  mut k usize (kk as usize)
+  if > k n
+    set k n
+  mut mass f32 0.0
+  mut a usize 0
+  while < a k
+    set mass + mass prob[a]
+    set a + a 1
+  let r f32 * coin mass
+  mut cdf f32 0.0
+  mut last usize 0
+  if > k 0
+    set last - k 1
+  mut b usize 0
+  while <= b last
+    set cdf + cdf prob[b]
+    let hit Bool (< r cdf)
+    if hit
+      ret index[b]
+    set b + b 1
+  ret index[last]
+
+# Pick the next token from the forward-pass logits. temperature 0 => greedy
+# argmax (top-p/top-k ignored). Otherwise scale by 1/temperature, softmax in
+# place, then dispatch: top-k when set (in (0, vocab)), else top-p when set
+# (in (0, 1)), else plain multinomial. coin (from randomF32) is the entropy
+# source; logits is consumed (scaled then softmaxed) exactly as in llama2.c.
+# With top-k unset the top-p branch is byte-identical to sample_topp, so
+# token-for-token parity holds for the -t/-p configuration.
+pub fn sample i32 sampler Sampler logits MutSpan<f32> coin f32
+  let temperature f32 sampler.temperature
+  let greedy Bool (== temperature 0.0)
+  if greedy
+    let g i32 argmax logits
+    ret g
+  let n usize std.mem.len logits
+  mut i usize 0
+  while < i n
+    set logits[i] / logits[i] temperature
+    set i + i 1
+  softmax logits
+  let topk i32 sampler.topk
+  let vocab_i i32 (n as i32)
+  let topkOn Bool (&& (> topk 0) (< topk vocab_i))
+  if topkOn
+    let rk i32 sampleTopk sampler logits coin
+    ret rk
+  let topp f32 sampler.topp
+  let toppOn Bool (&& (> topp 0.0) (< topp 1.0))
+  if toppOn
+    let rp i32 sampleTopp sampler logits topp coin
+    ret rp
+  let r i32 sampleMult logits coin
+  ret r
